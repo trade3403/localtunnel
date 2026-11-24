@@ -68,6 +68,27 @@ fn run() -> Result<(), String> {
             let config = gateway_config(bind.parse().map_err(|_| "invalid gateway listener")?, &routes, cert)?;
             write_new(Path::new(output), &config)?;
         }
+        #[cfg(target_os = "linux")]
+        [command, prefix, bind, pairs @ ..] if command == "gateway-init" || command == "gateway-apply" => {
+            if pairs.len() % 2 != 0 || pairs.len() > 128 {
+                return Err("provide 0-64 domain/port pairs".into());
+            }
+            let routes = pairs.chunks_exact(2).map(|p| {
+                Ok(Route { domain: &p[0], port: p[1].parse().map_err(|_| "invalid upstream port")? })
+            }).collect::<Result<Vec<_>, &str>>()?;
+            let address = bind.parse().map_err(|_| "invalid gateway listener")?;
+            if command == "gateway-init" {
+                localtunnel::managed_gateway::init(Path::new(prefix), address, &routes)?;
+            } else {
+                localtunnel::managed_gateway::apply(Path::new(prefix), address, &routes)?;
+            }
+        }
+        #[cfg(target_os = "linux")]
+        [command, chain, key, ca, days, domains @ ..] if command == "cert-check" => {
+            let days = days.parse().map_err(|_| "invalid minimum validity days")?;
+            localtunnel::certificates::check(chain, key, ca, days, domains)?;
+            println!("certificate preflight passed");
+        }
         [command, config] if command == "run" => {
             let binary = env::var_os("LOCALTUNNEL_ENGINE").ok_or("set LOCALTUNNEL_ENGINE to the absolute path of the verified rathole executable")?;
             if !Path::new(&binary).is_absolute() { return Err("engine path must be absolute".into()); }
@@ -78,7 +99,7 @@ fn run() -> Result<(), String> {
             if !status.success() { return Err(format!("engine exited: {status}")); }
         }
         [command] if command == "--version" => println!("localtunnel {}", env!("CARGO_PKG_VERSION")),
-        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | run <config-file> | --version".into()),
+        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | run <config-file> | --version".into()),
     }
     Ok(())
 }
