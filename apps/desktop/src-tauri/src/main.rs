@@ -2,6 +2,8 @@
 
 mod profile;
 mod credentials;
+#[cfg(windows)]
+mod engine_job;
 
 use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};
@@ -36,8 +38,31 @@ struct Status {
 
 struct Running {
     child: Child,
+    #[cfg(windows)]
+    _job: engine_job::EngineJob,
     _directory: TempDir,
     count: usize,
+}
+
+impl Running {
+    fn spawn(command: &mut Command, directory: TempDir, count: usize) -> Result<Self, String> {
+        #[cfg(windows)]
+        let job = engine_job::EngineJob::new().map_err(|e| format!("无法创建引擎进程保护：{e}"))?;
+        let mut child = command.spawn().map_err(|_| "无法启动 Rathole 引擎")?;
+        #[cfg(windows)]
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("无法保护引擎进程，已拒绝启动：{error}"));
+        }
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            _job: job,
+            _directory: directory,
+            count,
+        })
+    }
 }
 
 impl Drop for Running {
@@ -101,8 +126,7 @@ impl Supervisor {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let child = command.spawn().map_err(|_| "无法启动 Rathole 引擎")?;
-        self.running = Some(Running { child, _directory: directory, count: request.mappings.len() });
+        self.running = Some(Running::spawn(&mut command, directory, request.mappings.len())?);
         self.last_error = None;
         self.status()
     }
@@ -330,8 +354,9 @@ mod tests {
         std::fs::write(&config, server_config(relay_addr, "web", mapped_addr.port(), &token, private).unwrap()).unwrap();
         drop(relay_port);
         drop(mapped_port);
-        let child = Command::new(&engine).arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-        let _relay = Running { child, _directory: directory, count: 1 };
+        let mut relay_command = Command::new(&engine);
+        relay_command.arg(&config).stdout(Stdio::null()).stderr(Stdio::null());
+        let _relay = Running::spawn(&mut relay_command, directory, 1).unwrap();
         let mut supervisor = Supervisor::default();
         assert_eq!(supervisor.start(StartRequest { engine, remote: relay_addr.to_string(), server_key: public.into(),
             mappings: vec![Mapping { name: "web".into(), local_port, token }] }).unwrap().state, "running");
