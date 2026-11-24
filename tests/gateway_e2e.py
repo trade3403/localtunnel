@@ -107,6 +107,64 @@ def check_gateway(directory, cli, ports, expected, port_factory, passed, results
                     assert reader.read(2) == bytes([0x81, len(payload)])
                     assert reader.read(len(payload)) == payload
         passed.append("verified TLS WebSocket upgrade and bidirectional text frame")
+        # Certificate preflight rejects short validity, wrong hostname, wrong key.
+        def cert_check(certificate, private_key, days, hosts, success):
+            run = subprocess.run([str(cli), "cert-check", str(certificate), str(private_key), str(cert), str(days), *hosts],
+                                 capture_output=True, timeout=15)
+            assert (run.returncode == 0) == success, run.stderr.decode(errors="replace")
+        cert_check(cert, key, 0, list(names), True)
+        cert_check(cert, key, 2, list(names), False)
+        cert_check(cert, key, 0, ["wrong.example.test"], False)
+        other_key = directory / "wrong.key"
+        subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048",
+                        "-out", str(other_key)], check=True, timeout=30, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cert_check(cert, other_key, 0, list(names), False)
+        passed.append("certificate trust, hostname, expiration and private key preflight")
+        # Dynamic routes over the running relay: keep the same master and listener.
+        managed_port = port_factory()
+        while managed_port in (http_port, tls_port, *ports):
+            managed_port = port_factory()
+        managed = directory / "managed"
+        managed.mkdir(mode=0o700)
+        endpoint = f"127.0.0.1:{managed_port}"
+        def manage(action, routes, success=True):
+            run = subprocess.run([str(cli), "gateway-" + action, str(managed), endpoint, *routes],
+                                 capture_output=True, timeout=35)
+            assert (run.returncode == 0) == success, run.stderr.decode(errors="replace")
+        manage("init", pairs[:2])
+        log = (results / "managed-nginx.log").open("wb")
+        handles.append(log)
+        master = subprocess.Popen(["nginx", "-p", str(managed)+"/", "-c", str(managed/"nginx.conf"),
+                                  "-g", "daemon off;"], stdout=log, stderr=subprocess.STDOUT)
+        processes.append(master)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if master.poll() is not None:
+                raise RuntimeError("managed gateway terminated")
+            try:
+                if request(managed_port, names[0]) == (200, expected[0]):
+                    break
+            except OSError:
+                pass
+            time.sleep(.2)
+        else:
+            raise RuntimeError("managed gateway did not start")
+        assert request(managed_port, names[1])[0] == 421
+        original_pid = (managed/"nginx.pid").read_text()
+        manage("apply", pairs)
+        assert request(managed_port, names[1]) == (200, expected[1])
+        assert request(managed_port, names[0]) == (200, expected[0])
+        before = (managed/"nginx.conf").read_bytes()
+        manage("apply", [*pairs, names[0], str(ports[1])], success=False)
+        assert (managed/"nginx.conf").read_bytes() == before
+        assert request(managed_port, names[1]) == (200, expected[1])
+        manage("apply", pairs[2:])
+        assert request(managed_port, names[0])[0] == 421
+        assert request(managed_port, names[1]) == (200, expected[1])
+        manage("apply", [])
+        assert request(managed_port, names[1])[0] == 421
+        assert (managed/"nginx.pid").read_text() == original_pid and master.poll() is None
+        passed.append("live gateway add/remove/disable-all routes with same master and invalid update rejected")
     finally:
         for p in processes:
             if p.poll() is None:
