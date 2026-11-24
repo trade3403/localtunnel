@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod profile;
+
 use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, net::SocketAddr, path::Path, process::{Child, Command, Stdio}, sync::Mutex};
@@ -141,16 +143,70 @@ fn tunnel_status(supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Stat
     supervisor.lock().map_err(|_| "进程状态不可用")?.status()
 }
 
+#[tauri::command]
+fn save_profile(app: tauri::AppHandle, profile: profile::Profile) -> Result<(), String> {
+    let path = app.path().app_config_dir().map_err(|_| "无法定位用户配置目录")?;
+    profile::save(&path, &profile)
+}
+
+#[tauri::command]
+fn load_profile(app: tauri::AppHandle) -> Result<Option<profile::Profile>, String> {
+    let path = app.path().app_config_dir().map_err(|_| "无法定位用户配置目录")?;
+    profile::load(&path)
+}
+
 fn main() {
+    use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, save_profile, load_profile])
+        .setup(|app| {
+            let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+            let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "退出 LocalTunnel", true, None::<&str>)?;
+            let menu = Menu::with_items(app, &[&show, &stop, &quit])?;
+            let icon = app.default_window_icon().cloned().ok_or("应用图标缺失")?;
+            TrayIconBuilder::with_id("localtunnel")
+                .icon(icon)
+                .tooltip("LocalTunnel · 内网穿透")
+                .menu(&menu)
+                .on_menu_event(|app, event| {
+                    match event.id.as_ref() {
+                        "show" => {
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        "stop" | "quit" => {
+                            let state = app.state::<Mutex<Supervisor>>();
+                            let stopped = state.lock().ok().is_some_and(|mut supervisor| supervisor.stop().is_ok());
+                            if stopped && event.id.as_ref() == "quit" {
+                                app.exit(0);
+                            } else if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.unminimize();
+                                let _ = window.set_focus();
+                            }
+                        }
+                        _ => {}
+                    }
+                })
+                .build(app)?;
+            Ok(())
+        })
         .on_window_event(|window, event| {
             if window.label() == "main" {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    let state = window.state::<Mutex<Supervisor>>();
-                    let stopped = state.lock().ok().is_some_and(|mut supervisor| supervisor.stop().is_ok());
-                    if !stopped { api.prevent_close(); }
+                    // Only hide if the tray exists; the explicit tray quit stops the engine.
+                    if window.app_handle().tray_by_id("localtunnel").is_some() && window.hide().is_ok() {
+                        api.prevent_close();
+                    } else {
+                        let state = window.state::<Mutex<Supervisor>>();
+                        let stopped = state.lock().ok().is_some_and(|mut supervisor| supervisor.stop().is_ok());
+                        if !stopped { api.prevent_close(); }
+                    }
                 }
             }
         })
