@@ -1,0 +1,36 @@
+name: Hosted Runner Smoke
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  smoke:
+    name: Runner smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Check installed Rust tools
+        run: |
+          rustup --version
+          rustc --version
+          cargo --version
+      - name: Verify native Rust compilation
+        shell: bash
+        run: |
+          set -euo pipefail
+          workdir="$(mktemp -d)"
+          trap 'rm -rf "$workdir"' EXIT
+          cd "$workdir"
+          cargo init --bin --name localtunnel_runner_smoke --vcs none
+          cargo build --release
+          cargo test
+          cargo run --release
+      - name: Scope
+        shell: bash
+        run: echo "Runner environment only; product and public E2E not tested."
