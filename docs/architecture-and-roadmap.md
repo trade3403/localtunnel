@@ -131,6 +131,8 @@ Windows：安装签名客户端 → 验证 WebView2 → 配对 → 新建映射 
 
 ## 06 / 测试、性能与参考资料
 
+统一使用 GitHub 官方免费的标准 GitHub-hosted Runner（ubuntu-latest、windows-latest，后期 macos-latest），不使用自托管 Runner。详细见 [云端部署测试规范](github-actions-ci-cd.md)。临时 CI 环境不作为正式公网服务器；真实公网 E2E 需获授权的可达入口，不以回环测试替代。
+
 ### 自动化验收矩阵
 
 | 测试 | 验收内容 |
