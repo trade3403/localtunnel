@@ -272,6 +272,24 @@ mod tests {
         assert!(build_config(&req).is_err());
     }
 
+    // Match the same bounded Base64 token extraction as the verified Python E2E.
+    fn generated_key<'a>(output: &'a str, label: &str) -> Option<&'a str> {
+        let (_, tail) = output.split_once(label)?;
+        let tail = tail.trim_start();
+        let n = tail.bytes().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')).count();
+        let key = &tail[..n];
+        (key.len() == 44 && key.ends_with('=')).then_some(key)
+    }
+
+    #[test]
+    fn key_parser_ignores_trailing_output_without_weakening_key_validation() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let output = format!("Private Key: {key} \x1b[0m\r\nPublic Key: {key} (keep safe)\r\n");
+        assert_eq!(generated_key(&output, "Private Key:"), Some(key));
+        assert_eq!(generated_key(&output, "Public Key:"), Some(key));
+        assert!(generated_key("Private Key: invalid", "Private Key:").is_none());
+    }
+
     #[test]
     #[ignore = "requires real Rathole executable; run explicitly in hosted CI"]
     fn real_engine_supervisor_lifecycle() {
@@ -281,8 +299,8 @@ mod tests {
         let output = Command::new(&engine).arg("--genkey").output().unwrap();
         assert!(output.status.success());
         let keys = String::from_utf8(output.stdout).unwrap();
-        let private = keys.lines().find_map(|s| s.trim().strip_prefix("Private Key:").map(str::trim)).unwrap();
-        let public = keys.lines().find_map(|s| s.trim().strip_prefix("Public Key:").map(str::trim)).unwrap();
+        let private = generated_key(&keys, "Private Key:").expect("missing or malformed generated private key");
+        let public = generated_key(&keys, "Public Key:").expect("missing or malformed generated public key");
         let local = TcpListener::bind("127.0.0.1:0").unwrap();
         let local_port = local.local_addr().unwrap().port();
         local.set_nonblocking(true).unwrap();
