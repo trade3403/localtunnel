@@ -11,7 +11,7 @@ pub struct Certificate<'a> {
     pub key: &'a str,
 }
 
-fn domain_valid(domain: &str) -> bool {
+pub(crate) fn domain_valid(domain: &str) -> bool {
     domain.len() <= 253
         && domain.contains('.')
         && domain.parse::<IpAddr>().is_err()
@@ -33,7 +33,7 @@ fn path_valid(path: &str) -> bool {
 /// All upstreams are restricted to relay ports on IPv4 loopback.
 pub fn gateway_config(bind: SocketAddr, routes: &[Route<'_>], cert: Option<Certificate<'_>>) -> Result<String, &'static str> {
     if bind.port() == 0 || bind.ip().is_multicast() { return Err("invalid listener"); }
-    if routes.is_empty() || routes.len() > 64 { return Err("expected 1-64 routes"); }
+    if routes.len() > 64 { return Err("expected at most 64 routes"); }
     let mut domains = HashSet::new();
     for route in routes {
         if !domain_valid(route.domain) { return Err("expected lowercase DNS hostname, without wildcard"); }
