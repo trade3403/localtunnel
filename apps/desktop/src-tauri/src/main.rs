@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod profile;
+mod credentials;
 
 use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};
@@ -8,16 +9,16 @@ use std::{io::Write, net::SocketAddr, path::Path, process::{Child, Command, Stdi
 use tempfile::TempDir;
 use tauri::Manager;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Mapping {
     name: String,
     local_port: u16,
     token: String,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct StartRequest {
     engine: String,
     remote: String,
@@ -155,11 +156,41 @@ fn load_profile(app: tauri::AppHandle) -> Result<Option<profile::Profile>, Strin
     profile::load(&path)
 }
 
+#[tauri::command]
+fn save_protected_profile(app: tauri::AppHandle, request: StartRequest) -> Result<(), String> {
+    let path = app.path().app_config_dir().map_err(|_| "无法定位用户配置目录")?;
+    credentials::save(&path, &request)
+}
+
+#[tauri::command]
+fn load_protected_profile(app: tauri::AppHandle) -> Result<Option<StartRequest>, String> {
+    let path = app.path().app_config_dir().map_err(|_| "无法定位用户配置目录")?;
+    credentials::load(&path)
+}
+
+#[tauri::command]
+fn forget_protected_profile(app: tauri::AppHandle) -> Result<(), String> {
+    let path = app.path().app_config_dir().map_err(|_| "无法定位用户配置目录")?;
+    credentials::forget(&path)
+}
+
+fn local_port_open(port: u16) -> Result<bool, String> {
+    if port == 0 { return Err("端口必须在 1–65535".into()); }
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    Ok(std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).is_ok())
+}
+
+#[tauri::command]
+async fn check_local_port(port: u16) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || local_port_open(port)).await
+        .map_err(|_| "本地端口检测失败")?
+}
+
 fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, save_profile, load_profile])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
@@ -241,6 +272,24 @@ mod tests {
         assert!(build_config(&req).is_err());
     }
 
+    // Match the same bounded Base64 token extraction as the verified Python E2E.
+    fn generated_key<'a>(output: &'a str, label: &str) -> Option<&'a str> {
+        let (_, tail) = output.split_once(label)?;
+        let tail = tail.trim_start();
+        let n = tail.bytes().take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')).count();
+        let key = &tail[..n];
+        (key.len() == 44 && key.ends_with('=')).then_some(key)
+    }
+
+    #[test]
+    fn key_parser_ignores_trailing_output_without_weakening_key_validation() {
+        let key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let output = format!("Private Key: {key} \x1b[0m\r\nPublic Key: {key} (keep safe)\r\n");
+        assert_eq!(generated_key(&output, "Private Key:"), Some(key));
+        assert_eq!(generated_key(&output, "Public Key:"), Some(key));
+        assert!(generated_key("Private Key: invalid", "Private Key:").is_none());
+    }
+
     #[test]
     #[ignore = "requires real Rathole executable; run explicitly in hosted CI"]
     fn real_engine_supervisor_lifecycle() {
@@ -250,8 +299,8 @@ mod tests {
         let output = Command::new(&engine).arg("--genkey").output().unwrap();
         assert!(output.status.success());
         let keys = String::from_utf8(output.stdout).unwrap();
-        let private = keys.lines().find_map(|s| s.trim().strip_prefix("Private Key:").map(str::trim)).unwrap();
-        let public = keys.lines().find_map(|s| s.trim().strip_prefix("Public Key:").map(str::trim)).unwrap();
+        let private = generated_key(&keys, "Private Key:").expect("missing or malformed generated private key");
+        let public = generated_key(&keys, "Public Key:").expect("missing or malformed generated public key");
         let local = TcpListener::bind("127.0.0.1:0").unwrap();
         let local_port = local.local_addr().unwrap().port();
         local.set_nonblocking(true).unwrap();
@@ -303,6 +352,16 @@ mod tests {
         fixture.join().unwrap();
         assert_eq!(supervisor.stop().unwrap().state, "stopped");
         assert!(supervisor.running.is_none());
+    }
+
+    #[test]
+    fn local_port_probe_uses_real_loopback_listener() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(local_port_open(port).unwrap());
+        drop(listener);
+        assert!(!local_port_open(port).unwrap());
+        assert!(local_port_open(0).is_err());
     }
 
     #[test]

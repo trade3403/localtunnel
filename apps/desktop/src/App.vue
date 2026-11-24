@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 
 type Mapping = { id: number; name: string; localPort: number | null; token: string }
 type Profile = { engine: string; remote: string; serverKey: string; mappings: { name: string; localPort: number }[] }
+type StartRequest = Omit<Profile, 'mappings'> & { mappings: { name: string; localPort: number; token: string }[] }
 type Status = { state: 'stopped' | 'running' | 'error'; detail: string; mappingCount: number }
 const engine = ref('')
 const remote = ref('')
@@ -14,6 +15,7 @@ const status = ref<Status>({ state: 'stopped', detail: '正在获取进程状态
 const busy = ref(false)
 const error = ref('')
 const notice = ref('')
+const portNotice = ref<Record<number, string>>({})
 const ready = ref(false)
 const running = computed(() => status.value.state === 'running')
 const locked = computed(() => busy.value || running.value || !ready.value)
@@ -72,6 +74,53 @@ async function profileAction(action: 'save' | 'load') {
     error.value = e instanceof Error ? e.message : String(e)
   } finally { busy.value = false; void refresh() }
 }
+function currentRequest(): StartRequest {
+  if (mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535)) {
+    throw new Error('请输入 1–65535 的有效本地端口')
+  }
+  return {
+    engine: engine.value.trim(), remote: remote.value.trim(), serverKey: serverKey.value.trim(),
+    mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: Number(m.localPort), token: m.token }))
+  }
+}
+async function protectedAction(action: 'save' | 'load' | 'forget') {
+  if (locked.value || polling) return
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    if (action === 'save') {
+      await invoke('save_protected_profile', { request: currentRequest() })
+      notice.value = '已用当前 Windows 用户 DPAPI 加密保存配置及 Token'
+    } else if (action === 'load') {
+      const saved = await invoke<StartRequest | null>('load_protected_profile')
+      if (!saved) { notice.value = '尚未保存加密凭据'; return }
+      engine.value = saved.engine
+      remote.value = saved.remote
+      serverKey.value = saved.serverKey
+      mappings.value = saved.mappings.map(m => ({ ...m, id: nextId++ }))
+      notice.value = '已读取加密配置，未自动连接'
+    } else {
+      await invoke('forget_protected_profile')
+      mappings.value.forEach(m => { m.token = '' })
+      notice.value = '已删除保存的加密凭据并清空当前 Token'
+    }
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+  } finally { busy.value = false; void refresh() }
+}
+async function probe(mapping: Mapping) {
+  if (!ready.value || busy.value || !Number.isInteger(mapping.localPort) || Number(mapping.localPort) < 1 || Number(mapping.localPort) > 65535) return
+  const port = Number(mapping.localPort)
+  const id = mapping.id
+  portNotice.value[id] = '检测中…'
+  try {
+    const open = await invoke<boolean>('check_local_port', { port })
+    portNotice.value[id] = '端口 ' + port + (open ? ' TCP 可达' : ' TCP 不可达')
+  } catch {
+    portNotice.value[id] = '端口 ' + port + ' 检测失败'
+  }
+}
 async function toggle() {
   if (!ready.value || busy.value || polling) return
   busy.value = true
@@ -116,23 +165,26 @@ async function toggle() {
             <label>服务器公钥<input v-model="serverKey" :disabled="locked" required autocomplete="off" placeholder="X25519 公钥（Base64）" /></label>
             <label class="wide">Rathole 引擎路径<input v-model="engine" :disabled="locked" required placeholder="C:\LocalTunnel\rathole.exe" /></label>
           </div>
-          <p class="hint">仅使用已校验的官方引擎。当前版本不自动下载引擎，保存配置不会写入授权 Token。</p>
+          <p class="hint">仅使用已校验的官方引擎。普通保存不写入 Token；仅主动选择加密保存才保留凭据。</p>
           <div class="profile-actions">
             <button type="button" class="secondary" :disabled="locked" @click="profileAction('save')">保存配置</button>
             <button type="button" class="secondary" :disabled="locked" @click="profileAction('load')">读取配置</button>
+            <button type="button" class="secondary" :disabled="locked" @click="protectedAction('save')">加密保存含 Token</button>
+            <button type="button" class="secondary" :disabled="locked" @click="protectedAction('load')">读取加密配置</button>
+            <button type="button" class="secondary" :disabled="locked" @click="protectedAction('forget')">删除加密凭据</button>
             <span v-if="notice" role="status">{{ notice }}</span>
           </div>
         </section>
         <section>
           <div class="section-title"><h2>本地映射</h2><button type="button" class="secondary" :disabled="locked || mappings.length >= 64" @click="add">＋ 添加映射</button></div>
           <div class="table-head"><span>映射名称</span><span>本地端口</span><span>独立授权 Token</span><span></span></div>
-          <div v-for="mapping in mappings" :key="mapping.id" class="mapping">
+          <div v-for="mapping in mappings" :key="mapping.id" class="mapping-group"><div class="mapping">
             <input v-model="mapping.name" :disabled="locked" aria-label="映射名称" required maxlength="64" placeholder="web" />
             <input v-model.number="mapping.localPort" :disabled="locked" aria-label="本地端口" required type="number" min="1" max="65535" />
             <input v-model="mapping.token" :disabled="locked" aria-label="映射授权 Token" required type="password" autocomplete="off" minlength="32" maxlength="128" placeholder="输入授权 Token" />
             <button type="button" class="remove" :disabled="locked || mappings.length === 1" @click="remove(mapping.id)" aria-label="删除映射">×</button>
-          </div>
-          <p class="hint">目标地址固定为 127.0.0.1。停止隧道后可编辑配置；域名由服务端分配。</p>
+          </div><div class="port-actions"><button type="button" class="secondary" :disabled="busy || !ready" @click="probe(mapping)">检测本地端口</button><span role="status">{{ portNotice[mapping.id] || "未检测" }}</span></div></div>
+          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。停止隧道后可编辑配置；域名由服务端分配。</p>
         </section>
         <div class="actions">
           <div aria-live="polite"><strong>{{ label }}</strong><p>{{ status.detail }}</p><p v-if="error" class="error" role="alert">{{ error }}</p></div>
