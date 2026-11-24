@@ -31,7 +31,16 @@ try {
     $remove = Start-Process -FilePath $uninstaller -ArgumentList "/S" -PassThru
     if (!$remove.WaitForExit(120000)) { $remove.Kill(); throw "Uninstaller timed out" }
     if ($remove.ExitCode -ne 0) { throw "Uninstaller failed: $($remove.ExitCode)" }
-    if (Test-Path -LiteralPath $exe) { throw "Application remains after uninstall" }
+    # NSIS normally copies its uninstaller to TEMP and starts a child. The
+    # original process may return before the child removes installed files.
+    # Preserve the removal gate: wait for evidence, never delete the app ourselves.
+    $report.uninstaller_launcher_exit_code = $remove.ExitCode
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while ((Test-Path -LiteralPath $exe) -and $watch.Elapsed.TotalSeconds -lt 60) {
+        Start-Sleep -Milliseconds 250
+    }
+    $report.removal_wait_ms = $watch.ElapsedMilliseconds
+    if (Test-Path -LiteralPath $exe) { throw "Application remains after uninstall (60-second completion window)" }
     $report.uninstalled = $true
 } finally {
     if ($app -and !$app.HasExited) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue }
