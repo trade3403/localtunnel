@@ -1,7 +1,7 @@
-name: V0.1 Rust Tunnel CI
+name: V0.2 Rust Gateway CI
 on:
   push:
-    branches: [main, 'feat/v0.1-rust-tunnel']
+    branches: [main, 'feat/v0.2-domain-gateway']
   pull_request:
   workflow_dispatch:
 permissions:
@@ -25,8 +25,16 @@ jobs:
           cargo --version
           cargo test --locked
           cargo build --release --locked
+      - name: Install Linux test gateway
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nginx openssl curl
       - name: Real encrypted loopback E2E
         shell: bash
+        env:
+          LOCALTUNNEL_GATEWAY_E2E: ${{ runner.os == 'Linux' && '1' || '0' }}
         run: python tests/e2e.py
       - name: Package CLI build
         shell: bash
@@ -49,7 +57,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: v01-evidence-${{ matrix.os }}
+          name: v02-evidence-${{ matrix.os }}
           path: test-results/
           if-no-files-found: warn
           retention-days: 7
