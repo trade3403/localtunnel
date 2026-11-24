@@ -2,6 +2,7 @@
 
 mod profile;
 mod credentials;
+mod engine_integrity;
 #[cfg(windows)]
 mod engine_job;
 
@@ -106,6 +107,7 @@ impl Supervisor {
         let config = build_config(&request)?;
         let directory = tempfile::Builder::new().prefix("localtunnel-client-").tempdir()
             .map_err(|_| "无法创建临时配置目录")?;
+        let staged_engine = engine_integrity::stage(engine, directory.path())?;
         let config_path = directory.path().join("client.toml");
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -117,8 +119,8 @@ impl Supervisor {
         let mut file = opts.open(&config_path).map_err(|_| "无法创建临时配置")?;
         file.write_all(config.as_bytes()).and_then(|_| file.sync_all()).map_err(|_| "无法写入配置")?;
         drop(file);
-        let mut command = Command::new(engine);
-        command.arg(&config_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut command = Command::new(&staged_engine);
+        command.current_dir(directory.path()).arg(&config_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         command.env_remove("LOCALTUNNEL_TOKEN").env_remove("LOCALTUNNEL_SERVER_PRIVATE_KEY").env_remove("LOCALTUNNEL_SERVER_PUBLIC_KEY");
         for i in 1..=64 { command.env_remove(format!("LOCALTUNNEL_TOKEN_{i}")); }
         #[cfg(windows)]
