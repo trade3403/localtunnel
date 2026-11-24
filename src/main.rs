@@ -84,6 +84,26 @@ fn run() -> Result<(), String> {
             }
         }
         #[cfg(target_os = "linux")]
+        [command, prefix, bind, probe, chain, key, ca, days, pairs @ ..]
+            if command == "gateway-tls-init" || command == "gateway-tls-apply" => {
+            if pairs.is_empty() || pairs.len() % 2 != 0 || pairs.len() > 128 {
+                return Err("provide 1-64 domain/port pairs".into());
+            }
+            let routes = pairs.chunks_exact(2).map(|p| {
+                Ok(Route { domain: &p[0], port: p[1].parse().map_err(|_| "invalid upstream port")? })
+            }).collect::<Result<Vec<_>, &str>>()?;
+            let address = bind.parse().map_err(|_| "invalid gateway listener")?;
+            let tls = localtunnel::managed_gateway::TlsSettings {
+                probe: probe.parse().map_err(|_| "invalid revision probe listener")?,
+                chain, key, ca, minimum_days: days.parse().map_err(|_| "invalid minimum validity days")?,
+            };
+            if command == "gateway-tls-init" {
+                localtunnel::managed_gateway::init_tls(Path::new(prefix), address, &routes, &tls)?;
+            } else {
+                localtunnel::managed_gateway::apply_tls(Path::new(prefix), address, &routes, &tls)?;
+            }
+        }
+        #[cfg(target_os = "linux")]
         [command, chain, key, ca, days, domains @ ..] if command == "cert-check" => {
             let days = days.parse().map_err(|_| "invalid minimum validity days")?;
             localtunnel::certificates::check(chain, key, ca, days, domains)?;
@@ -99,7 +119,7 @@ fn run() -> Result<(), String> {
             if !status.success() { return Err(format!("engine exited: {status}")); }
         }
         [command] if command == "--version" => println!("localtunnel {}", env!("CARGO_PKG_VERSION")),
-        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | run <config-file> | --version".into()),
+        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | gateway-tls-init/gateway-tls-apply <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> [...] (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | run <config-file> | --version".into()),
     }
     Ok(())
 }
