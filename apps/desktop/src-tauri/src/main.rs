@@ -138,7 +138,18 @@ impl Supervisor {
             }
             running.child.wait().map_err(|_| "无法等待隧道退出")?;
         }
-        self.running.take();
+        if let Some(running) = self.running.take() {
+            // Report cleanup failures rather than silently discarding a plaintext config.
+            let config_path = running._directory.path().join("client.toml");
+            if let Err(error) = std::fs::remove_file(&config_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.last_error = Some("引擎已停止，但临时凭据文件清理失败".into());
+                    drop(running);
+                    return Err(self.last_error.clone().unwrap());
+                }
+            }
+            drop(running);
+        }
         self.last_error = None;
         self.status()
     }
@@ -375,7 +386,11 @@ mod tests {
         }
         assert!(forwarded, "desktop supervisor failed to forward real bytes");
         fixture.join().unwrap();
+        let client_dir = supervisor.running.as_ref().unwrap()._directory.path().to_owned();
+        assert!(client_dir.join("client.toml").is_file());
         assert_eq!(supervisor.stop().unwrap().state, "stopped");
+        assert!(!client_dir.join("client.toml").exists(), "plaintext config survived stop");
+        assert!(!client_dir.exists(), "temporary directory survived stop");
         assert!(supervisor.running.is_none());
     }
 

@@ -22,3 +22,7 @@
 4. 只在有实质变化时更新本记录及相关版本文档；每次报告包含阶段、功能、head SHA、真实 CI 链接/结果、数据、产物、未完与下一项。完成所有授权范围目标后，若剩余仅人工门禁，报告并暂停开发任务；不得自行发布。
 
 下一次执行从 PR #5 当前 HEAD 开始，不固定旧 SHA。此文档是接续入口，实际 CI 与分支最新状态优先。
+
+## 2026-11-25：安装门禁通过，下一增量
+- PR #5 head 7dc9358a28e8ecd1186c72bf1b830993bfbd8c83，Windows CI #27 https://github.com/trade3403/localtunnel/actions/runs/45424105874 全部通过；9/9 单测、1/1 真实 TCP 生命周期（0.58 秒为测试耗时，不是网络性能）。实际下载证据 ZIP 核验 installer-smoke.json：installed/window_started/uninstalled 均 true，卸载启动器 exit 0，文件消失等待 258 ms。build.txt 实际测试 merge SHA 4d350107da1dad59d22aa73685b42d01598fd990，EXE SHA256 540410316edd4f18711ecda842cdbb7bcbe462ed5c571b251069f33746483d7。安装包 1.99 MiB，未签名预览：https://github.com/trade3403/localtunnel/actions/runs/45424105874/artifacts/14936666766 ，证据：https://github.com/trade3403/localtunnel/actions/runs/45424105874/artifacts/14936093271 。V0.2 #57 与 Runner #122 均通过。
+- 下一安全增量：正常停止后显式删除临时明文配置，失败时报告而不是静默成功；真实生命周期测试增加配置文件和目录不存在的断言。新提交待 CI。强杀桌面后的孤立配置清理仍未实现；后续继续可信引擎、依赖锁、独立服务及自启等门禁。
