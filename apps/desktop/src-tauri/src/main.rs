@@ -371,6 +371,20 @@ mod tests {
         relay_command.arg(&config).stdout(Stdio::null()).stderr(Stdio::null());
         let _relay = Running::spawn(&mut relay_command, directory, 1).unwrap();
         let mut supervisor = Supervisor::default();
+        // Alter one byte of the real release executable and exercise the exact
+        // supervisor launch guard, without ever executing the altered copy.
+        let tampered_dir = tempfile::tempdir().unwrap();
+        let tampered_path = tampered_dir.path().join("rathole.exe");
+        let mut tampered_bytes = std::fs::read(&engine).unwrap();
+        tampered_bytes[0] ^= 1;
+        std::fs::write(&tampered_path, tampered_bytes).unwrap();
+        let error = supervisor.start(StartRequest {
+            engine: tampered_path.to_string_lossy().into_owned(),
+            remote: relay_addr.to_string(), server_key: public.into(),
+            mappings: vec![Mapping { name: "web".into(), local_port, token: token.clone() }],
+        }).err().expect("modified engine must not launch");
+        assert!(error.contains("SHA-256"));
+        assert!(supervisor.running.is_none());
         assert_eq!(supervisor.start(StartRequest { engine, remote: relay_addr.to_string(), server_key: public.into(),
             mappings: vec![Mapping { name: "web".into(), local_port, token }] }).unwrap().state, "running");
         let until = Instant::now() + Duration::from_secs(25);
