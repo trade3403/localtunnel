@@ -10,6 +10,7 @@
 
 - [V0.1 候选版运行和测试说明](docs/v0.1.md)
 - [V0.2 域名网关候选版](docs/v0.2.md)
+- [V0.3 Windows 客户端开发预览](docs/v0.3.md)
 
 ## 技术栈
 
@@ -17,13 +18,13 @@ Rust · Tokio · Rathole · Axum · Rustls · Tauri 2 · Vue 3 · SQLite · Ngin
 
 ## 开发进度
 
-V0.1 免费 Linux/Windows Runner 同机加密隧道测试已通过。V0.2 静态域名网关已通过 Linux/Windows CI #17；动态 HTTP/HTTPS 路由、证书预检和证书轮换增量已提交，等待新 CI。公网部署和真实域名绑定暂缓。
+V0.1 免费 Linux/Windows Runner 同机加密隧道测试已通过。V0.2 静态域名网关已通过 Linux/Windows CI #17；动态 HTTP/HTTPS 路由及证书轮换已通过 CI #44。V0.3 Windows 客户端候选代码等待 CI。公网部署和真实域名绑定暂缓。
 
 | 版本 | 目标 | 状态 |
 |---|---|---|
 | V0.1 | Rust 配置工具、加密隧道、同机 E2E；公网验收延后 | 同机 CI 通过，公网待验收 |
-| V0.2 | 域名映射、HTTPS、WebSocket | 静态网关 CI 通过；动态 HTTP/HTTPS 路由、证书预检及轮换待 CI；ACME、动态隧道待开发 |
-| V0.3 | Windows 客户端及安装包 | 待开发 |
+| V0.2 | 域名映射、HTTPS、WebSocket | 静态及动态网关 CI 通过；ACME、动态隧道待开发 |
+| V0.3 | Windows 客户端及安装包 | 桌面预览、托盘与非秘密配置保存已提交，待 CI；独立后台服务待开发 |
 | V0.4 | Web 管理后台 | 待开发 |
 | V0.5 | 安全、稳定性与负载测试 | 待开发 |
 | V0.6–V1.0 | 跨平台、扩展、商业化、多节点及发行 | 待开发 |

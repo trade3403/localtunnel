@@ -1,0 +1,10 @@
+{
+  "identifier": "main",
+  "description": "Main desktop window; no filesystem or shell plugin permissions",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default"
+  ]
+}
