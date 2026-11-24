@@ -4,6 +4,7 @@ use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, net::SocketAddr, path::Path, process::{Child, Command, Stdio}, sync::Mutex};
 use tempfile::TempDir;
+use tauri::Manager;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -144,6 +145,15 @@ fn main() {
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
         .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status])
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    let state = window.state::<Mutex<Supervisor>>();
+                    let stopped = state.lock().ok().is_some_and(|mut supervisor| supervisor.stop().is_ok());
+                    if !stopped { api.prevent_close(); }
+                }
+            }
+        })
         .run(tauri::generate_context!())
         .expect("LocalTunnel desktop runtime failed");
 }
@@ -173,6 +183,70 @@ mod tests {
         req.mappings[0].local_port = 8080;
         req.mappings[0].token = "short".into();
         assert!(build_config(&req).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires real Rathole executable; run explicitly in hosted CI"]
+    fn real_engine_supervisor_lifecycle() {
+        use std::{io::{Read, Write}, net::{TcpListener, TcpStream}, thread, time::{Duration, Instant}};
+        use localtunnel::server_config;
+        let engine = std::env::var("LOCALTUNNEL_TEST_ENGINE").expect("test engine required");
+        let output = Command::new(&engine).arg("--genkey").output().unwrap();
+        assert!(output.status.success());
+        let keys = String::from_utf8(output.stdout).unwrap();
+        let private = keys.lines().find_map(|s| s.trim().strip_prefix("Private Key:").map(str::trim)).unwrap();
+        let public = keys.lines().find_map(|s| s.trim().strip_prefix("Public Key:").map(str::trim)).unwrap();
+        let local = TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_port = local.local_addr().unwrap().port();
+        local.set_nonblocking(true).unwrap();
+        let relay_port = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mapped_port = TcpListener::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay_port.local_addr().unwrap();
+        let mapped_addr = mapped_port.local_addr().unwrap();
+        let fixture = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if let Ok((mut connection, _)) = local.accept() {
+                    connection.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    let mut buffer = [0u8; 4];
+                    if connection.read_exact(&mut buffer).is_ok() && &buffer == b"ping" {
+                        connection.write_all(b"pong").unwrap();
+                        return;
+                    }
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            panic!("fixture did not receive tunneled data");
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("server.toml");
+        // Ephemeral loopback-only CI token, never a production credential.
+        let token = format!("{:032x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        std::fs::write(&config, server_config(relay_addr, "web", mapped_addr.port(), &token, private).unwrap()).unwrap();
+        drop(relay_port);
+        drop(mapped_port);
+        let child = Command::new(&engine).arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let _relay = Running { child, _directory: directory, count: 1 };
+        let mut supervisor = Supervisor::default();
+        assert_eq!(supervisor.start(StartRequest { engine, remote: relay_addr.to_string(), server_key: public.into(),
+            mappings: vec![Mapping { name: "web".into(), local_port, token }] }).unwrap().state, "running");
+        let until = Instant::now() + Duration::from_secs(25);
+        let mut forwarded = false;
+        while Instant::now() < until {
+            if let Ok(mut stream) = TcpStream::connect_timeout(&mapped_addr, Duration::from_millis(500)) {
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                let mut response = [0u8; 4];
+                if stream.write_all(b"ping").is_ok() && stream.read_exact(&mut response).is_ok() && &response == b"pong" {
+                    forwarded = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        assert!(forwarded, "desktop supervisor failed to forward real bytes");
+        fixture.join().unwrap();
+        assert_eq!(supervisor.stop().unwrap().state, "stopped");
+        assert!(supervisor.running.is_none());
     }
 
     #[test]
