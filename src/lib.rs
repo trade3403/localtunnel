@@ -1,3 +1,5 @@
+pub mod managed_gateway;
+pub mod certificates;
 pub mod gateway;
 use std::net::SocketAddr;
 
