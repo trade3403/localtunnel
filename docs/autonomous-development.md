@@ -26,3 +26,10 @@
 ## 2026-11-25：安装门禁通过，下一增量
 - PR #5 head 7dc9358a28e8ecd1186c72bf1b830993bfbd8c83，Windows CI #27 https://github.com/trade3403/localtunnel/actions/runs/45424105874 全部通过；9/9 单测、1/1 真实 TCP 生命周期（0.58 秒为测试耗时，不是网络性能）。实际下载证据 ZIP 核验 installer-smoke.json：installed/window_started/uninstalled 均 true，卸载启动器 exit 0，文件消失等待 258 ms。build.txt 实际测试 merge SHA 4d350107da1dad59d22aa73685b42d01598fd990，EXE SHA256 540410316edd4f18711ecda842cdbb7bcbe462ed5c571b251069f33746483d7。安装包 1.99 MiB，未签名预览：https://github.com/trade3403/localtunnel/actions/runs/45424105874/artifacts/14936666766 ，证据：https://github.com/trade3403/localtunnel/actions/runs/45424105874/artifacts/14936093271 。V0.2 #57 与 Runner #122 均通过。
 - 下一安全增量：正常停止后显式删除临时明文配置，失败时报告而不是静默成功；真实生命周期测试增加配置文件和目录不存在的断言。新提交待 CI。强杀桌面后的孤立配置清理仍未实现；后续继续可信引擎、依赖锁、独立服务及自启等门禁。
+
+
+## 2026-11-25：正常停止清理验收、引擎完整性增量
+- PR #5 head 3e9b39b80f5447a51d333b3cfa13b14d03c18c12：Windows CI #29 https://github.com/trade3403/localtunnel/actions/runs/45426246888 全部通过，9/9 Rust 单测、1/1 真实 TCP 生命周期（0.78 秒为测试耗时），正常停止后临时明文配置及目录不存在断言通过。EXE 2.00 MiB；安装、启动、卸载门禁通过。未签名预览包 https://github.com/trade3403/localtunnel/actions/runs/45426246888/artifacts/14938545505 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45426246888/artifacts/14936868707 。预览包 ZIP 的 SHA256 0364a5a7727bee672845e5a4ef8f59b12dbb1bb6cf9ee21dfa8c6526509674a9（不是 EXE 的 SHA）。V0.2 #58、Runner #124 通过。
+- 新增 engine_integrity.rs，Windows CI 在编译前从现有固定 SHA256 的 Rathole v0.5.0 Windows x64 官方归档提取引擎，通过 Get-FileHash 得到二进制 SHA256，并以构建时 LOCALTUNNEL_ENGINE_SHA256 嵌入客户端。运行时不信任环境变量或用户自报哈希；未配置构建指纹、非法指纹、超限或文件摘要不匹配均拒绝启动。最多读取 64 MiB，将通过校验的确切字节写入独立临时目录，执行该副本而非原始路径；此机制不抵御已控制同一用户账户或临时目录的攻击者。引擎与临时配置随正常停止清理，强杀后孤立目录清理仍待实现。
+- 新增两项校验单测，真实生命周期测试先篡改真实官方 EXE 的一个字节并验证拒绝启动，然后使用正确引擎走真实 TCP 转发及清理门禁。提交 d91fada3598b11038621d5ef21cd047c33e59199、0714625ab45eb7651cc1cc4a7293d29819894558、0570ea8ddaaa9fefb4ddc6a4a8074c50c74c905a、6350f5c2cc97776a0d51e9f4858b9773dfa66ed8、d91c4adc00904db4f1cecddd6004216f5a5841ea。新 CI 待核验。
+- 下一步：先验收此次增量；之后审查并锁定 Cargo.lock 与 package-lock.json、改用 locked/npm ci，并考虑将已验证的引擎纳入安装包（许可声明、完整性复核）；目前仍需要用户提供对应官方 EXE 路径。Windows Service、自启、认证状态、流量计量、真实 GUI/托盘及异常退出专项仍未完成。只在安全开发分支工作，不发布 main。
