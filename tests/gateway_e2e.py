@@ -47,11 +47,11 @@ def check_gateway(directory, cli, ports, expected, port_factory, passed, results
                 time.sleep(.2)
         raise RuntimeError("gateway failed to listen")
 
-    def request(port, host, tls=False, sni=None, path="/", headers=None):
+    def request(port, host, tls=False, sni=None, path="/", headers=None, trust=None):
         sock = socket.create_connection(("127.0.0.1", port), timeout=5)
         try:
             if tls:
-                sock = context.wrap_socket(sock, server_hostname=sni or host)
+                sock = (trust or context).wrap_socket(sock, server_hostname=sni or host)
             extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items())
             sock.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n{extra}\r\n".encode())
             response = http.client.HTTPResponse(sock)
@@ -165,6 +165,69 @@ def check_gateway(directory, cli, ports, expected, port_factory, passed, results
         assert request(managed_port, names[1])[0] == 421
         assert (managed/"nginx.pid").read_text() == original_pid and master.poll() is None
         passed.append("live gateway add/remove/disable-all routes with same master and invalid update rejected")
+        # Managed HTTPS: use versioned certificate files so rollback can retain old material.
+        live_tls = port_factory()
+        probe = port_factory()
+        used = {http_port, tls_port, managed_port, *ports}
+        while live_tls in used:
+            live_tls = port_factory()
+        while probe in used or probe == live_tls:
+            probe = port_factory()
+        tls_dir = directory / "managed-tls"
+        tls_dir.mkdir(mode=0o700)
+        new_cert, new_key = directory / "rotated.pem", directory / "rotated.key"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3",
+            "-subj", "/CN=web.example.test", "-addext", "subjectAltName=DNS:web.example.test,DNS:api.example.test",
+            "-keyout", str(new_key), "-out", str(new_cert)], check=True, timeout=30,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        new_context = ssl.create_default_context(cafile=str(new_cert))
+        def manage_tls(action, certificate, private_key, trust_file, routes, success=True):
+            run = subprocess.run([str(cli), "gateway-tls-" + action, str(tls_dir),
+                f"127.0.0.1:{live_tls}", f"127.0.0.1:{probe}", str(certificate), str(private_key),
+                str(trust_file), "0", *routes], capture_output=True, timeout=45)
+            assert (run.returncode == 0) == success, run.stderr.decode(errors="replace")
+        manage_tls("init", cert, key, cert, pairs[:2])
+        log = (results / "managed-tls-nginx.log").open("wb")
+        handles.append(log)
+        tls_master = subprocess.Popen(["nginx", "-p", str(tls_dir)+"/", "-c", str(tls_dir/"nginx.conf"),
+                                     "-g", "daemon off;"], stdout=log, stderr=subprocess.STDOUT)
+        processes.append(tls_master)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if tls_master.poll() is not None:
+                raise RuntimeError("managed TLS gateway exited")
+            try:
+                if request(live_tls, names[0], True) == (200, expected[0]):
+                    break
+            except OSError:
+                pass
+            time.sleep(.2)
+        else:
+            raise RuntimeError("managed HTTPS gateway did not start")
+        original_tls_pid = (tls_dir/"nginx.pid").read_text()
+        manage_tls("apply", new_cert, new_key, new_cert, pairs)
+        for name, body in zip(names, expected):
+            assert request(live_tls, name, True, trust=new_context) == (200, body)
+        try:
+            request(live_tls, names[0], True)
+        except ssl.SSLCertVerificationError:
+            pass
+        else:
+            raise RuntimeError("old trust unexpectedly accepted rotated certificate")
+        before_tls = (tls_dir/"nginx.conf").read_bytes()
+        manage_tls("apply", new_cert, key, new_cert, pairs, success=False)
+        assert (tls_dir/"nginx.conf").read_bytes() == before_tls
+        assert request(live_tls, names[0], True, trust=new_context) == (200, expected[0])
+        manage_tls("apply", new_cert, new_key, new_cert, pairs[2:])
+        try:
+            request(live_tls, names[0], True, trust=new_context)
+        except (ssl.SSLError, ConnectionError):
+            pass
+        else:
+            raise RuntimeError("deleted TLS domain still accepted")
+        assert request(live_tls, names[1], True, trust=new_context) == (200, expected[1])
+        assert (tls_dir/"nginx.pid").read_text() == original_tls_pid and tls_master.poll() is None
+        passed.append("live HTTPS route changes and certificate rotation with verified trust and same master")
     finally:
         for p in processes:
             if p.poll() is None:
