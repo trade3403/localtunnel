@@ -1,3 +1,4 @@
+use localtunnel::gateway::{gateway_config, Certificate, Route};
 use localtunnel::{client_config, server_config, client_configs, server_configs, ClientMapping, ServerMapping};
 use std::{env, fs::OpenOptions, io::Write, path::Path, process::{Command, ExitCode}};
 
@@ -51,6 +52,22 @@ fn run() -> Result<(), String> {
             };
             write_new(Path::new(output), &config)?;
         }
+        [command, output, bind, rest @ ..] if command == "gateway-http" || command == "gateway-https" => {
+            let (cert, pairs) = if command == "gateway-https" {
+                match rest {
+                    [chain, key, pairs @ ..] => (Some(Certificate { chain, key }), pairs),
+                    _ => return Err("gateway-https requires certificate and key paths".into()),
+                }
+            } else { (None, rest) };
+            if pairs.is_empty() || pairs.len() % 2 != 0 || pairs.len() > 128 {
+                return Err("provide 1-64 domain/port pairs".into());
+            }
+            let routes = pairs.chunks_exact(2).map(|p| {
+                Ok(Route { domain: &p[0], port: p[1].parse().map_err(|_| "invalid upstream port")? })
+            }).collect::<Result<Vec<_>, &str>>()?;
+            let config = gateway_config(bind.parse().map_err(|_| "invalid gateway listener")?, &routes, cert)?;
+            write_new(Path::new(output), &config)?;
+        }
         [command, config] if command == "run" => {
             let binary = env::var_os("LOCALTUNNEL_ENGINE").ok_or("set LOCALTUNNEL_ENGINE to the absolute path of the verified rathole executable")?;
             if !Path::new(&binary).is_absolute() { return Err("engine path must be absolute".into()); }
@@ -61,7 +78,7 @@ fn run() -> Result<(), String> {
             if !status.success() { return Err(format!("engine exited: {status}")); }
         }
         [command] if command == "--version" => println!("localtunnel {}", env!("CARGO_PKG_VERSION")),
-        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | run <config-file> | --version".into()),
+        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | run <config-file> | --version".into()),
     }
     Ok(())
 }
