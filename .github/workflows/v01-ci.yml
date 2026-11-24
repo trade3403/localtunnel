@@ -30,7 +30,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y nginx openssl
+          sudo apt-get install -y nginx openssl curl
       - name: Real encrypted loopback E2E
         shell: bash
         env:
