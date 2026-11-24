@@ -37,3 +37,8 @@
 ## 2026-11-25：可信引擎验收与依赖锁接续
 - HEAD 7052e693769aed4af57b89f689c0a2455f695d22，Windows CI #41 https://github.com/trade3403/localtunnel/actions/runs/45428041713 ，11/11 单测及 1/1 真实 TCP 生命周期通过（含真实篡改拒绝、停止清理）；官方归档提取的引擎 SHA256 a91717eb37b3dc25c9d2391aca6a1b1f8edde9a3de626264718811ff8113e55b。原始报告已解压核验：安装、原生窗口、卸载均 true，卸载等待 257 ms，EXE SHA256 719C0B2F149DE0372987FFF74A027BAEB5E2402CDA92F838326637CCFE48A59E。预览包 https://github.com/trade3403/localtunnel/actions/runs/45428041713/artifacts/14937931826 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45428041713/artifacts/14938136827 。核心 #64、Runner #136 状态 success。
 - 依赖锁 ZIP 已实际获取，Cargo.lock 114832 字节、package-lock.json 52974 字节。当前文件下载与 Git 写入工具之间缺少直接字节传递接口；新增临时 CI 步骤，仅输出两个非秘密依赖锁的 Base64 分块、长度和 SHA256，供下一轮在同一 GitHub 工具调用内重组并提交。保留全部现有门禁，不赋予 CI 写权限。下一轮从最新成功 job 日志解析 LOCK-BEGIN/CHUNK/END，检查连续偏移、长度及 SHA256（或 Git blob 校验），审查依赖来源；以 base64 创建两个 blob，原子提交锁文件及 npm ci/cargo --locked 门禁，并移除临时导出步骤。不得将本轮视为依赖锁定完成。若导出无法取得，记录限制并推进独立功能，不重复无效下载。
+
+
+## 2026-11-25：依赖锁定增量
+- CI #43 https://github.com/trade3403/localtunnel/actions/runs/45495224323 三个工作流通过；桌面 11/11 单测、真实隧道及安装门禁通过。产物：https://github.com/trade3403/localtunnel/actions/runs/45495224323/artifacts/14969265290 。
+- 重组真实日志 110 个 Base64 分块，逐块核验偏移、文件字节数和 SHA256，Cargo.lock 114832 字节 bf267572bd5eb29f4cdc6c150a60a6072e4ccd6df8dae60c2a6876d12386f339；package-lock.json 52974 字节 26116400ee3aedc2f0e2e60605a58fb09fe6abba4d520abddb1b4b4e299b1e7a。检查 Cargo registry 仅 crates.io，npm resolved 仅 npm 官方 registry 且有 integrity。提交原始字节；启用 npm ci、cargo test --locked、Tauri cargo build --locked 和构建后锁文件不变门禁，删除临时日志导出。锁定构建仍待新 CI 验收；下一项为可信引擎安装包集成、许可证及真实安装验证。未修改 main、未发布。

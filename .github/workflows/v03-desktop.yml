@@ -31,7 +31,7 @@ jobs:
         run: python apps/desktop/scripts/create_icons.py
       - name: Install frontend dependencies
         working-directory: apps/desktop
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
       - name: Build Vue frontend
         working-directory: apps/desktop
         run: npm run build
@@ -45,12 +45,16 @@ jobs:
           "LOCALTUNNEL_ENGINE_SHA256=$digest" >> $env:GITHUB_ENV
           Write-Host "Verified archive member SHA-256: $digest"
       - name: Rust desktop unit tests
-        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
       - name: Desktop supervisor real encrypted TCP lifecycle
-        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml real_engine_supervisor_lifecycle -- --ignored --nocapture
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml real_engine_supervisor_lifecycle -- --ignored --nocapture
       - name: Build Windows NSIS preview installer
         working-directory: apps/desktop
-        run: npm run tauri -- build --bundles nsis
+        run: npm run tauri -- build --bundles nsis -- --locked
+      - name: Verify dependency locks unchanged
+        run: |
+          git diff --exit-code -- apps/desktop/package-lock.json apps/desktop/src-tauri/Cargo.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Silent installer and native window smoke
         run: |
           New-Item -ItemType Directory -Force desktop-evidence | Out-Null
@@ -66,21 +70,6 @@ jobs:
           if (Test-Path test-results/engine.json) { Copy-Item test-results/engine.json desktop-evidence/ }
           "commit=$env:GITHUB_SHA" | Set-Content desktop-evidence/build.txt
           Get-ChildItem apps/desktop/src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Get-FileHash -Algorithm SHA256 | Format-List | Out-File -Append desktop-evidence/build.txt
-      # Temporary bootstrap export: only dependency manifests, never credentials.
-      - name: Export dependency lock bootstrap evidence
-        run: |
-          foreach ($path in @("apps/desktop/package-lock.json", "apps/desktop/src-tauri/Cargo.lock")) {
-            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $path).Path)
-            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant()
-            $name = [IO.Path]::GetFileName($path)
-            $encoded = [Convert]::ToBase64String($bytes)
-            Write-Host "LOCK-BEGIN $name $($bytes.Length) $hash"
-            for ($i = 0; $i -lt $encoded.Length; $i += 2048) {
-              $chunk = $encoded.Substring($i, [Math]::Min(2048, $encoded.Length - $i))
-              Write-Host "LOCK-CHUNK $name $i $chunk"
-            }
-            Write-Host "LOCK-END $name"
-          }
       - name: Upload preview installer
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
