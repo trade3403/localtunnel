@@ -28,6 +28,23 @@ jobs:
       - name: Real encrypted loopback E2E
         shell: bash
         run: python tests/e2e.py
+      - name: Package CLI build
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/release/localtunnel.exe dist/
+          else
+            cp target/release/localtunnel dist/
+          fi
+          (cd dist && sha256sum localtunnel* > SHA256SUMS)
+      - name: Native CLI artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: localtunnel-cli-${{ matrix.os }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
       - name: Test evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
