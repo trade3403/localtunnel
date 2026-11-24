@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 
 type Mapping = { id: number; name: string; localPort: number | null; token: string }
+type Profile = { engine: string; remote: string; serverKey: string; mappings: { name: string; localPort: number }[] }
 type Status = { state: 'stopped' | 'running' | 'error'; detail: string; mappingCount: number }
 const engine = ref('')
 const remote = ref('')
@@ -12,6 +13,7 @@ const mappings = ref<Mapping[]>([{ id: 1, name: 'web', localPort: 8080, token: '
 const status = ref<Status>({ state: 'stopped', detail: '正在获取进程状态', mappingCount: 0 })
 const busy = ref(false)
 const error = ref('')
+const notice = ref('')
 const ready = ref(false)
 const running = computed(() => status.value.state === 'running')
 const locked = computed(() => busy.value || running.value || !ready.value)
@@ -37,6 +39,38 @@ function add() {
 }
 function remove(id: number) {
   if (!locked.value && mappings.value.length > 1) mappings.value = mappings.value.filter(m => m.id !== id)
+}
+async function profileAction(action: 'save' | 'load') {
+  if (locked.value || polling) return
+  busy.value = true
+  error.value = ''
+  notice.value = ''
+  try {
+    if (action === 'save') {
+      if (mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535)) {
+        throw new Error('请输入有效本地端口')
+      }
+      const profile: Profile = {
+        engine: engine.value.trim(), remote: remote.value.trim(), serverKey: serverKey.value.trim(),
+        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: Number(m.localPort) }))
+      }
+      await invoke('save_profile', { profile })
+      notice.value = '配置已保存（不包含授权 Token）'
+    } else {
+      const profile = await invoke<Profile | null>('load_profile')
+      if (!profile) {
+        notice.value = '尚未保存配置'
+        return
+      }
+      engine.value = profile.engine
+      remote.value = profile.remote
+      serverKey.value = profile.serverKey
+      mappings.value = profile.mappings.map(m => ({ ...m, id: nextId++, token: '' }))
+      notice.value = '配置已读取，请重新填写授权 Token'
+    }
+  } catch (e) {
+    error.value = e instanceof Error ? e.message : String(e)
+  } finally { busy.value = false; void refresh() }
 }
 async function toggle() {
   if (!ready.value || busy.value || polling) return
@@ -82,7 +116,12 @@ async function toggle() {
             <label>服务器公钥<input v-model="serverKey" :disabled="locked" required autocomplete="off" placeholder="X25519 公钥（Base64）" /></label>
             <label class="wide">Rathole 引擎路径<input v-model="engine" :disabled="locked" required placeholder="C:\LocalTunnel\rathole.exe" /></label>
           </div>
-          <p class="hint">仅使用已校验的官方引擎。当前版本不自动下载引擎，也不保存密钥。</p>
+          <p class="hint">仅使用已校验的官方引擎。当前版本不自动下载引擎，保存配置不会写入授权 Token。</p>
+          <div class="profile-actions">
+            <button type="button" class="secondary" :disabled="locked" @click="profileAction('save')">保存配置</button>
+            <button type="button" class="secondary" :disabled="locked" @click="profileAction('load')">读取配置</button>
+            <span v-if="notice" role="status">{{ notice }}</span>
+          </div>
         </section>
         <section>
           <div class="section-title"><h2>本地映射</h2><button type="button" class="secondary" :disabled="locked || mappings.length >= 64" @click="add">＋ 添加映射</button></div>
@@ -100,7 +139,7 @@ async function toggle() {
           <button class="primary" :class="{ danger: running }" :disabled="busy || !ready" :type="running ? 'button' : 'submit'" @click="running && toggle()">{{ busy ? '处理中…' : running ? '停止隧道' : '启动隧道' }}</button>
         </div>
       </form>
-      <footer>开发预览 · 关闭程序会停止隧道 · 公网连通性需独立验收</footer>
+      <footer>开发预览 · 关闭窗口后保留在系统托盘 · 托盘中退出会停止隧道</footer>
     </main>
   </div>
 </template>
