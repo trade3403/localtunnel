@@ -10,7 +10,7 @@ import ssl
 import subprocess
 import time
 
-def check_gateway(directory, cli, ports, expected, port_factory, passed):
+def check_gateway(directory, cli, ports, expected, port_factory, passed, results):
     names = ("web.example.test", "api.example.test")
     http_port = port_factory()
     tls_port = port_factory()
@@ -31,7 +31,7 @@ def check_gateway(directory, cli, ports, expected, port_factory, passed):
         subprocess.run([str(cli), "gateway-" + mode, str(config), f"127.0.0.1:{port}", *args, *pairs], check=True, timeout=15)
         command = ["nginx", "-p", str(prefix) + "/", "-c", str(config)]
         subprocess.run([*command, "-t"], check=True, timeout=15)
-        log = (directory.parent / (mode + "-nginx.log")).open("wb")
+        log = (results / (mode + "-nginx.log")).open("wb")
         # Keep private CI temporary config/certificates out of artifacts.
         handles.append(log)
         process = subprocess.Popen([*command, "-g", "daemon off;"], stdout=log, stderr=subprocess.STDOUT)
