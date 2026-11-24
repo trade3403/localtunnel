@@ -45,7 +45,7 @@ pub fn gateway_config(bind: SocketAddr, routes: &[Route<'_>], cert: Option<Certi
     }
     let tls = cert.is_some();
     let listener = format!("{bind}{}", if tls { " ssl" } else { "" });
-    let mut out = String::from("worker_processes 1;\npid nginx.pid;\nerror_log stderr warn;\nevents { worker_connections 1024; }\nhttp {\n    access_log off;\n    server_tokens off;\n    client_max_body_size 16m;\n    client_header_timeout 15s;\n    client_body_timeout 30s;\n    map $http_upgrade $lt_connection { default upgrade; '' close; }\n");
+    let mut out = String::from("worker_processes 1;\npid nginx.pid;\nerror_log stderr warn;\nevents { worker_connections 1024; }\nhttp {\n    access_log off;\n    client_body_temp_path client_body_temp;\n    proxy_temp_path proxy_temp;\n    fastcgi_temp_path fastcgi_temp;\n    uwsgi_temp_path uwsgi_temp;\n    scgi_temp_path scgi_temp;\n    server_tokens off;\n    client_max_body_size 16m;\n    client_header_timeout 15s;\n    client_body_timeout 30s;\n    map $http_upgrade $lt_connection { default upgrade; '' close; }\n");
     if let Some(c) = &cert {
         writeln!(out, "    ssl_certificate {};\n    ssl_certificate_key {};\n    ssl_protocols TLSv1.2 TLSv1.3;", c.chain, c.key).map_err(|_| "format error")?;
     }
