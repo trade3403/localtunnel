@@ -41,24 +41,71 @@ fn remote_valid(remote: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-pub fn server_config(bind: SocketAddr, name: &str, port: u16, token: &str, key: &str) -> Result<String, &'static str> {
-    validate_name(name)?;
-    validate_token(token)?;
+pub struct ServerMapping<'a> {
+    pub name: &'a str,
+    pub port: u16,
+    pub token: &'a str,
+}
+
+pub struct ClientMapping<'a> {
+    pub name: &'a str,
+    pub local: SocketAddr,
+    pub token: &'a str,
+}
+
+fn mapping_count(count: usize) -> Result<(), &'static str> {
+    if (1..=64).contains(&count) { Ok(()) } else { Err("expected 1-64 mappings") }
+}
+
+pub fn server_configs(bind: SocketAddr, mappings: &[ServerMapping<'_>], key: &str) -> Result<String, &'static str> {
+    use std::collections::HashSet;
+    use std::fmt::Write;
     validate_key(key)?;
     port_valid(bind.port())?;
-    port_valid(port)?;
-    if bind.port() == port { return Err("tunnel port and mapping port must differ"); }
-    Ok(format!("[server]\nbind_addr = \"{bind}\"\nheartbeat_interval = 5\n\n[server.transport]\ntype = \"noise\"\n\n[server.transport.noise]\npattern = \"{PATTERN}\"\nlocal_private_key = \"{key}\"\n\n[server.services.{name}]\ntype = \"tcp\"\ntoken = \"{token}\"\nbind_addr = \"127.0.0.1:{port}\"\n"))
+    mapping_count(mappings.len())?;
+    let mut names = HashSet::new();
+    let mut ports = HashSet::new();
+    let mut tokens = HashSet::new();
+    let mut config = format!("[server]\nbind_addr = \"{bind}\"\nheartbeat_interval = 5\n\n[server.transport]\ntype = \"noise\"\n\n[server.transport.noise]\npattern = \"{PATTERN}\"\nlocal_private_key = \"{key}\"\n");
+    for m in mappings {
+        validate_name(m.name)?;
+        validate_token(m.token)?;
+        port_valid(m.port)?;
+        if !names.insert(m.name) { return Err("duplicate mapping name"); }
+        if bind.port() == m.port || !ports.insert(m.port) { return Err("duplicate or conflicting mapping port"); }
+        if !tokens.insert(m.token) { return Err("each mapping must use an independent token"); }
+        writeln!(config, "\n[server.services.{}]\ntype = \"tcp\"\ntoken = \"{}\"\nbind_addr = \"127.0.0.1:{}\"", m.name, m.token, m.port).map_err(|_| "configuration formatting failed")?;
+    }
+    Ok(config)
+}
+
+pub fn client_configs(remote: &str, mappings: &[ClientMapping<'_>], key: &str) -> Result<String, &'static str> {
+    use std::collections::HashSet;
+    use std::fmt::Write;
+    validate_key(key)?;
+    remote_valid(remote)?;
+    mapping_count(mappings.len())?;
+    let mut names = HashSet::new();
+    let mut tokens = HashSet::new();
+    let mut config = format!("[client]\nremote_addr = \"{remote}\"\nheartbeat_timeout = 15\nretry_interval = 1\n\n[client.transport]\ntype = \"noise\"\n\n[client.transport.noise]\npattern = \"{PATTERN}\"\nremote_public_key = \"{key}\"\n");
+    for m in mappings {
+        validate_name(m.name)?;
+        validate_token(m.token)?;
+        port_valid(m.local.port())?;
+        if !m.local.ip().is_loopback() { return Err("local target must be loopback"); }
+        if !names.insert(m.name) { return Err("duplicate mapping name"); }
+        if !tokens.insert(m.token) { return Err("each mapping must use an independent token"); }
+        writeln!(config, "\n[client.services.{}]\ntype = \"tcp\"\ntoken = \"{}\"\nlocal_addr = \"{}\"", m.name, m.token, m.local).map_err(|_| "configuration formatting failed")?;
+    }
+    Ok(config)
+}
+
+pub fn server_config(bind: SocketAddr, name: &str, port: u16, token: &str, key: &str) -> Result<String, &'static str> {
+    server_configs(bind, &[ServerMapping { name, port, token }], key)
 }
 
 pub fn client_config(remote: &str, name: &str, local: SocketAddr, token: &str, key: &str) -> Result<String, &'static str> {
-    validate_name(name)?;
-    validate_token(token)?;
-    validate_key(key)?;
-    remote_valid(remote)?;
-    port_valid(local.port())?;
-    if !local.ip().is_loopback() { return Err("local target must be loopback in V0.1"); }
-    Ok(format!("[client]\nremote_addr = \"{remote}\"\nheartbeat_timeout = 15\nretry_interval = 1\n\n[client.transport]\ntype = \"noise\"\n\n[client.transport.noise]\npattern = \"{PATTERN}\"\nremote_public_key = \"{key}\"\n\n[client.services.{name}]\ntype = \"tcp\"\ntoken = \"{token}\"\nlocal_addr = \"{local}\"\n"))
+    client_configs(remote, &[ClientMapping { name, local, token }], key)
 }
 
 #[cfg(test)]
@@ -96,5 +143,46 @@ mod tests {
         assert!(c.contains("remote_public_key"));
         assert!(c.contains("local_addr = \"[::1]:8080\""));
         assert!(!c.contains("local_private_key"));
+    }
+}
+
+#[cfg(test)]
+mod multi_tests {
+    use super::*;
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn renders_independent_mappings() {
+        let config = server_configs("127.0.0.1:2333".parse().unwrap(), &[
+            ServerMapping { name: "web", port: 20800, token: A },
+            ServerMapping { name: "api", port: 20801, token: B },
+        ], KEY).unwrap();
+        assert_eq!(config.matches("[server.transport]").count(), 1);
+        assert!(config.contains("[server.services.web]"));
+        assert!(config.contains("[server.services.api]"));
+        assert!(config.contains("127.0.0.1:20801"));
+        let client = client_configs("localhost:2333", &[
+            ClientMapping { name: "web", local: "127.0.0.1:5173".parse().unwrap(), token: A },
+            ClientMapping { name: "api", local: "127.0.0.1:8080".parse().unwrap(), token: B },
+        ], KEY).unwrap();
+        assert!(client.contains("[client.services.api]"));
+        assert!(client.contains("127.0.0.1:5173"));
+    }
+
+    #[test]
+    fn rejects_collisions_and_reused_credentials() {
+        let bind = "127.0.0.1:2333".parse().unwrap();
+        let first = || ServerMapping { name: "web", port: 20800, token: A };
+        for second in [
+            ServerMapping { name: "web", port: 20801, token: B },
+            ServerMapping { name: "api", port: 20800, token: B },
+            ServerMapping { name: "api", port: 20801, token: A },
+            ServerMapping { name: "api", port: 2333, token: B },
+        ] {
+            assert!(server_configs(bind, &[first(), second], KEY).is_err());
+        }
+        assert!(server_configs(bind, &[], KEY).is_err());
     }
 }
