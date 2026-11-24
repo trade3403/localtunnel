@@ -1,0 +1,10 @@
+[package]
+name = "localtunnel"
+version = "0.1.0"
+edition = "2021"
+description = "LocalTunnel encrypted reverse tunnel configuration and launch tooling"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
