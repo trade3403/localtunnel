@@ -1,4 +1,5 @@
 """Real local TCP/HTTP forwarding through two Rathole processes; not public E2E."""
+import base64
 import concurrent.futures
 import hashlib
 import http.server
@@ -91,7 +92,39 @@ def main():
             redactions.extend([private, public, token, bad])
             body = ("localtunnel-" + secrets.token_hex(24)).encode()
             class Handler(http.server.BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
                 def do_GET(self):
+                    if self.path == "/ws":
+                        ws_key = self.headers.get("Sec-WebSocket-Key")
+                        if not ws_key or self.headers.get("Upgrade", "").lower() != "websocket":
+                            self.send_error(400)
+                            return
+                        accept = base64.b64encode(hashlib.sha1((ws_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+                        self.send_response(101)
+                        self.send_header("Upgrade", "websocket")
+                        self.send_header("Connection", "Upgrade")
+                        self.send_header("Sec-WebSocket-Accept", accept)
+                        self.end_headers()
+                        self.connection.settimeout(5)
+                        header = self.rfile.read(2)
+                        if len(header) != 2 or header[0] != 0x81 or not header[1] & 0x80 or (header[1] & 127) > 125:
+                            self.close_connection = True
+                            return
+                        size = header[1] & 127
+                        mask = self.rfile.read(4)
+                        payload = self.rfile.read(size)
+                        if len(mask) == 4 and len(payload) == size:
+                            self.wfile.write(bytes([0x81, size]) + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+                            self.wfile.flush()
+                        self.close_connection = True
+                        return
+                    if self.path == "/headers":
+                        data = "|".join(self.headers.get(h, "") for h in ("X-Forwarded-For", "X-Forwarded-Proto", "Forwarded")).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+                        return
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(body)))
                     self.end_headers()
@@ -178,6 +211,9 @@ def main():
                     if not all(pool.map(verify, pairs)):
                         raise RuntimeError("concurrent mappings returned incorrect data")
                 result["passed"].append("32 concurrent/interleaved HTTP requests across two mappings")
+                if os.environ.get("LOCALTUNNEL_GATEWAY_E2E") == "1":
+                    from gateway_e2e import check_gateway
+                    check_gateway(d, CLI, (b, c), (body, body2), port, result["passed"], RESULTS)
             finally:
                 for p in reversed(processes):
                     terminate(p)
