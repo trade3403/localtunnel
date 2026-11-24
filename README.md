@@ -5,6 +5,8 @@
 ## 开发文档
 
 - [技术设计与开发路线 V1.0](docs/architecture-and-roadmap.md)
+- [GitHub Actions 免费云端 Runner 部署测试规范](docs/github-actions-ci-cd.md)
+- [Runner 环境测试工作流](https://github.com/trade3403/localtunnel/actions/workflows/runner-smoke.yml)
 
 ## 技术栈
 
