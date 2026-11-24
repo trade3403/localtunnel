@@ -35,13 +35,17 @@ jobs:
       - name: Build Vue frontend
         working-directory: apps/desktop
         run: npm run build
-      - name: Rust desktop unit tests
-        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
-      - name: Prepare verified test Rathole engine
+      - name: Prepare pinned Rathole engine and embed binary digest
         run: |
           python -c "import sys; from pathlib import Path; sys.path.insert(0, 'tests'); import e2e; d=Path('.runtime').resolve(); d.mkdir(exist_ok=True); print(e2e.engine(d))"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          "LOCALTUNNEL_TEST_ENGINE=$((Resolve-Path .runtime/rathole.exe).Path)" >> $env:GITHUB_ENV
+          $engine = (Resolve-Path .runtime/rathole.exe).Path
+          $digest = (Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant()
+          "LOCALTUNNEL_TEST_ENGINE=$engine" >> $env:GITHUB_ENV
+          "LOCALTUNNEL_ENGINE_SHA256=$digest" >> $env:GITHUB_ENV
+          Write-Host "Verified archive member SHA-256: $digest"
+      - name: Rust desktop unit tests
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
       - name: Desktop supervisor real encrypted TCP lifecycle
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml real_engine_supervisor_lifecycle -- --ignored --nocapture
       - name: Build Windows NSIS preview installer
