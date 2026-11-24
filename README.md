@@ -17,12 +17,12 @@ Rust · Tokio · Rathole · Axum · Rustls · Tauri 2 · Vue 3 · SQLite · Ngin
 
 ## 开发进度
 
-V0.1 免费 Linux/Windows Runner 同机加密隧道测试已通过。V0.2 静态域名网关候选代码已提交，等待新 CI 验证。公网部署和真实域名绑定暂缓。
+V0.1 免费 Linux/Windows Runner 同机加密隧道测试已通过。V0.2 静态域名网关已通过 Linux/Windows CI #17；动态 HTTP 路由和证书预检增量已提交，等待新 CI。公网部署和真实域名绑定暂缓。
 
 | 版本 | 目标 | 状态 |
 |---|---|---|
 | V0.1 | Rust 配置工具、加密隧道、同机 E2E；公网验收延后 | 同机 CI 通过，公网待验收 |
-| V0.2 | 域名映射、HTTPS、WebSocket | 静态网关已实现，待 CI；ACME/动态映射待开发 |
+| V0.2 | 域名映射、HTTPS、WebSocket | 静态网关 CI 通过；动态 HTTP 路由及证书预检待 CI；ACME、动态隧道待开发 |
 | V0.3 | Windows 客户端及安装包 | 待开发 |
 | V0.4 | Web 管理后台 | 待开发 |
 | V0.5 | 安全、稳定性与负载测试 | 待开发 |
