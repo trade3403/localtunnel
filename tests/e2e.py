@@ -1,4 +1,5 @@
 """Real local TCP/HTTP forwarding through two Rathole processes; not public E2E."""
+import concurrent.futures
 import hashlib
 import http.server
 import json
@@ -78,6 +79,7 @@ def main():
     result = {"scope": "single-host real encrypted tunnel", "public_e2e": "BLOCKED: no public relay/domain", "passed": []}
     processes, handles, redactions = [], [], []
     fixture = None
+    fixture2 = None
     try:
         with tempfile.TemporaryDirectory(prefix="localtunnel-") as tmp:
             d = Path(tmp)
@@ -143,12 +145,48 @@ def main():
                 relay = launch(server, "relay-restarted")
                 wait_for(url, body, [relay, agent], seconds=60)
                 result["passed"].append("agent reconnects after relay restart")
+                terminate(agent)
+                terminate(relay)
+                body2 = ("localtunnel-api-" + secrets.token_hex(24)).encode()
+                class ApiHandler(Handler):
+                    def do_GET(self):
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(body2)))
+                        self.end_headers()
+                        self.wfile.write(body2)
+                fixture2 = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ApiHandler)
+                threading.Thread(target=fixture2.serve_forever, daemon=True).start()
+                c = port()
+                while c in (a, b):
+                    c = port()
+                url2 = f"http://127.0.0.1:{c}/"
+                token2 = secrets.token_hex(32)
+                redactions.append(token2)
+                multi_env = {**env, "LOCALTUNNEL_TOKEN_1": token, "LOCALTUNNEL_TOKEN_2": token2}
+                multi_server, multi_client = d / "multi-server.toml", d / "multi-client.toml"
+                config(["server-multi", multi_server, f"127.0.0.1:{a}", "web", b, "api", c], multi_env)
+                config(["client-multi", multi_client, f"127.0.0.1:{a}", "web", f"127.0.0.1:{fixture.server_port}", "api", f"127.0.0.1:{fixture2.server_port}"], multi_env)
+                relay = launch(multi_server, "multi-relay")
+                agent = launch(multi_client, "multi-agent")
+                wait_for(url, body, [relay, agent])
+                wait_for(url2, body2, [relay, agent])
+                result["passed"].append("two isolated mappings with different local services")
+                pairs = [(url, body), (url2, body2)] * 16
+                def verify(pair):
+                    return get(pair[0]) == pair[1]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                    if not all(pool.map(verify, pairs)):
+                        raise RuntimeError("concurrent mappings returned incorrect data")
+                result["passed"].append("32 concurrent/interleaved HTTP requests across two mappings")
             finally:
                 for p in reversed(processes):
                     terminate(p)
                 for h in handles:
                     h.close()
     finally:
+        if fixture2:
+            fixture2.shutdown()
+            fixture2.server_close()
         if fixture:
             fixture.shutdown()
             fixture.server_close()
