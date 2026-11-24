@@ -8,17 +8,19 @@
 - [GitHub Actions 免费云端 Runner 部署测试规范](docs/github-actions-ci-cd.md)
 - [Runner 环境测试工作流](https://github.com/trade3403/localtunnel/actions/workflows/runner-smoke.yml)
 
+- [V0.1 候选版运行和测试说明](docs/v0.1.md)
+
 ## 技术栈
 
 Rust · Tokio · Rathole · Axum · Rustls · Tauri 2 · Vue 3 · SQLite · Nginx
 
 ## 开发进度
 
-当前处于规划阶段，尚未实现或测试核心功能。
+V0.1 候选代码已提交，等待免费云端 Runner 的真实测试结果。公网部署和域名绑定暂缓。
 
 | 版本 | 目标 | 状态 |
 |---|---|---|
-| V0.1 | 核心隧道与真实公网访问验证 | 待开发 |
+| V0.1 | Rust 配置工具、加密隧道、同机 E2E；公网验收延后 | 候选代码，待 CI |
 | V0.2 | 域名映射、HTTPS、WebSocket | 待开发 |
 | V0.3 | Windows 客户端及安装包 | 待开发 |
 | V0.4 | Web 管理后台 | 待开发 |
