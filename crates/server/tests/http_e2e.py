@@ -69,7 +69,7 @@ try:
         try:
             assert http(base, "/healthz") == (200, b"ok")
             assert http(base, "/readyz") == (200, b"ready")
-            assert http(base, "/api/v1/mappings")[0] == 404
+            assert http(base, "/api/v1/mappings")[0] == 401
             assert http(base, "/healthz", "POST")[0] == 405
             report["real_loopback_http"] = True
             with sqlite3.connect(db_path) as db:

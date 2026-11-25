@@ -31,6 +31,8 @@ jobs:
         run: python3 crates/server/tests/devices_e2e.py crates/server/target/release/localtunnel-server management-evidence/devices.json
       - name: Real device desired configuration and heartbeat lifecycle
         run: python3 crates/server/tests/sync_e2e.py crates/server/target/release/localtunnel-server management-evidence/sync.json
+      - name: Real administrator mapping CRUD and revision lifecycle
+        run: python3 crates/server/tests/mappings_e2e.py crates/server/target/release/localtunnel-server management-evidence/mappings.json
       - name: Verify committed dependency lock unchanged
         run: git diff --exit-code -- crates/server/Cargo.lock
       - name: Collect committed lock

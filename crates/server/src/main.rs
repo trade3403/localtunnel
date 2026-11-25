@@ -1,5 +1,6 @@
 mod auth;
 mod devices;
+mod mappings;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -78,7 +79,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .route("/readyz", get(ready))
         .with_state(pool.clone())
         .merge(auth::routes(auth))
-        .merge(devices::routes(pool));
+        .merge(devices::routes(pool.clone()))
+        .merge(mappings::routes(pool));
     // No configurable public bind or unauthenticated data API in this increment.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("LISTENING {}", listener.local_addr()?);
