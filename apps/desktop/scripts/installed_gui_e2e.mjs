@@ -341,12 +341,30 @@ try {
   // Real native process restart; DPAPI saved enrollment must be restored
   // and heartbeat sent without another enrollment or manual sync.
   trayMenu('quit')
-  await until('management app exited',()=>app.exitCode===0,20000)
+  // until() deliberately rejects any app exit. An intentional restart
+  // instead requires this exact child to exit with code zero, just as the
+  // final tray quit gate does. Never accept a crash or force-kill here.
+  const managementExitDeadline=Date.now()+20000
+  while(app.exitCode===null&&app.signalCode===null&&Date.now()<managementExitDeadline) await sleep(200)
+  if(app.exitCode!==0) throw Error('management tray quit did not exit normally')
+  report.native_management_restart_clean_exit=true
   if(socket)socket.close()
+  for(const request of pending.values()){
+    clearTimeout(request.timer)
+    request.fail(Error('CDP session closed for intentional restart'))
+  }
   pending.clear()
-  app=launch(exe,[],{...process.env,WEBVIEW2_USER_DATA_FOLDER:join(work,'webview')})
-  await connectCdp(debugPort)
+  // A fresh CDP port/profile avoids attaching to a still-shutting-down
+  // WebView2 child. The real per-user DPAPI file must survive independently.
+  removeDebugPolicy()
+  const debugReservation=tcpServer()
+  const restartDebugPort=await listen(debugReservation)
+  await close(debugReservation)
+  installDebugPolicy(restartDebugPort)
+  app=launch(exe,[],{...process.env,WEBVIEW2_USER_DATA_FOLDER:join(work,'webview-restart')})
+  await connectCdp(restartDebugPort)
   await waitText('已配对 ID：'+device.id)
+  await until('restarted desktop form ready',()=>evaluate('!!document.querySelector("input[placeholder=\\\"relay.example.com:2333\\\"]:not(:disabled)")'))
   await until('automatic heartbeat after app restart',async()=>{
     const r=await manage('devices/'+device.id+'/status','GET',admin)
     if(r.status!==200)return false
