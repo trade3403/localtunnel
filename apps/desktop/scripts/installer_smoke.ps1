@@ -1,0 +1,67 @@
+param(
+    [Parameter(Mandatory=$true)][string]$Installer,
+    [Parameter(Mandatory=$true)][string]$Evidence
+)
+$ErrorActionPreference = "Stop"
+$installerPath = (Resolve-Path -LiteralPath $Installer).Path
+$installDir = Join-Path $env:RUNNER_TEMP ("localtunnel-install-" + [guid]::NewGuid().ToString("N"))
+$report = [ordered]@{ installed = $false; bundled_engine_verified = $false; bundled_engine_runs = $false; window_started = $false; uninstalled = $false; scope = "isolated installer smoke, not GUI interaction or public tunnel E2E" }
+$app = $null
+try {
+    $setup = Start-Process -FilePath $installerPath -ArgumentList "/S /D=$installDir" -PassThru
+    if (!$setup.WaitForExit(120000)) { $setup.Kill(); throw "Installer timed out" }
+    if ($setup.ExitCode -ne 0) { throw "Installer failed: $($setup.ExitCode)" }
+    $exe = Join-Path $installDir "localtunnel-desktop.exe"
+    if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Installed application not found" }
+    $report.installed = $true
+    $engine = Join-Path $installDir "engine/rathole.exe"
+    $license = Join-Path $installDir "engine/rathole-LICENSE.txt"
+    $notice = Join-Path $installDir "engine/rathole-NOTICE.txt"
+    if (!(Test-Path -LiteralPath $engine -PathType Leaf) -or !(Test-Path -LiteralPath $license -PathType Leaf) -or !(Test-Path -LiteralPath $notice -PathType Leaf)) { throw "Bundled engine or license missing" }
+    $digest = (Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($digest -ne "a91717eb37b3dc25c9d2391aca6a1b1f8edde9a3de626264718811ff8113e55b") { throw "Installed engine SHA-256 mismatch" }
+    $report.bundled_engine_sha256 = $digest
+    $report.bundled_engine_verified = $true
+    $engineProcess = Start-Process -FilePath $engine -ArgumentList "--version" -PassThru -WindowStyle Hidden
+    if (!$engineProcess.WaitForExit(15000)) { $engineProcess.Kill(); throw "Installed engine version check timed out" }
+    if ($engineProcess.ExitCode -ne 0) { throw "Installed engine failed to run" }
+    $report.bundled_engine_runs = $true
+    # Use the installed executable and bundled engine. The dedicated script
+    # starts a disposable fixture and launches its own test-only WebView2.
+    $guiEvidence = Join-Path (Split-Path -Parent $Evidence) "installed-gui-e2e.json"
+    & node (Join-Path $PSScriptRoot "installed_gui_e2e.mjs") $exe $guiEvidence
+    if ($LASTEXITCODE -ne 0) { throw "Installed GUI E2E failed" }
+    $report.installed_gui_e2e = $true
+    $app = Start-Process -FilePath $exe -PassThru
+    $deadline = (Get-Date).AddSeconds(40)
+    do {
+        Start-Sleep -Milliseconds 500
+        $app.Refresh()
+        if ($app.HasExited) { throw "Desktop exited before showing a window: $($app.ExitCode)" }
+        if ($app.MainWindowHandle -ne [IntPtr]::Zero) { $report.window_started = $true; break }
+    } while ((Get-Date) -lt $deadline)
+    if (!$report.window_started) { throw "No native application window detected" }
+    # No engine is started in this test; normal tray exit is a separate GUI test.
+    Stop-Process -Id $app.Id -Force
+    if (!$app.WaitForExit(10000)) { throw "Application did not exit" }
+    $uninstaller = Join-Path $installDir "uninstall.exe"
+    if (!(Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw "Uninstaller missing" }
+    $remove = Start-Process -FilePath $uninstaller -ArgumentList "/S" -PassThru
+    if (!$remove.WaitForExit(120000)) { $remove.Kill(); throw "Uninstaller timed out" }
+    if ($remove.ExitCode -ne 0) { throw "Uninstaller failed: $($remove.ExitCode)" }
+    # NSIS normally copies its uninstaller to TEMP and starts a child. The
+    # original process may return before the child removes installed files.
+    # Preserve the removal gate: wait for evidence, never delete the app ourselves.
+    $report.uninstaller_launcher_exit_code = $remove.ExitCode
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    while (((Test-Path -LiteralPath $exe) -or (Test-Path -LiteralPath $engine) -or (Test-Path -LiteralPath $license) -or (Test-Path -LiteralPath $notice)) -and $watch.Elapsed.TotalSeconds -lt 60) {
+        Start-Sleep -Milliseconds 250
+    }
+    $report.removal_wait_ms = $watch.ElapsedMilliseconds
+    if (Test-Path -LiteralPath $exe) { throw "Application remains after uninstall (60-second completion window)" }
+    if ((Test-Path -LiteralPath $engine) -or (Test-Path -LiteralPath $license) -or (Test-Path -LiteralPath $notice)) { throw "Engine or license remains after uninstall" }
+    $report.uninstalled = $true
+} finally {
+    if ($app -and !$app.HasExited) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue }
+    $report | ConvertTo-Json | Set-Content -LiteralPath $Evidence -Encoding utf8
+}

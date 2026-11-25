@@ -23,8 +23,8 @@ pub struct Profile {
 }
 
 fn validate(profile: &Profile) -> Result<(), String> {
-    if profile.engine.len() > 4096 || !Path::new(&profile.engine).is_absolute() {
-        return Err("引擎路径须为绝对路径".into());
+    if profile.engine.len() > 4096 || (!profile.engine.is_empty() && !Path::new(&profile.engine).is_absolute()) {
+        return Err("自定义引擎路径须为绝对路径，留空使用内置引擎".into());
     }
     if profile.mappings.is_empty() || profile.mappings.len() > 64 {
         return Err("映射数量须为 1–64".into());
@@ -80,9 +80,11 @@ mod tests {
         assert!(load(d.path()).unwrap().is_none());
         let mut p = example();
         save(d.path(), &p).unwrap();
+        p.engine.clear(); // bundled engine selection must persist
         p.mappings[0].local_port = 5173;
         save(d.path(), &p).unwrap();
         assert_eq!(load(d.path()).unwrap().unwrap().mappings[0].local_port, 5173);
+        assert!(load(d.path()).unwrap().unwrap().engine.is_empty());
         let text = fs::read_to_string(d.path().join("profile.json")).unwrap();
         assert!(!text.contains("token"));
     }

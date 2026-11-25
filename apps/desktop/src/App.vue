@@ -6,6 +6,165 @@ type Mapping = { id: number; name: string; localPort: number | null; token: stri
 type Profile = { engine: string; remote: string; serverKey: string; mappings: { name: string; localPort: number }[] }
 type StartRequest = Omit<Profile, 'mappings'> & { mappings: { name: string; localPort: number; token: string }[] }
 type Status = { state: 'stopped' | 'running' | 'error'; detail: string; mappingCount: number }
+type Transport = { state: 'inactive' | 'unknown' | 'established' | 'not_observed'; established: number | null; matchScope: 'none' | 'ip_port' | 'port_only' }
+const transport = ref<Transport>({ state: 'inactive', established: null, matchScope: 'none' })
+const transportLabel = computed(() => !ready.value || transport.value.state === 'unknown' ? '未知' :
+  transport.value.state === 'inactive' ? '未启动' :
+  transport.value.state === 'not_observed' ? '未观察到' : String(transport.value.established))
+const transportHint = computed(() => transport.value.matchScope === 'port_only' ? '按中转端口匹配候选 TCP；未验证域名/认证' :
+  transport.value.matchScope === 'ip_port' ? '按中转 IP 和端口匹配；未验证认证' : '非公网在线证明')
+type ServiceTraffic = { hostPid: number; enginePid: number; sampledAtMs: number; uploadBytes: number; downloadBytes: number; uploadBytesPerSecond: number | null; downloadBytesPerSecond: number | null }
+type ServiceSnapshot = { state: string; startup: string; recovery: 'enabled' | 'disabled' | 'unverified'; hostPid: number | null; win32ExitCode: number; serviceExitCode: number; traffic: ServiceTraffic | null; history: { uploadBytes: number; downloadBytes: number; savedAtMs: number } | null }
+const serviceName = ref('')
+const watchedService = ref('')
+const serviceSnapshot = ref<ServiceSnapshot | null>(null)
+const serviceError = ref('')
+const serviceActionError = ref('')
+const serviceActionNotice = ref('')
+const serviceBusy = ref(false)
+const provisionConfirm = ref(false)
+const maintenanceConfirm = ref('')
+async function maintainService(action: 'update' | 'unregister') {
+  const name = watchedService.value
+  if (!name || serviceName.value.trim() !== name || maintenanceConfirm.value !== name ||
+      serviceSnapshot.value?.state !== 'stopped' || serviceBusy.value || busy.value) return
+  if (action === 'update' && (running.value || engine.value.trim() ||
+      mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535))) {
+    serviceActionError.value = '请停止桌面隧道，清空自定义引擎路径并填写有效端口'; return
+  }
+  serviceBusy.value = true
+  serviceGeneration++
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
+  try {
+    if (action === 'update') {
+      await invoke('update_service_profile', { name, confirmation: maintenanceConfirm.value, request: {
+        engine: '', remote: remote.value.trim(), serverKey: serverKey.value.trim(),
+        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+      } })
+      serviceActionNotice.value = '配置已更新，服务保持禁用；检查后可设为手动启动'
+    } else {
+      await invoke('unregister_service', { name, confirmation: maintenanceConfirm.value })
+      watchedService.value = ''
+      serviceName.value = ''
+      serviceActionNotice.value = '已注销 SCM 注册，受保护目录、凭据和历史流量仍保留'
+    }
+    maintenanceConfirm.value = ''
+  } catch (e) {
+    serviceActionError.value = '服务维护失败：' + String(e)
+  } finally {
+    serviceSnapshot.value = null
+    serviceBusy.value = false
+    void refreshService()
+  }
+}
+async function provisionService() {
+  if (serviceBusy.value || busy.value || running.value || !ready.value || !provisionConfirm.value) return
+  if (engine.value.trim()) { serviceActionError.value = '后台服务只允许内置引擎，请清空自定义路径'; return }
+  if (mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535)) {
+    serviceActionError.value = '请填写有效本地端口'; return
+  }
+  serviceBusy.value = true
+  serviceGeneration++
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
+  try {
+    const name = await invoke<string>('provision_service', { request: {
+      engine: '', remote: remote.value.trim(), serverKey: serverKey.value.trim(),
+      mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+    } })
+    serviceName.value = name
+    watchedService.value = name
+    serviceSnapshot.value = null
+    serviceActionNotice.value = '新服务已部署，默认停止、手动启动'
+    provisionConfirm.value = false
+  } catch (e) {
+    serviceActionError.value = '部署失败：' + String(e)
+  } finally {
+    serviceBusy.value = false
+    void refreshService()
+  }
+}
+type ServiceAction = 'check' | 'start' | 'stop' | 'autostart-on' | 'autostart-off' | 'recovery-on' | 'recovery-off'
+async function serviceAction(action: ServiceAction) {
+  const name = watchedService.value
+  if (!name || !serviceSnapshot.value || serviceBusy.value || serviceName.value.trim() !== name) return
+  serviceBusy.value = true
+  serviceGeneration++
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
+  try {
+    await invoke('manage_service', { name, action })
+    serviceActionNotice.value = '操作成功，正在读取 SCM 最新状态'
+  } catch (e) {
+    serviceActionError.value = '操作失败（请检查管理员权限、服务配置及状态）：' + String(e)
+  } finally {
+    serviceSnapshot.value = null
+    serviceBusy.value = false
+    void refreshService()
+  }
+}
+let servicePolling = false
+let serviceGeneration = 0
+const serviceStateLabels: Record<string, string> = { stopped: '已停止', starting: '启动中', stopping: '停止中', running: '宿主运行中', paused: '已暂停', transitioning: '切换中', unknown: '未知' }
+const startupLabels: Record<string, string> = { automatic: '自动', manual: '手动', disabled: '禁用', unknown: '未知' }
+async function refreshService() {
+  const name = watchedService.value
+  if (!name || servicePolling || serviceBusy.value) return
+  servicePolling = true
+  const generation = serviceGeneration
+  try {
+    const result = await invoke<ServiceSnapshot>('service_status', { name })
+    if (serviceGeneration === generation) {
+      serviceSnapshot.value = result
+      serviceError.value = ''
+    }
+  } catch {
+    if (serviceGeneration === generation) {
+      serviceSnapshot.value = null
+      serviceError.value = '无法读取服务：未注册、身份不符或查询权限不足'
+    }
+  } finally { servicePolling = false }
+}
+function watchService() {
+  if (serviceBusy.value) return
+  maintenanceConfirm.value = ''
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
+  serviceGeneration++
+  serviceSnapshot.value = null
+  serviceError.value = ''
+  const name = serviceName.value.trim()
+  watchedService.value = ''
+  if (!/^LocalTunnelPreview-[0-9a-fA-F]{32}$/.test(name)) {
+    serviceError.value = '请输入完整的 LocalTunnelPreview 服务名称'
+    return
+  }
+  watchedService.value = name
+  void refreshService()
+}
+function unwatchService() {
+  if (serviceBusy.value) return
+  maintenanceConfirm.value = ''
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
+  serviceGeneration++
+  watchedService.value = ''
+  serviceSnapshot.value = null
+  serviceError.value = ''
+}
+type Traffic = { state: 'inactive' | 'unknown' | 'measured'; uploadBytes: number | null; downloadBytes: number | null; uploadBytesPerSecond: number | null; downloadBytesPerSecond: number | null }
+const traffic = ref<Traffic | null>(null)
+type TrafficHistory = { saved: { uploadBytes: number; downloadBytes: number; savedAtMs: number } | null; writeFailed: boolean }
+const trafficHistory = ref<TrafficHistory | null>(null)
+const historyError = ref(false)
+function formatBytes(value: number | null | undefined, rate = false) {
+  if (value == null || !Number.isFinite(value) || value < 0) return '—'
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let i = 0
+  while (value >= 1024 && i < units.length - 1) { value /= 1024; i++ }
+  return value.toFixed(i === 0 ? 0 : 2) + ' ' + units[i] + (rate ? '/s' : '')
+}
 const engine = ref('')
 const remote = ref('')
 const serverKey = ref('')
@@ -18,7 +177,7 @@ const notice = ref('')
 const portNotice = ref<Record<number, string>>({})
 const ready = ref(false)
 const running = computed(() => status.value.state === 'running')
-const locked = computed(() => busy.value || running.value || !ready.value)
+const locked = computed(() => busy.value || running.value || !ready.value || serviceBusy.value)
 const label = computed(() => !ready.value ? '状态未知' : running.value ? '进程运行中' : status.value.state === 'error' ? '进程异常' : '已停止')
 let timer: ReturnType<typeof setInterval> | undefined
 let polling = false
@@ -28,12 +187,25 @@ async function refresh() {
   try {
     status.value = await invoke<Status>('tunnel_status')
     ready.value = true
+    try { traffic.value = await invoke<Traffic>('traffic_status') } catch { traffic.value = null }
+    try {
+      trafficHistory.value = await invoke<TrafficHistory>('traffic_history')
+      historyError.value = false
+    } catch { trafficHistory.value = null; historyError.value = true }
+    try {
+      transport.value = await invoke<Transport>('transport_status')
+    } catch {
+      transport.value = { state: 'unknown', established: null, matchScope: 'none' }
+    }
   } catch {
     ready.value = false
+    traffic.value = null
+    trafficHistory.value = null
+    historyError.value = true
     error.value = '无法读取本地 Rust 服务状态。请使用桌面应用打开。'
   } finally { polling = false }
 }
-onMounted(() => { void refresh(); timer = setInterval(refresh, 1200) })
+onMounted(() => { void refresh(); timer = setInterval(() => { void refresh(); void refreshService() }, 1200) })
 onUnmounted(() => { if (timer) clearInterval(timer) })
 function add() {
   if (locked.value || mappings.value.length >= 64) return
@@ -122,7 +294,7 @@ async function probe(mapping: Mapping) {
   }
 }
 async function toggle() {
-  if (!ready.value || busy.value || polling) return
+  if (!ready.value || busy.value || polling || serviceBusy.value) return
   busy.value = true
   error.value = ''
   try {
@@ -151,21 +323,95 @@ async function toggle() {
       <div class="side-note">V0.3 开发预览<br>Rust · Noise 加密隧道</div>
     </aside>
     <main>
-      <header><div><p class="eyebrow">工作台 / 连接与映射</p><h1>内网穿透</h1><p class="muted">将本地服务连接到已授权的中转节点</p></div><span class="status" :class="{ online: ready && running }"><i></i>{{ label }}</span></header>
+      <header><div><p class="eyebrow">工作台 / 连接与映射</p><h1>内网穿透</h1><p class="muted">将本地服务连接到已授权的中转节点 · Noise 加密</p></div><span class="status" :class="{ online: ready && running }"><i></i>{{ label }}</span></header>
       <div class="summary">
         <div><small>映射配置</small><strong>{{ mappings.length }}</strong><span>最多 64 个映射</span></div>
         <div><small>已启动映射</small><strong>{{ ready ? status.mappingCount : '—' }}</strong><span>进程状态，非公网在线数</span></div>
-        <div><small>隧道协议</small><strong class="protocol">Noise</strong><span>服务端公钥验证</span></div>
+        <div><small>中转 TCP 连接</small><strong class="protocol">{{ transportLabel }}</strong><span>{{ transportHint }}</span></div>
       </div>
+      <section>
+        <div class="section-title"><h2>桌面隧道流量</h2><span>{{ traffic?.state === 'measured' ? '实际 TCP 数据' : '未计量 / 未启动' }}</span></div>
+        <div class="summary">
+          <div><small>上传速度</small><strong class="protocol">{{ formatBytes(traffic?.uploadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.uploadBytes) }}</span></div>
+          <div><small>下载速度</small><strong class="protocol">{{ formatBytes(traffic?.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.downloadBytes) }}</span></div>
+          <div><small>计量范围</small><strong class="protocol">本次会话</strong><span>不含加密/TCP 开销</span></div>
+        </div>
+        <p class="hint">以上为本次桌面会话；历史统计每 5 秒保存，正常停止时保存最终值。</p>
+        <div class="summary">
+          <div><small>历史累计上传</small><strong class="protocol">{{ formatBytes(trafficHistory?.saved?.uploadBytes) }}</strong><span>本机已保存</span></div>
+          <div><small>历史累计下载</small><strong class="protocol">{{ formatBytes(trafficHistory?.saved?.downloadBytes) }}</strong><span>本机已保存</span></div>
+          <div><small>最近保存</small><strong class="protocol">{{ trafficHistory?.saved ? new Date(trafficHistory.saved.savedAtMs).toLocaleTimeString() : '—' }}</strong><span>仅桌面模式</span></div>
+        </div>
+        <p v-if="historyError || trafficHistory?.writeFailed" class="error" role="alert">历史流量读取或保存失败，已保留原记录。</p>
+        <p class="hint">历史包含已保存的本次会话流量，不能重复相加；异常断电可能丢失最后一段未保存数据。不包含协议开销、后台服务或计费数据。</p>
+      </section>
+      <section>
+        <div class="section-title"><h2>Windows 后台服务</h2><span>SCM 服务管理</span></div>
+        <div class="fields">
+          <label class="wide">已注册服务名称<input v-model="serviceName" :disabled="serviceBusy" maxlength="51" placeholder="LocalTunnelPreview-…" /></label>
+        </div>
+        <div class="profile-actions">
+          <button type="button" class="secondary" :disabled="serviceBusy" @click="watchService">监测服务</button>
+          <button type="button" class="secondary" :disabled="!watchedService || serviceBusy" @click="unwatchService">停止监测</button>
+        </div>
+        <div class="profile-actions">
+          <label><input type="checkbox" v-model="provisionConfirm" :disabled="serviceBusy" /> 使用下方映射配置创建新服务，允许系统级加密保存 Token</label>
+          <button type="button" class="secondary" :disabled="locked || !provisionConfirm" @click="provisionService">一键部署新服务</button>
+        </div>
+        <p class="hint">需要以管理员身份运行客户端；创建全新服务，不覆盖旧配置。默认停止且手动启动。失败时保留受保护目录供检查。</p>
+        <p v-if="watchedService" class="hint">监测：{{ watchedService }}</p>
+        <div v-if="serviceSnapshot" class="summary" aria-live="polite">
+          <div><small>服务状态</small><strong class="protocol">{{ serviceStateLabels[serviceSnapshot.state] || '未知' }}</strong><span>非公网在线证明</span></div>
+          <div><small>启动方式</small><strong class="protocol">{{ startupLabels[serviceSnapshot.startup] || '未知' }}</strong><span>SCM 实际配置</span></div>
+          <div><small>宿主 PID</small><strong>{{ serviceSnapshot.hostPid ?? '—' }}</strong><span>退出码 {{ serviceSnapshot.win32ExitCode }} / {{ serviceSnapshot.serviceExitCode }}</span></div>
+        </div>
+        <p v-else-if="watchedService && !serviceError" class="hint">读取服务状态中…</p>
+        <div v-if="serviceSnapshot?.traffic" class="summary">
+          <div><small>服务上传速度</small><strong class="protocol">{{ formatBytes(serviceSnapshot.traffic.uploadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(serviceSnapshot.traffic.uploadBytes) }}</span></div>
+          <div><small>服务下载速度</small><strong class="protocol">{{ formatBytes(serviceSnapshot.traffic.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(serviceSnapshot.traffic.downloadBytes) }}</span></div>
+          <div><small>计量引擎 PID</small><strong>{{ serviceSnapshot.traffic.enginePid }}</strong><span>本次引擎会话</span></div>
+        </div>
+        <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照暂不可用（权限不足、恢复中或尚未采样）。</p>
+        <div v-if="serviceSnapshot?.history" class="summary">
+          <div><small>服务历史累计上传</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.uploadBytes) }}</strong><span>已保存</span></div>
+          <div><small>服务历史累计下载</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.downloadBytes) }}</strong><span>已保存</span></div>
+          <div><small>最近保存</small><strong class="protocol">{{ new Date(serviceSnapshot.history.savedAtMs).toLocaleTimeString() }}</strong><span>独立于桌面历史</span></div>
+        </div>
+        <p v-else-if="serviceSnapshot" class="hint">服务历史暂无可读记录（未配置、未保存或权限不足）。</p>
+        <p v-if="serviceSnapshot?.history" class="hint">已保存历史含本次已保存增量，不与会话流量重复相加；强制结束可能丢失未保存增量。</p>
+        <div v-if="serviceSnapshot" class="profile-actions">
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService" @click="serviceAction('check')">检查服务配置</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.state !== 'stopped' || serviceSnapshot.startup === 'disabled'" @click="serviceAction('start')">启动服务</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.state !== 'running'" @click="serviceAction('stop')">停止服务</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.startup === 'automatic'" @click="serviceAction('autostart-on')">开启开机自启</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.startup === 'manual'" @click="serviceAction('autostart-off')">设为手动启动</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.recovery === 'enabled'" @click="serviceAction('recovery-on')">开启故障恢复</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.recovery === 'disabled'" @click="serviceAction('recovery-off')">关闭故障恢复</button>
+          <span>故障恢复：{{ serviceSnapshot.recovery === 'enabled' ? '已启用' : serviceSnapshot.recovery === 'disabled' ? '已关闭' : '默认 / 未验证' }}</span>
+        </div>
+        <div v-if="serviceSnapshot?.state === 'stopped'" class="fields">
+          <label class="wide">维护确认：完整输入当前服务名称<input v-model="maintenanceConfirm" :disabled="serviceBusy" maxlength="51" autocomplete="off" :placeholder="watchedService" /></label>
+        </div>
+        <div v-if="serviceSnapshot?.state === 'stopped'" class="profile-actions">
+          <button type="button" class="secondary" :disabled="serviceBusy || busy || running || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService" @click="maintainService('update')">使用下方表单更新服务配置</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || busy || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService" @click="maintainService('unregister')">注销服务注册</button>
+        </div>
+        <p v-if="serviceSnapshot?.state === 'stopped'" class="hint">更新将替换整套加密配置并保持禁用，需手动恢复启动方式；注销只删除服务注册，不删除配置或历史目录。不会读取或显示旧 Token。</p>
+        <p v-if="serviceBusy" class="hint" role="status">正在执行服务操作…</p>
+        <p v-if="serviceActionNotice" class="hint" role="status">{{ serviceActionNotice }}</p>
+        <p v-if="serviceActionError" class="error" role="alert">{{ serviceActionError }}</p>
+        <p v-if="serviceError" class="error" role="alert">{{ serviceError }}</p>
+        <p class="hint">仅管理已注册且已授权的预览服务。操作使用当前 Windows 权限，不自动提权；需管理员时请以管理员身份运行客户端。关闭客户端不停止独立后台服务。已排队的 SCM 恢复可能仍会执行。</p>
+      </section>
       <form @submit.prevent="toggle">
         <section>
           <div class="section-title"><h2>中转节点</h2><span>服务端需提前配置同名映射</span></div>
           <div class="fields">
             <label>服务器地址<input v-model="remote" :disabled="locked" required placeholder="relay.example.com:2333" /></label>
             <label>服务器公钥<input v-model="serverKey" :disabled="locked" required autocomplete="off" placeholder="X25519 公钥（Base64）" /></label>
-            <label class="wide">Rathole 引擎路径<input v-model="engine" :disabled="locked" required placeholder="C:\LocalTunnel\rathole.exe" /></label>
+            <label class="wide">Rathole 引擎路径（可选）<input v-model="engine" :disabled="locked" placeholder="留空使用安装包内置引擎" /></label>
           </div>
-          <p class="hint">仅使用已校验的官方引擎。普通保存不写入 Token；仅主动选择加密保存才保留凭据。</p>
+          <p class="hint">默认使用内置 Rathole v0.5.0；自定义引擎仍须通过 SHA-256 校验。普通保存不写入 Token；仅主动选择加密保存才保留凭据。</p>
           <div class="profile-actions">
             <button type="button" class="secondary" :disabled="locked" @click="profileAction('save')">保存配置</button>
             <button type="button" class="secondary" :disabled="locked" @click="profileAction('load')">读取配置</button>

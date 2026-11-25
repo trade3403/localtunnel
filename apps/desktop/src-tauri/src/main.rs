@@ -2,6 +2,20 @@
 
 mod profile;
 mod credentials;
+mod engine_integrity;
+mod transport;
+mod traffic;
+mod history;
+#[cfg(windows)]
+mod engine_job;
+#[cfg(windows)]
+mod service_host;
+#[cfg(windows)]
+mod service_acl;
+#[cfg(windows)]
+mod service_control;
+#[cfg(windows)]
+mod service_provision;
 
 use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};
@@ -36,8 +50,40 @@ struct Status {
 
 struct Running {
     child: Child,
+    #[cfg(windows)]
+    _job: engine_job::EngineJob,
+    // Close telemetry before TempDir removes its files.
+    #[cfg(windows)]
+    telemetry: Option<std::fs::File>,
     _directory: TempDir,
     count: usize,
+    relay_target: Option<transport::Target>,
+    meter: Option<traffic::Meter>,
+}
+
+impl Running {
+    fn spawn(command: &mut Command, directory: TempDir, count: usize) -> Result<Self, String> {
+        #[cfg(windows)]
+        let job = engine_job::EngineJob::new().map_err(|e| format!("无法创建引擎进程保护：{e}"))?;
+        let mut child = command.spawn().map_err(|_| "无法启动 Rathole 引擎")?;
+        #[cfg(windows)]
+        if let Err(error) = job.assign(&child) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("无法保护引擎进程，已拒绝启动：{error}"));
+        }
+        Ok(Self {
+            child,
+            #[cfg(windows)]
+            _job: job,
+            #[cfg(windows)]
+            telemetry: None,
+            _directory: directory,
+            count,
+            relay_target: None,
+            meter: None,
+        })
+    }
 }
 
 impl Drop for Running {
@@ -68,6 +114,14 @@ impl Supervisor {
     }
 
     fn start(&mut self, request: StartRequest) -> Result<Status, String> {
+        self.start_in(request, None)
+    }
+
+    fn start_in(&mut self, request: StartRequest, runtime_root: Option<&Path>) -> Result<Status, String> {
+        self.start_in_with_history(request, runtime_root, None)
+    }
+
+    fn start_in_with_history(&mut self, request: StartRequest, runtime_root: Option<&Path>, history_dir: Option<&Path>) -> Result<Status, String> {
         self.status()?;
         if self.running.is_some() { return Err("请先停止现有隧道".into()); }
         let engine = Path::new(&request.engine);
@@ -78,9 +132,29 @@ impl Supervisor {
         if !engine.extension().is_some_and(|s| s.eq_ignore_ascii_case("exe")) {
             return Err("Windows 引擎必须为 EXE 文件".into());
         }
-        let config = build_config(&request)?;
-        let directory = tempfile::Builder::new().prefix("localtunnel-client-").tempdir()
-            .map_err(|_| "无法创建临时配置目录")?;
+        // Validate original configuration before allocating any listeners.
+        build_config(&request)?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("localtunnel-client-");
+        let directory = match runtime_root {
+            Some(root) => builder.tempdir_in(root),
+            None => builder.tempdir(),
+        }.map_err(|_| "无法创建临时配置目录")?;
+        let staged_engine = engine_integrity::stage(engine, directory.path())?;
+        let relay_port = request.remote.rsplit_once(':').and_then(|(_,p)| p.parse::<u16>().ok())
+            .ok_or("invalid relay port")?;
+        let meter = traffic::Meter::start_with_history(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port, history_dir)?;
+        let mappings = request.mappings.iter().zip(meter.ports()).map(|(m, &port)| ClientMapping {
+            name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
+        }).collect::<Vec<_>>();
+        let config = client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)?;
+        let target_ports = meter.ports().to_vec();
+        #[cfg(windows)]
+        let telemetry = if runtime_root.is_some() {
+            Some(std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(directory.path().join("traffic.json")).map_err(|_| "service telemetry file unavailable")?)
+        } else { None };
+        let relay_target = transport::Target::new(&request.remote, target_ports)?;
         let config_path = directory.path().join("client.toml");
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -92,8 +166,8 @@ impl Supervisor {
         let mut file = opts.open(&config_path).map_err(|_| "无法创建临时配置")?;
         file.write_all(config.as_bytes()).and_then(|_| file.sync_all()).map_err(|_| "无法写入配置")?;
         drop(file);
-        let mut command = Command::new(engine);
-        command.arg(&config_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        let mut command = Command::new(&staged_engine);
+        command.current_dir(directory.path()).arg(&config_path).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         command.env_remove("LOCALTUNNEL_TOKEN").env_remove("LOCALTUNNEL_SERVER_PRIVATE_KEY").env_remove("LOCALTUNNEL_SERVER_PUBLIC_KEY");
         for i in 1..=64 { command.env_remove(format!("LOCALTUNNEL_TOKEN_{i}")); }
         #[cfg(windows)]
@@ -101,10 +175,44 @@ impl Supervisor {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let child = command.spawn().map_err(|_| "无法启动 Rathole 引擎")?;
-        self.running = Some(Running { child, _directory: directory, count: request.mappings.len() });
+        let mut running = Running::spawn(&mut command, directory, request.mappings.len())?;
+        running.relay_target = Some(relay_target);
+        running.meter = Some(meter);
+        #[cfg(windows)]
+        { running.telemetry = telemetry; }
+        self.running = Some(running);
         self.last_error = None;
         self.status()
+    }
+
+    fn transport_status(&mut self) -> Result<transport::Observation, String> {
+        if self.status()?.state != "running" {
+            return Ok(transport::Observation::inactive());
+        }
+        let running = self.running.as_ref().ok_or("engine unavailable")?;
+        let Some(target) = &running.relay_target else { return Ok(transport::Observation::unknown()); };
+        Ok(transport::observe(running.child.id(), target))
+    }
+
+    fn traffic_status(&mut self) -> Result<traffic::Snapshot, String> {
+        if self.status()?.state != "running" { return Ok(traffic::Snapshot::inactive()); }
+        Ok(self.running.as_mut().and_then(|r| r.meter.as_mut())
+            .map(|m| m.snapshot()).unwrap_or_else(traffic::Snapshot::inactive))
+    }
+
+    #[cfg(windows)]
+    fn publish_service_traffic(&mut self) -> Result<(), String> {
+        use std::io::{Seek, SeekFrom};
+        let running = self.running.as_mut().ok_or("engine unavailable")?;
+        let meter = running.meter.as_mut().ok_or("meter unavailable")?;
+        let file = running.telemetry.as_mut().ok_or("telemetry unavailable")?;
+        let sample = traffic::ServiceSample::from_snapshot(meter.snapshot(), running.child.id())
+            .ok_or("sample unavailable")?;
+        let bytes = serde_json::to_vec(&sample).map_err(|_| "sample serialization failed")?;
+        // Fixed file and bounded record; no extra temp files to survive a
+        // host crash. Reader rejects partial or stale records.
+        file.seek(SeekFrom::Start(0)).and_then(|_| file.set_len(0))
+            .and_then(|_| file.write_all(&bytes)).map_err(|_| "sample write failed".to_owned())
     }
 
     fn stop(&mut self) -> Result<Status, String> {
@@ -114,7 +222,26 @@ impl Supervisor {
             }
             running.child.wait().map_err(|_| "无法等待隧道退出")?;
         }
-        self.running.take();
+        let mut history_failure = false;
+        if let Some(mut running) = self.running.take() {
+            if let Some(mut meter) = running.meter.take() {
+                history_failure = meter.finish().is_err();
+            }
+            // Report cleanup failures rather than silently discarding a plaintext config.
+            let config_path = running._directory.path().join("client.toml");
+            if let Err(error) = std::fs::remove_file(&config_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.last_error = Some("引擎已停止，但临时凭据文件清理失败".into());
+                    drop(running);
+                    return Err(self.last_error.clone().unwrap());
+                }
+            }
+            drop(running);
+        }
+        if history_failure {
+            self.last_error = Some("隧道已停止，但历史流量保存失败".into());
+            return Err(self.last_error.clone().unwrap());
+        }
         self.last_error = None;
         self.status()
     }
@@ -129,9 +256,23 @@ fn build_config(request: &StartRequest) -> Result<String, String> {
     client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)
 }
 
+fn bundled_engine(resource_dir: &Path) -> Result<std::path::PathBuf, String> {
+    let path = resource_dir.join("engine").join("rathole.exe");
+    if !path.is_absolute() || !path.is_file() {
+        return Err("内置 Rathole 引擎缺失，请重新安装客户端".into());
+    }
+    Ok(path)
+}
+
 #[tauri::command]
-fn start_tunnel(request: StartRequest, supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Status, String> {
-    supervisor.lock().map_err(|_| "进程状态不可用")?.start(request)
+fn start_tunnel(app: tauri::AppHandle, mut request: StartRequest, supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Status, String> {
+    // Empty means the packaged resource, resolved by Rust, not a frontend path.
+    if request.engine.is_empty() {
+        let resource = app.path().resource_dir().map_err(|_| "无法定位应用资源目录")?;
+        request.engine = bundled_engine(&resource)?.to_str().ok_or("引擎路径编码无效")?.to_owned();
+    }
+    let history_dir = app.path().app_config_dir().map_err(|_| "无法定位用户统计目录")?;
+    supervisor.lock().map_err(|_| "进程状态不可用")?.start_in_with_history(request, None, Some(&history_dir))
 }
 
 #[tauri::command]
@@ -142,6 +283,121 @@ fn stop_tunnel(supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Status
 #[tauri::command]
 fn tunnel_status(supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Status, String> {
     supervisor.lock().map_err(|_| "进程状态不可用")?.status()
+}
+
+#[tauri::command]
+async fn transport_status(app: tauri::AppHandle) -> Result<transport::Observation, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let supervisor = app.state::<Mutex<Supervisor>>();
+        let result = supervisor.lock().map_err(|_| "进程状态不可用")?.transport_status();
+        result
+    }).await.map_err(|_| "TCP 状态读取失败")?
+}
+
+#[tauri::command]
+fn traffic_status(supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<traffic::Snapshot, String> {
+    supervisor.lock().map_err(|_| "进程状态不可用")?.traffic_status()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryStatus {
+    saved: Option<history::Totals>,
+    write_failed: bool,
+}
+
+#[tauri::command]
+async fn traffic_history(app: tauri::AppHandle) -> Result<HistoryStatus, String> {
+    let dir = app.path().app_config_dir().map_err(|_| "无法定位用户统计目录")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<Mutex<Supervisor>>();
+        let write_failed = state.lock().map_err(|_| "进程状态不可用")?.running.as_ref()
+            .and_then(|r| r.meter.as_ref()).is_some_and(|m| m.history_failed());
+        Ok(HistoryStatus { saved: history::read(&dir)?, write_failed })
+    }).await.map_err(|_| "历史流量读取失败")?
+}
+
+#[cfg(windows)]
+static SERVICE_MUTATION: Mutex<()> = Mutex::new(());
+
+#[cfg(windows)]
+#[tauri::command]
+async fn update_service_profile(name: String, confirmation: String, request: StartRequest) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = SERVICE_MUTATION.try_lock().map_err(|_| "another service action is running")?;
+        service_control::update_profile(&name, &confirmation, request)
+    }).await.map_err(|_| "service configuration update failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn update_service_profile(name: String, confirmation: String, request: StartRequest) -> Result<(), String> {
+    let _ = (name, confirmation, request);
+    Err("Windows SCM unavailable".into())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn unregister_service(name: String, confirmation: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = SERVICE_MUTATION.try_lock().map_err(|_| "another service action is running")?;
+        service_control::unregister_confirmed(&name, &confirmation)
+    }).await.map_err(|_| "service unregister failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn unregister_service(name: String, confirmation: String) -> Result<(), String> {
+    let _ = (name, confirmation);
+    Err("Windows SCM unavailable".into())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn provision_service(app: tauri::AppHandle, request: StartRequest) -> Result<String, String> {
+    let resource = app.path().resource_dir().map_err(|_| "application resource directory unavailable")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = SERVICE_MUTATION.try_lock().map_err(|_| "another provisioning action is running")?;
+        service_provision::provision(request, &resource)
+    }).await.map_err(|_| "service provisioning failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn provision_service(request: StartRequest) -> Result<String, String> {
+    let _ = request;
+    Err("Windows SCM unavailable".into())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn manage_service(name: String, action: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Only one desktop mutation per process; Windows SCM remains
+        // authoritative for cross-process state transitions.
+        let _guard = SERVICE_MUTATION.try_lock().map_err(|_| "another service action is running")?;
+        service_control::manage_existing(&name, &action)
+    }).await.map_err(|_| "service action failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn manage_service(name: String, action: String) -> Result<(), String> {
+    let _ = (name, action);
+    Err("Windows SCM unavailable".into())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn service_status(name: String) -> Result<service_control::ServiceSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || service_control::snapshot(&name))
+        .await.map_err(|_| "service query failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn service_status(_name: String) -> Result<serde_json::Value, String> {
+    Err("Windows SCM unavailable".into())
 }
 
 #[tauri::command]
@@ -187,10 +443,89 @@ async fn check_local_port(port: u16) -> Result<bool, String> {
 }
 
 fn main() {
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).is_some_and(|arg| arg == "--service-status") {
+            let result = if args.len() == 3 {
+                service_control::snapshot(&args[2]).and_then(|s|
+                    serde_json::to_writer(std::io::stdout().lock(), &s).map_err(|_| "status output failed".into()))
+            } else { Err("invalid service status arguments".into()) };
+            if let Err(error) = &result {
+                let _ = writeln!(std::io::stderr(), "service status failed: {error}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+        if args.get(1).is_some_and(|arg| arg == "--service-update" || arg == "--service-unregister") {
+            let result = (|| -> Result<(), String> {
+                if args.len() != 4 { return Err("exact service name and confirmation required".into()); }
+                if args[1] == "--service-unregister" {
+                    return service_control::unregister_confirmed(&args[2], &args[3]);
+                }
+                use std::io::Read;
+                let mut data = zeroize::Zeroizing::new(Vec::new());
+                std::io::stdin().lock().take(256 * 1024 + 1).read_to_end(&mut data)
+                    .map_err(|_| "profile read failed")?;
+                if data.len() > 256 * 1024 { return Err("profile too large".into()); }
+                let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "invalid service profile")?;
+                service_control::update_profile(&args[2], &args[3], request)
+            })();
+            if let Err(error) = &result {
+                let _ = writeln!(std::io::stderr(), "service maintenance failed: {error}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+        if args.get(1).is_some_and(|arg| arg == "--service-provision") {
+            use std::io::Read;
+            let result = (|| -> Result<String, String> {
+                if args.len() != 2 { return Err("invalid provisioning arguments".into()); }
+                let mut data = zeroize::Zeroizing::new(Vec::new());
+                std::io::stdin().lock().take(256 * 1024 + 1).read_to_end(&mut data)
+                    .map_err(|_| "profile read failed")?;
+                if data.len() > 256 * 1024 { return Err("profile too large".into()); }
+                let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "invalid service profile")?;
+                let exe = std::env::current_exe().map_err(|_| "desktop executable unavailable")?;
+                service_provision::provision(request, exe.parent().ok_or("resource directory unavailable")?)
+            })();
+            match result {
+                Ok(name) => { let _ = writeln!(std::io::stdout(), "{name}"); std::process::exit(0); }
+                Err(error) => { let _ = writeln!(std::io::stderr(), "service provisioning failed: {error}"); std::process::exit(1); }
+            }
+        }
+        if args.get(1).is_some_and(|arg| arg == "--service-manage") {
+            // Exercise the same allowlisted native function as the desktop IPC.
+            let result = if args.len() == 4 {
+                service_control::manage_existing(&args[2], &args[3])
+            } else { Err("invalid desktop service arguments".into()) };
+            if let Err(error) = &result {
+                let _ = writeln!(std::io::stderr(), "desktop service action failed: {error}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+        if args.get(1).is_some_and(|arg| arg == "--service-control") {
+            let result = if args.len() == 4 {
+                service_control::execute(&args[2], &args[3])
+            } else { Err("invalid service control arguments".into()) };
+            if let Err(error) = &result {
+                // Only static diagnostics and SCM errors; never print credentials.
+                let _ = writeln!(std::io::stderr(), "service control failed: {error}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
+        if args.get(1).is_some_and(|arg| arg == "--service-seal-profile") {
+            let ok = args.len() == 3 && service_host::seal_profile_from_stdin(&args[2]).is_ok();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+        if args.get(1).is_some_and(|arg| arg == "--service-host" || arg == "--service-tunnel") {
+            // Explicit SCM-only entry; ordinary desktop startup never registers a service.
+            let ok = args.len() == 3 && service_host::dispatch(&args[2], args[1] == "--service-tunnel").is_ok();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+    }
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
@@ -330,9 +665,24 @@ mod tests {
         std::fs::write(&config, server_config(relay_addr, "web", mapped_addr.port(), &token, private).unwrap()).unwrap();
         drop(relay_port);
         drop(mapped_port);
-        let child = Command::new(&engine).arg(&config).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-        let _relay = Running { child, _directory: directory, count: 1 };
+        let mut relay_command = Command::new(&engine);
+        relay_command.arg(&config).stdout(Stdio::null()).stderr(Stdio::null());
+        let _relay = Running::spawn(&mut relay_command, directory, 1).unwrap();
         let mut supervisor = Supervisor::default();
+        // Alter one byte of the real release executable and exercise the exact
+        // supervisor launch guard, without ever executing the altered copy.
+        let tampered_dir = tempfile::tempdir().unwrap();
+        let tampered_path = tampered_dir.path().join("rathole.exe");
+        let mut tampered_bytes = std::fs::read(&engine).unwrap();
+        tampered_bytes[0] ^= 1;
+        std::fs::write(&tampered_path, tampered_bytes).unwrap();
+        let error = supervisor.start(StartRequest {
+            engine: tampered_path.to_string_lossy().into_owned(),
+            remote: relay_addr.to_string(), server_key: public.into(),
+            mappings: vec![Mapping { name: "web".into(), local_port, token: token.clone() }],
+        }).err().expect("modified engine must not launch");
+        assert!(error.contains("SHA-256"));
+        assert!(supervisor.running.is_none());
         assert_eq!(supervisor.start(StartRequest { engine, remote: relay_addr.to_string(), server_key: public.into(),
             mappings: vec![Mapping { name: "web".into(), local_port, token }] }).unwrap().state, "running");
         let until = Instant::now() + Duration::from_secs(25);
@@ -350,8 +700,25 @@ mod tests {
         }
         assert!(forwarded, "desktop supervisor failed to forward real bytes");
         fixture.join().unwrap();
+        let measured = supervisor.traffic_status().unwrap();
+        assert_eq!(measured.state, "measured");
+        assert!(measured.download_bytes.unwrap() >= 4);
+        assert!(measured.upload_bytes.unwrap() >= 4);
+        #[cfg(windows)]
+        {
+            let observed = supervisor.transport_status().unwrap();
+            assert_eq!(observed.state, "established", "real engine relay TCP connection missing");
+            assert!(observed.established.unwrap() > 0);
+            assert_eq!(observed.match_scope, "ip_port");
+        }
+        let client_dir = supervisor.running.as_ref().unwrap()._directory.path().to_owned();
+        assert!(client_dir.join("client.toml").is_file());
         assert_eq!(supervisor.stop().unwrap().state, "stopped");
+        assert!(!client_dir.join("client.toml").exists(), "plaintext config survived stop");
+        assert!(!client_dir.exists(), "temporary directory survived stop");
         assert!(supervisor.running.is_none());
+        assert_eq!(supervisor.transport_status().unwrap().state, "inactive");
+        assert_eq!(supervisor.traffic_status().unwrap().state, "inactive");
     }
 
     #[test]
@@ -362,6 +729,17 @@ mod tests {
         drop(listener);
         assert!(!local_port_open(port).unwrap());
         assert!(local_port_open(0).is_err());
+    }
+
+    #[test]
+    fn bundled_engine_resolves_only_expected_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(bundled_engine(dir.path()).is_err());
+        let engine_dir = dir.path().join("engine");
+        std::fs::create_dir(&engine_dir).unwrap();
+        let exe = engine_dir.join("rathole.exe");
+        std::fs::write(&exe, b"test path only").unwrap();
+        assert_eq!(bundled_engine(dir.path()).unwrap(), exe);
     }
 
     #[test]
