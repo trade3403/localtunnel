@@ -223,6 +223,8 @@ REQUIRED["management-v05"] = {
         "real_consistent_live_wal_snapshot_and_no_overwrite",
         "real_restored_login_mapping_and_stale_credentials_rejected",
         "corrupt_schema_symlink_and_existing_destination_refused",
+        "restored_runtime_and_domain_authority_cleared",
+        "snapshot_size_and_sidecar_admission_recovery",
     ],
     "transport.json": [
         "real_incomplete_header_absolute_deadline",
