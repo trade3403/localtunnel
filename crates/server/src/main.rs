@@ -1,3 +1,5 @@
+mod auth;
+
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
 use std::{error::Error, io::{self, Write}, net::Ipv4Addr, path::{Path, PathBuf}, time::Duration};
@@ -11,10 +13,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(5) => (StatusCode::OK, "ready"),
+        Ok(6) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -50,10 +52,11 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
 async fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.len() != 2 {
-        return Err("usage: localtunnel-server <private-data-directory> <port>".into());
+        return Err("usage: localtunnel-server <private-data-directory> <port> | --init-admin <private-data-directory>".into());
     }
-    let port: u16 = args[1].to_str().ok_or("invalid port")?.parse()?;
-    let database = data_path(Path::new(&args[0]))?;
+    let init = args[0] == "--init-admin";
+    let database = data_path(Path::new(if init { &args[1] } else { &args[0] }))?;
+    let port: u16 = if init { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_secs(3))
@@ -64,10 +67,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .busy_timeout(Duration::from_secs(3)))
         .await?;
     MIGRATOR.run(&pool).await?;
+    if init {
+        auth::init_admin(&pool).await.map_err(|_| "administrator initialization refused")?;
+        return Ok(());
+    }
+    let auth = auth::AuthState::new(pool.clone()).map_err(|_| "authentication initialization failed")?;
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
-        .with_state(pool);
+        .with_state(pool)
+        .merge(auth::routes(auth));
     // No configurable public bind or unauthenticated data API in this increment.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("LISTENING {}", listener.local_addr()?);

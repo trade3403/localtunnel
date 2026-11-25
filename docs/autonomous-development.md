@@ -188,3 +188,7 @@
 ## 2026-11-25：V0.4 首个管理服务 CI 通过、锁定构建复验
 - HEAD 1a02e3c0823d1a07f296c5d0fe1111ce053efaef 全部 6 个 CI 成功：Management #1 https://github.com/trade3403/localtunnel/actions/runs/45597475434 、#2 https://github.com/trade3403/localtunnel/actions/runs/45597497087 、Windows #100、Gateway #94、Runner #196/#197。两个管理服务 job 139147263653/139147335947 均实际通过 Rust 构建、真实回环 HTTP、SQLite 迁移/持久化/约束、就绪状态与不安全路径拒绝，报告 https://github.com/trade3403/localtunnel/actions/runs/45597497087/artifacts/15012909468 。
 - 从两份独立成功 CI 的 BEGIN/END 标记回收完整 Cargo.lock（1840 行），逐字比较一致，保留 registry checksum，无手工拼装依赖。提交 crates/server/Cargo.lock；删除每轮 cargo generate-lockfile 步骤，继续 cargo test/build --locked，并增加 git diff 门禁，保留真实 E2E 与证据上传。下一轮严格锁定构建仍需验收，未开发登录或对外开放服务。全绿后进入管理员认证；未改 main、未部署公网、未启用自动任务。
+
+## 2026-11-25：锁定管理服务验收、管理员认证增量
+- HEAD 17744e96e2cb03994628cdca98c11acfcc825110 六个 CI 全绿：Management #3 https://github.com/trade3403/localtunnel/actions/runs/45599226639 、#4 https://github.com/trade3403/localtunnel/actions/runs/45599234675 、Windows #101、Gateway #95、Runner #198/#199。严格锁定构建、真实 HTTP/SQLite、git diff 锁文件不变通过，报告 https://github.com/trade3403/localtunnel/actions/runs/45599234675/artifacts/15013974712 。
+- 新增 stdin 初始化管理员（空 users 表原子插入）、Argon2id 随机盐、随机32字节 Bearer token 仅存 SHA256 摘要、1小时单会话、登录轮换/注销/降权/禁用/密码变更撤销、4KiB body 上限、全局12次/60秒预算及2个并行哈希任务。真实 CLI/HTTP/SQLite 测试，保留旧测试，迁移计数更新为2。仅回环预览；MFA、密码恢复、普通用户认证、生产 HTTPS 未实现。预算重启清空，可能共享阻塞。新增 Argon2 依赖一次性 cargo metadata 解析，输出锁供回收；构建 --locked 并核对解析后无变化。全部新增功能待 CI，之后回收锁严格复验再进入设备注册。未改 main、未部署、未启动定时任务。
