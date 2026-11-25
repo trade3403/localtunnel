@@ -161,3 +161,8 @@
 ## 2026-11-25：真实安装版 GUI CI #89 连接修复
 - HEAD b38ed5169351c462851e2574c4f181b23f847fab，CI #89 https://github.com/trade3403/localtunnel/actions/runs/45578918748 仅已安装 GUI E2E 失败；job 139083710495 日志 Error: GUI gate timed out: WebView2 debug target，未执行 UI 测试。Rust、真实 TCP、SCM 生命周期、加密转发及构建均通过；核心 #88、Runner #184 通过。失败证据 https://github.com/trade3403/localtunnel/actions/runs/45578918748/artifacts/15006496243 。
 - 与上游 https://github.com/tauri-apps/wry/issues/1782 高度吻合：WebView2 Runtime 150+ 管理员进程忽略环境变量调试参数，Windows hosted runner 受影响；本次日志尚未证实 runtime 版本。参考按 EXE 名称的 HKLM AdditionalBrowserArguments 策略 https://github.com/RVYNP/hold-my-brief/commit/7f3b93f88073be1f7274fe4612a39b93284cf5cf 。仅允许 GitHub-hosted Windows CI 脚本设置 localtunnel-desktop.exe 的随机本地调试端口，不覆盖已有 app/wildcard 策略，不修改发行配置、运行权限或安全开关，退出测试进程后 finally 校验并删除本次创建的策略值；保留空父键，不碰其他注册表值。新增 CDP HTTP 可达/目标类型/策略设置与清理证据，识别 page/webview，连接时限 60 秒；修正 Windows PowerShell 5.1 不支持的 0u 字面量。临时 runner 上仍仅使用随机测试密钥/令牌；不用于真实用户电脑。新 CI 待验收，保留全部 GUI 门禁。未改 main。
+
+
+## 2026-11-25：安装版 GUI 验收通过、服务 GUI 全生命周期验收
+- HEAD ade61d31676ec31cdafe141b907cf72fc159bd27，CI #91 https://github.com/trade3403/localtunnel/actions/runs/45581311380 全部通过；临时 CDP 策略修复通过实际安装版 GUI 门禁，真实桌面映射、端口检测、启动/HTTP/流量、原生关闭隐藏后转发、恢复/停止/历史、安装卸载通过。核心 #89、Runner #186 通过。安装包 https://github.com/trade3403/localtunnel/actions/runs/45581311380/artifacts/15007680224 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45581311380/artifacts/15007396009 。
+- 扩展同一个安装版 WebView2 DOM E2E：桌面已停止后，真实勾选并点击一键部署，验证随机新服务名、SCM 手动且停止、密文无测试 token；实际点击开机自启/手动、恢复策略开关、启动/停止，真实 HTTP 及可见字节、持久化记录；第二独立 HTTP fixture 修改本地端口，点击更新后保持禁用，再手动启用并验证不同响应和历史累加；通过输入确切服务名点击注销，验证 SCM 不存在及密文和历史保持。失败清理仅本轮新建的随机服务，CI 专用临时调试策略仍清理；不添加依赖或修改产品安全配置，不改 main。新增服务 GUI 测试待 CI，物理托盘菜单点击尚未验证，公网、非管理员权限、签名安装包仍未完成。

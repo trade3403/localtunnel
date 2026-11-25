@@ -5,7 +5,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { createServer as tcpServer } from 'node:net'
 import { createServer as httpServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
-import { mkdtemp, writeFile, rm } from 'node:fs/promises'
+import { mkdtemp, writeFile, rm, readFile, readdir } from 'node:fs/promises'
 import { dirname, join, resolve, basename } from 'node:path'
 import { tmpdir } from 'node:os'
 
@@ -18,12 +18,23 @@ const exe = resolve(exeArg)
 const evidence = resolve(evidenceArg)
 const engine = join(dirname(exe), 'engine', 'rathole.exe')
 const work = await mkdtemp(join(tmpdir(), 'localtunnel-gui-'))
-const report = { scope: 'installed WebView2 DOM controls + real IPC + loopback encrypted HTTP + native WM_CLOSE; not physical tray menu click or public E2E',
+const report = { scope: 'installed WebView2 desktop and SCM DOM controls + real IPC + loopback encrypted HTTP + native WM_CLOSE; not physical tray menu click or public E2E',
   ui_ready: false, mapping_add_remove: false, port_probe: false,
   start_clicked: false, encrypted_http: false, traffic_visible: false,
   native_close_hides: false, hidden_tunnel_works: false, native_restore: false,
   stop_clicked: false, forwarding_stopped: false, history_visible: false }
-let app, relay, socket, fixture, policy
+let app, relay, socket, fixture, policy, alternate
+let serviceName
+report.service_provisioned = false
+report.service_startup_controls = false
+report.service_recovery_controls = false
+report.service_real_http = false
+report.service_traffic_visible = false
+report.service_stopped = false
+report.service_config_updated = false
+report.service_updated_http = false
+report.service_unregistered = false
+report.service_data_preserved = false
 report.cdp_policy_created = false
 report.cdp_policy_removed = false
 report.cdp_http_reachable = false
@@ -151,6 +162,41 @@ async function click(text) {
   const success = await evaluate('(()=>{const b=[...document.querySelectorAll("button")].find(e=>e.textContent.trim()===' + q(text) + ');if(!b||b.disabled)return false;b.click();return true})()')
   if (!success) throw Error('button unavailable: ' + text)
 }
+async function serviceStat(label) {
+  return evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="Windows 后台服务");return [...(s?.querySelectorAll(".summary div")||[])].find(e=>e.querySelector("small")?.textContent===' + q(label) + ')?.querySelector("strong")?.textContent.trim()||null})()')
+}
+async function waitStat(label, value) {
+  await until('service ' + label + ' = ' + value, async () => await serviceStat(label) === value, 35000)
+}
+async function waitButton(text) {
+  await until('enabled service button ' + text, () => evaluate('[...document.querySelectorAll("button")].some(e=>!e.disabled&&e.textContent.trim()===' + q(text) + ')'), 35000)
+}
+async function serviceClick(text) {
+  await waitButton(text)
+  await click(text)
+}
+function servicePath(name) {
+  if (!/^LocalTunnelPreview-[0-9a-f]{32}$/.test(name)) throw Error('invalid generated service name')
+  if (!process.env.ProgramData) throw Error('ProgramData unavailable')
+  return join(process.env.ProgramData,name)
+}
+function statusCli(name) {
+  return JSON.parse(execFileSync(exe,['--service-status',name],{encoding:'utf8',timeout:15000,windowsHide:true}))
+}
+function scAbsent(name) {
+  // The exact generated test service only. SCM error 1060 means nonexistent.
+  try {
+    execFileSync(join(process.env.SystemRoot,'System32','sc.exe'),['query',name],{encoding:'utf8',timeout:10000,windowsHide:true,stdio:'pipe'})
+    return false
+  } catch(e) { return e.status === 1060 || /1060/.test(String(e.stdout||'')) }
+}
+function cleanupTestService(name) {
+  // Emergency cleanup only: no production services, no arbitrary paths.
+  if (!/^LocalTunnelPreview-[0-9a-f]{32}$/.test(name)) return
+  for (const args of [['--service-manage',name,'recovery-off'],['--service-manage',name,'stop'],['--service-unregister',name,name]]) {
+    try { execFileSync(exe,args,{stdio:'ignore',timeout:35000,windowsHide:true}) } catch {}
+  }
+}
 async function has(text) { return evaluate('document.body.innerText.includes(' + q(text) + ')') }
 async function waitText(text) { await until(text, () => has(text)) }
 async function get(url) {
@@ -259,11 +305,103 @@ try {
   report.forwarding_stopped = true
   await until('history visible', () => evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="桌面隧道流量");return !!s&&[...s.querySelectorAll(".summary div")].some(e=>e.querySelector("small")?.textContent==="历史累计上传"&&/^[1-9][0-9.]* (B|KiB|MiB|GiB|TiB)$/.test(e.querySelector("strong")?.textContent.trim()))})()'))
   report.history_visible = true
+
+  // The desktop tunnel has stopped. The same form now provisions a fresh
+  // SCM service using the installed app's actual Vue button and Rust IPC.
+  await until('desktop form editable', () => evaluate('!!document.querySelector("input[placeholder=\\"relay.example.com:2333\\"]:not(:disabled)")'))
+  const beforeDirs = new Set((await readdir(process.env.ProgramData)).filter(n=>/^LocalTunnelPreview-[0-9a-f]{32}$/.test(n)))
+  const checked = await evaluate('(()=>{const e=document.querySelector("input[type=checkbox]");if(!e||e.disabled)return false;if(!e.checked)e.click();return e.checked})()')
+  if (!checked) throw Error('provision confirmation unavailable')
+  await serviceClick('一键部署新服务')
+  try {
+    serviceName = await until('new generated service name', async () => {
+      const name = await evaluate('document.querySelector("input[placeholder=\\"LocalTunnelPreview-…\\"]")?.value')
+      return typeof name==='string' && /^LocalTunnelPreview-[0-9a-f]{32}$/.test(name) && !beforeDirs.has(name) ? name : null
+    }, 45000)
+  } catch(e) {
+    // If UI failed after provisioning, recover only a unique fresh fixture.
+    const created = (await readdir(process.env.ProgramData)).filter(n=>/^LocalTunnelPreview-[0-9a-f]{32}$/.test(n)&&!beforeDirs.has(n))
+    if (created.length===1) serviceName=created[0]
+    throw e
+  }
+  const root = servicePath(serviceName)
+  const profilePath = join(root,'service-profile.bin')
+  const historyPath = join(root,'history','traffic-history.json')
+  await waitStat('服务状态','已停止')
+  await waitStat('启动方式','手动')
+  const initial = statusCli(serviceName)
+  if(initial.state!=='stopped'||initial.startup!=='manual') throw Error('unexpected provisioned SCM state')
+  const originalProfile = await readFile(profilePath)
+  if(originalProfile.includes(Buffer.from(token))) throw Error('plaintext fixture token in service profile')
+  report.service_provisioned = true
+  await serviceClick('开启开机自启')
+  await waitStat('启动方式','自动')
+  await serviceClick('设为手动启动')
+  await waitStat('启动方式','手动')
+  report.service_startup_controls = true
+  await serviceClick('开启故障恢复')
+  await waitText('故障恢复：已启用')
+  await serviceClick('关闭故障恢复')
+  await waitText('故障恢复：已关闭')
+  report.service_recovery_controls = true
+  await serviceClick('启动服务')
+  await waitStat('服务状态','宿主运行中')
+  await until('real SCM HTTP response',async()=>await get(url)===body,35000)
+  report.service_real_http = true
+  await until('visible SCM traffic',()=>evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="Windows 后台服务");return !!s&&[...s.querySelectorAll(".summary span")].filter(e=>/^累计 [1-9][0-9.]* (B|KiB|MiB|GiB|TiB)$/.test(e.textContent.trim())).length>=2})()'))
+  report.service_traffic_visible = true
+  await serviceClick('停止服务')
+  await waitStat('服务状态','已停止')
+  await until('SCM forwarding stopped',async()=>await get(url)!==body,15000)
+  report.service_stopped = true
+  const savedBefore=JSON.parse(await readFile(historyPath,'utf8'))
+  if(savedBefore.uploadBytes<Buffer.byteLength(body)||savedBefore.downloadBytes<=0) throw Error('missing real service history')
+
+  // Update the stopped service to a second independent local HTTP fixture.
+  const changedBody=randomBytes(56).toString('hex')
+  alternate=httpServer((_req,res)=>{res.writeHead(200,{'Content-Length':Buffer.byteLength(changedBody)});res.end(changedBody)})
+  const alternatePort=await listen(alternate)
+  await field('input[aria-label="本地端口"]',alternatePort)
+  await field('input[placeholder="'+serviceName+'"]',serviceName)
+  await serviceClick('使用下方表单更新服务配置')
+  await waitStat('启动方式','禁用')
+  await waitStat('服务状态','已停止')
+  const updatedProfile=await readFile(profilePath)
+  if(updatedProfile.equals(originalProfile)||updatedProfile.includes(Buffer.from(token))) throw Error('updated service profile not encrypted/replaced')
+  report.service_config_updated=true
+  await serviceClick('设为手动启动')
+  await waitStat('启动方式','手动')
+  await serviceClick('启动服务')
+  await waitStat('服务状态','宿主运行中')
+  await until('updated SCM mapping response',async()=>await get(url)===changedBody,35000)
+  report.service_updated_http=true
+  await serviceClick('停止服务')
+  await waitStat('服务状态','已停止')
+  await until('updated mapping stopped',async()=>await get(url)!==changedBody,15000)
+  const savedAfter=JSON.parse(await readFile(historyPath,'utf8'))
+  if(savedAfter.uploadBytes<savedBefore.uploadBytes+Buffer.byteLength(changedBody)||savedAfter.downloadBytes<=savedBefore.downloadBytes) throw Error('service update lost history')
+  await field('input[placeholder="'+serviceName+'"]',serviceName)
+  await serviceClick('注销服务注册')
+  await waitText('已注销 SCM 注册')
+  await until('SCM registration absent',()=>scAbsent(serviceName),25000)
+  report.service_unregistered=true
+  if(!(await readFile(profilePath)).equals(updatedProfile)||JSON.stringify(JSON.parse(await readFile(historyPath,'utf8')))!==JSON.stringify(savedAfter)) throw Error('unregister changed protected data')
+  report.service_data_preserved=true
 } finally {
   try {
     if (socket) socket.close()
     await terminate(app)
+    if (serviceName) {
+      cleanupTestService(serviceName)
+      if (scAbsent(serviceName)) {
+        // Remove only the random fixture created in this isolated CI test.
+        await rm(servicePath(serviceName),{recursive:true,force:true,maxRetries:5,retryDelay:300})
+      } else {
+        throw Error('disposable GUI service cleanup failed')
+      }
+    }
     await terminate(relay)
+    if (alternate) { alternate.closeAllConnections(); await close(alternate) }
     if (fixture) { fixture.closeAllConnections(); await close(fixture) }
   } finally {
     try { removeDebugPolicy() }
