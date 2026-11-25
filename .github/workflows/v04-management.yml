@@ -1,7 +1,7 @@
 name: V0.4 Management API CI
 on:
   push:
-    branches: ['feat/v0.4-management-api']
+    branches: ['feat/v0.4-management-api', 'feat/v0.5-security-stability']
   pull_request:
     paths:
       - 'crates/server/**'
@@ -27,6 +27,8 @@ jobs:
           cargo build --release --locked
       - name: Real management HTTP and SQLite lifecycle
         run: python3 crates/server/tests/http_e2e.py crates/server/target/release/localtunnel-server management-evidence/http.json
+      - name: Real management resource admission and deadline
+        run: python3 crates/server/tests/protection_e2e.py crates/server/target/release/localtunnel-server management-evidence/protection.json
       - name: Real administrator authentication lifecycle
         run: python3 crates/server/tests/auth_e2e.py crates/server/target/release/localtunnel-server management-evidence/auth.json
       - name: Real device enrollment and authorization lifecycle

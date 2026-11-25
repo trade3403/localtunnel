@@ -13,6 +13,7 @@
 - [V0.3 Windows 客户端开发预览](docs/v0.3.md)
 - [V0.4 管理服务开发预览与历史](docs/v0.4.md)
 - [V0.4 最终验收记录、运行入口及未完成边界](docs/v0.4-acceptance.md)
+- [V0.5 安全与稳定性开发记录](docs/v0.5.md)
 - [自主开发与 CI 记录](docs/autonomous-development.md)
 
 ## 技术栈
@@ -21,15 +22,15 @@ Rust · Tokio · Rathole · Axum · Rustls · Tauri 2 · Vue 3 · SQLite · Ngin
 
 ## 开发进度
 
-V0.1–V0.4 已通过免费 GitHub Hosted Runner 的同机开发预览回归。V0.4 实测基线为 `d21c0443aeae221172eb5a1e6eb5ef5dcd1050ab`（Management #57/#58、Windows #128、Gateway #122、Runner #253/#254 全绿）；最终证据门禁增量待 CI。包括 Axum/SQLite、中文 Web 后台、Windows 管理配对/原生心跳、HTTP/HTTPS 真实加密隧道启停、常驻故障恢复、流量观测和审计。不是生产版或公网验收；当前管理入口仅回环，不能自动把远程 Windows 设备配置应用至真实公网中转。
+V0.1–V0.4 已通过免费 GitHub Hosted Runner 的同机开发预览回归。V0.4 实测基线为 `d21c0443aeae221172eb5a1e6eb5ef5dcd1050ab`（Management #57/#58、Windows #128、Gateway #122、Runner #253/#254 全绿）；最终证据门禁提交 `d6440ab87c7f9b782ef32a3689d32719935124d0`（Management #59/#60、Windows #129、Gateway #123、Runner #255/#256）也已全绿。包括 Axum/SQLite、中文 Web 后台、Windows 管理配对/原生心跳、HTTP/HTTPS 真实加密隧道启停、常驻故障恢复、流量观测和审计。不是生产版或公网验收；当前管理入口仅回环，不能自动把远程 Windows 设备配置应用至真实公网中转。
 
 | 版本 | 目标 | 状态 |
 |---|---|---|
 | V0.1 | Rust 配置工具、加密隧道、同机 E2E；公网验收延后 | 同机 CI 通过，公网待验收 |
 | V0.2 | 域名映射、HTTPS、WebSocket | 静态及动态网关 CI 通过；ACME、动态隧道待开发 |
 | V0.3 | Windows 客户端及安装包 | 桌面、托盘、Windows Service、安装卸载与真实回环转发 CI 通过；未签名，实机和公网待验收 |
-| V0.4 | Web 管理后台、管理设备、受控预览运行 | 同机功能验收通过；最终证据门禁待 CI；生产边界未完成 |
-| V0.5 | 安全、稳定性与负载测试 | 待开发 |
+| V0.4 | Web 管理后台、管理设备、受控预览运行 | 同机功能及最终证据门禁验收通过；生产边界未完成 |
+| V0.5 | 安全、稳定性与负载测试 | 管理 API 资源保护首批开发，待 CI |
 | V0.6–V1.0 | 跨平台、扩展、商业化、多节点及发行 | 待开发 |
 
 首个里程碑：Windows agent + Linux relay + 自定义域名，真实公网端到端访问本地 HTTP 服务。验收标准见开发文档。

@@ -7,6 +7,7 @@ mod preview;
 mod runtime;
 mod traffic;
 mod audit;
+mod protection;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -154,7 +155,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .merge(runtime::routes(pool.clone()))
         .merge(traffic::routes(pool.clone()))
         .merge(audit::routes(pool.clone()))
-        .merge(domains::routes(pool).map_err(|_|"invalid DNS resolver configuration")?);
+        .merge(domains::routes(pool).map_err(|_|"invalid DNS resolver configuration")?)
+        .layer(axum::middleware::from_fn_with_state(protection::Limits::new(), protection::protect));
     // No configurable public bind or unauthenticated data API in this increment.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("LISTENING {}", listener.local_addr()?);
