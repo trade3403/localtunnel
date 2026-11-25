@@ -318,9 +318,50 @@ try {
   const observed=await manage('devices/'+device.id+'/status','GET',admin)
   const heartbeat=await observed.json()
   if(observed.status!==200||!heartbeat.management_online||!heartbeat.configuration_current||heartbeat.reported_state!=='idle')throw Error('real desktop heartbeat missing')
+  // Create real desired metadata after the manual heartbeat; do not click
+  // sync. Native periodic sync must fetch the new revision while hidden.
+  const nodeId=execFileSync(control,['--add-node',data,'Windows preview relay'],{encoding:'utf8',timeout:20000,windowsHide:true}).trim()
+  const created=await manage('mappings','POST',admin,{device_id:device.id,node_id:nodeId,protocol:'tcp',local_port:localPort,bind_port:24001})
+  if(created.status!==201)throw Error('management draft creation failed')
+  const managedMapping=await created.json()
+  const managementHwnd=await until('management native HWND',windowHandle)
+  windowAction(managementHwnd,'close')
+  await until('management window hidden',()=>windowAction(managementHwnd,'visible')==='False')
+  const updated=await until('native automatic heartbeat while hidden',async()=>{
+    const r=await manage('devices/'+device.id+'/status','GET',admin)
+    if(r.status!==200)return false
+    const s=await r.json()
+    return s.management_online&&s.configuration_current&&s.reported_revision>heartbeat.reported_revision&&s.last_seen_at>heartbeat.last_seen_at&&s.reported_state==='idle'?s:null
+  },65000)
+  report.native_management_auto_heartbeat_hidden=true
+  trayMenu('show')
+  await until('management tray restored',()=>windowAction(managementHwnd,'visible')==='True')
+  await waitText('管理配置版本：'+updated.reported_revision)
+  await waitText('TCP · 本地 '+managedMapping.local_port+' → 中转 '+managedMapping.bind_port+' · 草稿禁用')
+  // Real native process restart; DPAPI saved enrollment must be restored
+  // and heartbeat sent without another enrollment or manual sync.
+  trayMenu('quit')
+  await until('management app exited',()=>app.exitCode===0,20000)
+  if(socket)socket.close()
+  pending.clear()
+  app=launch(exe,[],{...process.env,WEBVIEW2_USER_DATA_FOLDER:join(work,'webview')})
+  await connectCdp(debugPort)
+  await waitText('已配对 ID：'+device.id)
+  await until('automatic heartbeat after app restart',async()=>{
+    const r=await manage('devices/'+device.id+'/status','GET',admin)
+    if(r.status!==200)return false
+    const s=await r.json()
+    return s.configuration_current&&s.last_seen_at>updated.last_seen_at
+  },65000)
+  report.native_management_saved_credential_restart=true
   if((await manage('devices/'+device.id+'/revoke','POST',admin)).status!==204)throw Error('management revoke failed')
-  await click('同步管理状态')
+  await until('automatic revocation recognized',()=>has('认证拒绝，自动同步已停止'),65000)
   await waitText('管理凭据无效或已吊销')
+  const revoked=await manage('devices/'+device.id+'/status','GET',admin)
+  const revokedState=await revoked.json()
+  if(revoked.status!==200||revokedState.enabled||revokedState.management_online||revokedState.last_seen_at!==null)throw Error('revoked device still reports online')
+  if(!await evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="同步管理状态"&&b.disabled)'))throw Error('revoked sync still enabled')
+  report.native_management_revocation_stops_automatic_sync=true
   if(await has('配置元数据及管理心跳同步成功'))throw Error('stale management status survived revoke')
   await evaluate('document.querySelector("input[aria-label=\\\"确认移除管理凭据\\\"]").click()')
   await click('移除管理凭据')
