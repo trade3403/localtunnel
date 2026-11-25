@@ -256,3 +256,7 @@
 ## 2026-11-25：管理后台第二批验收、浏览器与真实隧道联动增量
 - HEAD 61e6a8c9fe0e4e2939c26adfdc68d68a3a6cde43 六个CI全绿：Management #35 https://github.com/trade3403/localtunnel/actions/runs/45630809953 、#36 https://github.com/trade3403/localtunnel/actions/runs/45630819862 、Windows #117、Gateway #111、Runner #230/#231。#36 job 139263202250 实际 Chromium 游标分页、映射修改及删除、域名引用保护与全部旧回归、双锁门禁成功，报告 https://github.com/trade3403/localtunnel/actions/runs/45630819862/artifacts/15030651745 。
 - 新增实际浏览器 UI DNS挑战/验证、映射创建、启动请求与真实本地 worker、Noise/Nginx 正文、运行状态刷新、停止请求/退出/网关421/relay不可达；复用固定上游引擎下载及真实TCP DNS夹具，不伪造API、DNS验证或业务。HTTPS专项追加实际 API/worker start/stop、可信TLS正文/状态及拒绝握手。无新依赖、无产品业务代码修改。新验收待CI；仍仅单机回环、需本地操作员预配执行器，生产常驻、流量审计、Windows联合、公网未完成。下一步常驻执行器及安全恢复。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-25：浏览器真实隧道验收、常驻前台执行器增量
+- HEAD 73bc7fb3c4dacbba2b5524aecc6fae7fa3c5b771 六个CI全绿：Management #37 https://github.com/trade3403/localtunnel/actions/runs/45632626458 、#38 https://github.com/trade3403/localtunnel/actions/runs/45632637702 、Windows #118、Gateway #112、Runner #232/#233。#38 job 139269631231 实际浏览器请求启停/Noise/Nginx正文、HTTPS worker专项与全部旧回归及双锁门禁成功，报告 https://github.com/trade3403/localtunnel/actions/runs/45632637702/artifacts/15031652472 。
+- 新增固定映射版本 HTTP/HTTPS 常驻前台 worker，重复领取独立授权请求、独立私有bundle和随机token、成功后清理本轮bundle、共享worker锁、本地停止标记、空闲授权检查及未知状态拒绝重试。真实HTTP E2E 两轮API启停、竞争锁、活动期停止标记及实际子进程异常退出/清理/失败记录/重启拒绝；TLS常驻专项尚待。未做systemd/强杀主进程孤儿收割、未知状态自动恢复、生产多节点、公网；无新增依赖，新功能待CI。下一步安全异常恢复及流量/审计。未改main、未部署公网、未开启定时任务。

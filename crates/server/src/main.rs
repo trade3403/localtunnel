@@ -67,11 +67,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let supervise_tls = args.first().is_some_and(|a| a=="--supervise-tls-preview");
     let worker = args.first().is_some_and(|a| a=="--runtime-worker");
     let tls_worker = args.first().is_some_and(|a| a=="--runtime-tls-worker");
-    let expected = if supervise_tls || tls_worker {11} else if worker {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
+    let resident = args.first().is_some_and(|a| a=="--runtime-resident");
+    let tls_resident = args.first().is_some_and(|a| a=="--runtime-tls-resident");
+    let expected = if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker (same arguments as corresponding supervise command)".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters)".into());
     }
-    let operator = init || add_node || set_node || export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker;
+    let operator = init || add_node || set_node || export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
@@ -99,12 +101,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
         nodes::set_enabled(&pool,args[2].to_str().ok_or("invalid node id")?,enabled).await.map_err(|_|"node state change refused")?;
         return Ok(());
     }
-    if export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker {
+    if export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident {
         let arg=|i:usize|args[i].to_str().ok_or("invalid preview argument");
         if tls_gateway {
             preview::tls_gateway(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?,arg(5)?.parse()?,arg(6)?.parse()?,arg(7)?,arg(8)?,if args.len()==10{Some(arg(9)?)}else{None}).await?;
-        } else if supervise || supervise_tls || worker || tls_worker {
-            let transport=if supervise_tls || tls_worker{
+        } else if supervise || supervise_tls || worker || tls_worker || resident || tls_resident {
+            let transport=if supervise_tls || tls_worker || tls_resident{
                 preview::PreviewTransport::Https{probe:arg(9)?.parse()?,cert_dir:arg(10)?}
             }else{preview::PreviewTransport::Http};
             let id=arg(2)?;
@@ -114,10 +116,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let prefix=arg(6)?;
             let listen=arg(7)?.parse()?;
             let expected_file=arg(8)?;
-            if worker || tls_worker{
+            if resident || tls_resident{
+                preview::resident(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await?;
+            }else if worker || tls_worker{
                 preview::worker(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await?;
             }else{
-                preview::supervise(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport,None).await?;
+                preview::supervise(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport,None,None).await?;
             }
         } else if export {
             preview::export(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?).await?;

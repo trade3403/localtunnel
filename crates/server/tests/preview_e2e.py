@@ -374,8 +374,79 @@ try:
                 final=expect(call(base,runtime_path+"/runtime",token=admin),200)
                 assert final["request"]["state"]=="stopped" and not final["worker_recent"]
                 assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
-                expect(call(base,runtime_path+"?expected_revision=1","DELETE",admin),204)
                 report["api_start_stop_scoped_request_real_worker"]=True
+                # Resident owns a single fixed mapping, but accepts multiple
+                # independently authorized requests without operator relaunch.
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"resident_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                def wait_state(phase,timeout=40):
+                    end=time.monotonic()+timeout
+                    while time.monotonic()<end:
+                        value=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                        if value and value["state"]==phase:
+                            return value
+                        time.sleep(.2)
+                    raise AssertionError("resident state did not converge: "+phase)
+                lock=root/"worker-gateway.lock"
+                end=time.monotonic()+10
+                while not lock.exists() and time.monotonic()<end:
+                    assert supervisor.poll() is None
+                    time.sleep(.1)
+                assert lock.exists()
+                assert operator("--runtime-resident",mid3,1,rp,"competing_resident","gateway",gp,"expected_body").returncode!=0
+                for i in range(2):
+                    queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                    rid=queued["request_id"]
+                    await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                    assert wait_state("running")["request_id"]==rid
+                    assert (root/("resident_bundle-"+rid)/"server.toml").is_file()
+                    expect(call(base,runtime_path+"/stop","POST",admin,{"request_id":rid}),202)
+                    assert wait_state("stopped")["request_id"]==rid
+                    assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                    assert not (root/("resident_bundle-"+rid)).exists()
+                    assert supervisor.poll() is None
+                report["resident_multiple_real_start_stop_cycles"]=True
+                # A local stop marker also requests orderly shutdown during a
+                # live run. It is never set via HTTP.
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                wait_state("running")
+                marker=root/"worker-gateway.stop"
+                marker.touch(mode=0o600)
+                assert supervisor.wait(timeout=40)==0
+                wait_state("stopped")
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                assert not lock.exists()
+                marker.unlink()
+                report["resident_local_stop_marker_cleans_real_tunnel"]=True
+                # Deliberately stop only one of the test-owned direct engine
+                # children. Verify its executable and per-request config,
+                # then confirm the supervisor stops its other owned child.
+                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"fault_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                rid=queued["request_id"]
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                wait_state("running")
+                import signal
+                children=[]
+                for task in (Path("/proc")/str(supervisor.pid)/"task").iterdir():
+                    for child in (task/"children").read_text().split():
+                        try:
+                            path=Path("/proc")/child
+                            if (path/"exe").resolve()==engine.resolve() and str(root/("fault_bundle-"+rid)).encode() in (path/"cmdline").read_bytes():
+                                children.append(int(child))
+                        except FileNotFoundError:
+                            pass
+                assert len(set(children))==2,"expected two owned engine children"
+                os.kill(children[0],signal.SIGKILL)
+                assert supervisor.wait(timeout=40)!=0
+                wait_state("failed_or_unknown")
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                assert (root/("fault_bundle-"+rid)).is_dir(),"retain failed run evidence"
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),409)
+                expect(call(base,runtime_path+"?expected_revision=1","DELETE",admin),409)
+                assert operator("--runtime-resident",mid3,1,rp,"retry_unknown","gateway",gp,"expected_body").returncode!=0
+                report["resident_child_exit_cleanup_blocks_unknown_restart"]=True
             finally:
                 # Test failure cleanup: revoke before waiting so that the
                 # supervisor gets the opportunity to stop its own children.

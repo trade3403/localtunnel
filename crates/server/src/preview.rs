@@ -166,6 +166,24 @@ impl TunnelChildren {
 impl Drop for TunnelChildren {fn drop(&mut self){let _=self.stop();}}
 struct PreviewLock(PathBuf);
 impl Drop for PreviewLock {fn drop(&mut self){let _=fs::remove_file(&self.0);}}
+fn acquire_worker_lock(root:&Path,prefix:&str)->Result<PreviewLock>{
+    if !safe_name(prefix){return Err("invalid worker prefix")}
+    let path=root.join(format!("worker-{prefix}.lock"));
+    let mut opts=fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
+    opts.open(&path).map_err(|_|"worker lock exists or unavailable")?;
+    Ok(PreviewLock(path))
+}
+fn stop_requested(path:Option<&Path>)->Result<bool>{
+    let Some(path)=path else{return Ok(false)};
+    // Any existing entry, including a symlink, is a fail-closed stop signal.
+    match fs::symlink_metadata(path){
+        Ok(_)=>Ok(true),
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(false),
+        Err(_)=>Err("cannot inspect local stop marker"),
+    }
+}
 
 fn read_expected(root:&Path,name:&str)->Result<Vec<u8>>{
     use std::io::Read;
@@ -211,7 +229,7 @@ impl PreviewTransport<'_>{
 
 /// Opt-in Linux foreground preview. The trusted operator must already have
 /// started an exclusive managed gateway of the selected transport.
-pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>,request:Option<&str>)->Result<()>{
+pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>,request:Option<&str>,stop_marker:Option<&Path>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(bundle)||!safe_name(prefix)||bundle==prefix{return Err("invalid supervisor request")}
     let m=checked_protocol(pool,id,revision,transport.protocol()).await?;
     if relay_port==listen||i64::from(listen)==m.bind_port{return Err("conflicting preview port")}
@@ -243,6 +261,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     export(pool,root,id,revision,relay_port,bundle).await?;
     let mut children=TunnelChildren(Vec::new());
     let result=async {
+        if stop_requested(stop_marker)?{return Ok(())}
         if let Some(rid)=request{
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
@@ -250,6 +269,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
         children.start(&engine,&root.join(bundle).join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
         loop{
+            if stop_requested(stop_marker)?{return Ok(())}
             if let Some(rid)=request{
                 if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
             }
@@ -259,6 +279,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
             if Instant::now()>=deadline{return Err("relay business probe timeout")}
             std::thread::sleep(Duration::from_millis(200));
         }
+        if stop_requested(stop_marker)?{return Ok(())}
         if let Some(rid)=request{
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
@@ -266,6 +287,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
         // Authorization is re-read after apply and every 500ms. Database
         // errors also fail closed. DNS age is checked, not continuous DNS.
         loop{
+            if stop_requested(stop_marker)?{return Ok(())}
             if checked_protocol(pool,id,revision,transport.protocol()).await.is_err(){return Ok(())}
             if !children.healthy(){return Err("tunnel child exited")}
             if let Some(rid)=request{
@@ -279,6 +301,11 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     let cleared=transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await;
     stopped?;
     cleared?;
+    // Only resident-owned, freshly created bundle is removed after a known
+    // clean result. Failed/unknown runs retain evidence for the operator.
+    if stop_marker.is_some()&&result.is_ok(){
+        fs::remove_dir_all(root.join(bundle)).map_err(|_|"private bundle cleanup failed")?;
+    }
     result
 }
 
@@ -327,13 +354,43 @@ pub async fn tls_gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&
 /// No automatic retry of unknown outcomes or remote execution parameters.
 pub async fn worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>)->Result<()>{
     checked_protocol(pool,id,revision,transport.protocol()).await?;
+    let _worker_lock=acquire_worker_lock(root,prefix)?;
     let deadline=Instant::now()+Duration::from_secs(60);
     let rid=loop{
         if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{break rid}
         if Instant::now()>=deadline{return Err("no fresh start request")}
         std::thread::sleep(Duration::from_millis(250));
     };
-    let result=supervise(pool,root,id,revision,relay_port,bundle,prefix,listen,expected_file,transport,Some(&rid)).await;
+    let result=supervise(pool,root,id,revision,relay_port,bundle,prefix,listen,expected_file,transport,Some(&rid),None).await;
     crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
     result
+}
+
+/// Resident foreground worker for exactly one operator-fixed mapping/revision.
+/// Never reclaims a previously claimed or unknown request. New start requests
+/// have independent random credentials and an independent private bundle.
+pub async fn resident(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle_base:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle_base)||bundle_base.len()>30||!safe_name(prefix){
+        return Err("invalid resident worker parameters")
+    }
+    checked_protocol(pool,id,revision,transport.protocol()).await?;
+    let _worker_lock=acquire_worker_lock(root,prefix)?;
+    let marker=root.join(format!("worker-{prefix}.stop"));
+    loop{
+        if stop_requested(Some(&marker))?{return Ok(())}
+        // Idle authorization checks do not require fresh DNS; each start
+        // still has a fresh proof gate. A revision change needs re-provisioning.
+        let state=crate::runtime::resident_state(pool,id,revision,transport.protocol()).await?;
+        match state.as_deref(){
+            None|Some("stopped")|Some("queued")=>{},
+            _=>return Err("claimed or unknown request requires local recovery"),
+        }
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{
+            let bundle=format!("{bundle_base}-{rid}");
+            let result=supervise(pool,root,id,revision,relay_port,&bundle,prefix,listen,expected_file,transport,Some(&rid),Some(&marker)).await;
+            crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+            result?;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }

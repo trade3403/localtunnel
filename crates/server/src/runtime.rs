@@ -80,3 +80,11 @@ pub async fn finish(pool:&SqlitePool,id:&str,rid:&str,success:bool)->Result<(),&
     if n!=1{return Err("runtime outcome unknown")}
     Ok(())
 }
+
+/// A resident worker must never silently adopt a changed mapping or a
+/// previously claimed request. DNS freshness is checked at every actual start.
+pub async fn resident_state(pool:&SqlitePool,id:&str,revision:i64,protocol:&str)->Result<Option<String>,&'static str>{
+    let row=sqlx::query_as::<_,(Option<String>,)>("SELECT r.state FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id LEFT JOIN runtime_requests r ON r.mapping_id=m.id WHERE m.id=? AND m.revision=? AND m.protocol=? AND m.enabled=0 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1")
+        .bind(id).bind(revision).bind(protocol).fetch_optional(pool).await.map_err(|_|"resident state unavailable")?.ok_or("resident mapping no longer eligible")?;
+    Ok(row.0)
+}
