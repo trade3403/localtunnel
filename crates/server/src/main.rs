@@ -3,6 +3,7 @@ mod devices;
 mod mappings;
 mod nodes;
 mod domains;
+mod preview;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -58,13 +59,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let init = args.first().is_some_and(|a| a=="--init-admin");
     let add_node = args.first().is_some_and(|a| a=="--add-node");
     let set_node = args.first().is_some_and(|a| a=="--set-node-enabled");
-    let expected = if add_node {3} else if set_node {4} else {2};
+    let export = args.first().is_some_and(|a| a=="--export-preview");
+    let gateway = args.first().is_some_and(|a| a=="--preview-gateway");
+    let expected = if export {6} else if gateway {7} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false>".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply>".into());
     }
-    let operator = init || add_node || set_node;
+    let operator = init || add_node || set_node || export || gateway;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
+    let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_secs(3))
@@ -87,6 +91,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if set_node {
         let enabled=args[3].to_str().ok_or("invalid node state")?.parse::<bool>()?;
         nodes::set_enabled(&pool,args[2].to_str().ok_or("invalid node id")?,enabled).await.map_err(|_|"node state change refused")?;
+        return Ok(());
+    }
+    if export || gateway {
+        let arg=|i:usize|args[i].to_str().ok_or("invalid preview argument");
+        if export {
+            preview::export(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?).await?;
+        } else {
+            preview::gateway(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?,arg(5)?.parse()?,arg(6)?).await?;
+        }
         return Ok(());
     }
     let auth = auth::AuthState::new(pool.clone()).map_err(|_| "authentication initialization failed")?;
