@@ -95,7 +95,7 @@ onBeforeUnmount(clearPair)
       <form @submit.prevent="login">
         <label for="username">管理员账号</label><a-input id="username" v-model:value="username" autocomplete="username" required/>
         <label for="password">密码</label><a-input-password id="password" v-model:value="password" autocomplete="current-password" required/>
-        <a-button type="primary" html-type="submit" block :loading="busy">登录</a-button>
+        <a-button type="primary" html-type="submit" aria-label="登录" block :loading="busy">登录</a-button>
       </form>
       <p class="muted small">无默认账号。由本地操作员初始化管理员。刷新页面后需要重新登录。</p>
     </a-card>
@@ -144,10 +144,10 @@ onBeforeUnmount(clearPair)
         </template>
         <template v-if="page==='mappings'">
           <a-card title="新建映射草稿"><form class="mapping-form" @submit.prevent="addMapping">
-            <label>设备<a-select v-model:value="create.device_id" aria-label="设备" :options="devices.filter(d=>d.enabled).map(d=>({value:d.id,label:d.name}))"/></label>
-            <label>节点<a-select v-model:value="create.node_id" aria-label="节点" :options="nodes.filter(n=>n.enabled).map(n=>({value:n.id,label:n.name}))"/></label>
+            <label>设备<a-select data-testid="mapping-device" v-model:value="create.device_id" aria-label="设备" :options="devices.filter(d=>d.enabled).map(d=>({value:d.id,label:d.name}))"/></label>
+            <label>节点<a-select data-testid="mapping-node" v-model:value="create.node_id" aria-label="节点" :options="nodes.filter(n=>n.enabled).map(n=>({value:n.id,label:n.name}))"/></label>
             <label>协议<a-select v-model:value="create.protocol" aria-label="协议" :options="['http','https','tcp'].map(v=>({value:v,label:v.toUpperCase()}))"/></label>
-            <label v-if="create.protocol!=='tcp'">域名<a-select v-model:value="create.domain_id" aria-label="映射域名" :options="domains.map(d=>({value:d.id,label:d.hostname}))"/></label>
+            <label v-if="create.protocol!=='tcp'">域名<a-select data-testid="mapping-domain" v-model:value="create.domain_id" aria-label="映射域名" :options="domains.map(d=>({value:d.id,label:d.hostname}))"/></label>
             <label>本地端口<a-input-number v-model:value="create.local_port" :min="1" :max="65535"/></label>
             <label>中转端口<a-input-number v-model:value="create.bind_port" :min="20000" :max="29999"/></label>
             <a-button type="primary" html-type="submit" :loading="busy" :disabled="!create.device_id||!create.node_id||(create.protocol!=='tcp'&&!create.domain_id)">创建草稿</a-button>

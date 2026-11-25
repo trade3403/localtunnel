@@ -244,3 +244,7 @@
 ## 2026-11-25：Web 管理后台 CI 环境修复及真实依赖锁固化
 - HEAD 05e4ee4967d8a62d5463646f58bdbcbcad2d3542：Management #29 https://github.com/trade3403/localtunnel/actions/runs/45625768748 、#30 https://github.com/trade3403/localtunnel/actions/runs/45625780978 失败；Windows #114、Gateway #108、Runner #224/#225 均已通过，确认无在途CI后修复。两管理 job 139245418516/139245457671 实际 Rust构建及全部既有HTTP/HTTPS生命周期成功，npm ci/cmp及Vue生产构建成功；Chromium安装失败原文 ERROR: Playwright does not support chromium on ubuntu26.04-x64，真实浏览器用例未执行。
 - 管理 CI 固定 ubuntu-24.04 免费托管 runner，保留原 Playwright 1.56.1 与所有实际浏览器/旧回归门禁。从上述两次实际日志取完整 BEGIN_ADMIN_PACKAGE_LOCK 至 END_ADMIN_PACKAGE_LOCK 内容，逐字一致（56950字符、1704行含尾部空行、118个packages条目含根），提交 apps/admin/package-lock.json（含真实registry integrity）；删除临时生成步骤，恢复 npm ci 及锁文件差异检查。无新依赖、未改业务功能，不宣称浏览器已通过。修复待新CI；全绿后继续后台编辑、删除、分页及实际启停。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-25：Chromium 环境修复成功、浏览器按钮定位修复
+- HEAD 7a42c9597ec051fee61732874c9e50ed6a84cd1f 管理 #31 https://github.com/trade3403/localtunnel/actions/runs/45627326098 、#32 https://github.com/trade3403/localtunnel/actions/runs/45627336659 失败；Windows #115、Gateway #109、Runner #226/#227 成功，均已结束。实际 job 139250881722/139250924736 的旧回归、锁安装、Vue 构建和 Chromium 安装均成功；浏览器首次点击 getByRole('button',{name:'登录',exact:true}) 在 browser.mjs:46 等待30秒超时。推断 Ant Design Vue 双字自动间隔导致可访问名称变化，未取得旧DOM直接证明。
+- 增加登录按钮明确 aria-label，保留真实点击/认证断言；对下拉控件使用稳定组件标识及实际可见弹层，对状态文本等待明确元素，登录后等待刷新结束；失败阶段诊断不输出DOM/凭据。无依赖变化、没有跳过测试或改业务认证。新CI待验收；未进入后台功能增量，未改main、未部署公网、未开启定时任务。
