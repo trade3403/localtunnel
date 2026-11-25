@@ -111,3 +111,8 @@
 ## 2026-11-25：桌面 TCP 监测验收、SCM 实时只读状态
 - HEAD 7422c15662fd3232bf34b9d60fe096773d3a17e2，CI #69 https://github.com/trade3403/localtunnel/actions/runs/45546429554 全部通过，Windows 原生 TCP 表、真实引擎 TCP、SCM 恢复、安装卸载及锁定构建通过；核心 #78、Runner #164 通过。预览包 https://github.com/trade3403/localtunnel/actions/runs/45546429554/artifacts/14992440025 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45546429554/artifacts/14992011167 。
 - 新增只读 SCM QueryServiceStatusEx 状态快照（校验预览服务名称、完整固定 ImagePath、LocalService/own-process、QUERY_CONFIG/QUERY_STATUS 最小权限），返回宿主状态、启动模式、有效宿主 PID、退出码；普通安装 EXE 可通过 --service-status <name> JSON 查询，不读密文或更改服务。GUI 增加手动指定服务并1.2秒轮询，停止监测、错误清空、代际检查避免旧查询覆盖新目标。CI 从非部署 EXE 真实读取注册后停止/自启/运行 PID/宿主恢复新 PID/停止/删除后的不可用状态，拒绝不相关服务。新增代码待 CI，不代表认证/公网在线，不含服务引擎 TCP 计数或流量字节统计，权限不足会明确报错；GUI 服务注册/修改仍待开发。未修改 main。下一步准确流量计量与服务管理界面。
+
+
+## 2026-11-25：SCM 状态验收、桌面实际流量计量
+- HEAD ba23fab81e8a09d722050a9611abaf0dd70b1ce7，CI #71 https://github.com/trade3403/localtunnel/actions/runs/45549752861 全部通过，真实 SCM 只读状态/恢复 PID/停止/删除与安装卸载通过；核心 #79、Runner #166 通过。预览包 https://github.com/trade3403/localtunnel/actions/runs/45549752861/artifacts/14992819841 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45549752861/artifacts/14994130021 。
+- 新增桌面模式专用 IPv4 loopback 计量转发层，固定每映射目标，临时端口不与目标或中转端口相同；单线程 Tokio runtime、全局128并发上限、3秒本地连接超时、双向流式转发与半关闭、停止时取消所有任务；统计成功写入应用字节（含 HTTP 头，不含加密与 TCP 开销），按实际单调时间差计算速度，界面1.2秒刷新；未测/停止显示空而非虚构0。仅本次桌面会话，停止后不可见，不持久化，不计费；本机其他进程可直接访问回环计量端口，因此非认证流量证明，不能用于安全/结算。SCM 仍直接转发，不受该计量层影响。新增真实32768/65536字节/半关闭/停止单测及实际 Rathole 转发计量断言；使用已有锁定 Tokio 1.54.1，更新根依赖锁定项，全部新代码待 CI；性能及高并发未测。下一步服务计量/管理 UI，未改 main。

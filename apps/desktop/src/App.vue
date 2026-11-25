@@ -59,6 +59,15 @@ function unwatchService() {
   serviceSnapshot.value = null
   serviceError.value = ''
 }
+type Traffic = { state: 'inactive' | 'unknown' | 'measured'; uploadBytes: number | null; downloadBytes: number | null; uploadBytesPerSecond: number | null; downloadBytesPerSecond: number | null }
+const traffic = ref<Traffic | null>(null)
+function formatBytes(value: number | null | undefined, rate = false) {
+  if (value == null || !Number.isFinite(value) || value < 0) return '—'
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let i = 0
+  while (value >= 1024 && i < units.length - 1) { value /= 1024; i++ }
+  return value.toFixed(i === 0 ? 0 : 2) + ' ' + units[i] + (rate ? '/s' : '')
+}
 const engine = ref('')
 const remote = ref('')
 const serverKey = ref('')
@@ -81,6 +90,7 @@ async function refresh() {
   try {
     status.value = await invoke<Status>('tunnel_status')
     ready.value = true
+    try { traffic.value = await invoke<Traffic>('traffic_status') } catch { traffic.value = null }
     try {
       transport.value = await invoke<Transport>('transport_status')
     } catch {
@@ -88,6 +98,7 @@ async function refresh() {
     }
   } catch {
     ready.value = false
+    traffic.value = null
     error.value = '无法读取本地 Rust 服务状态。请使用桌面应用打开。'
   } finally { polling = false }
 }
@@ -215,6 +226,15 @@ async function toggle() {
         <div><small>已启动映射</small><strong>{{ ready ? status.mappingCount : '—' }}</strong><span>进程状态，非公网在线数</span></div>
         <div><small>中转 TCP 连接</small><strong class="protocol">{{ transportLabel }}</strong><span>{{ transportHint }}</span></div>
       </div>
+      <section>
+        <div class="section-title"><h2>桌面隧道流量</h2><span>{{ traffic?.state === 'measured' ? '实际 TCP 数据' : '未计量 / 未启动' }}</span></div>
+        <div class="summary">
+          <div><small>上传速度</small><strong class="protocol">{{ formatBytes(traffic?.uploadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.uploadBytes) }}</span></div>
+          <div><small>下载速度</small><strong class="protocol">{{ formatBytes(traffic?.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.downloadBytes) }}</span></div>
+          <div><small>计量范围</small><strong class="protocol">本次会话</strong><span>不含加密/TCP 开销</span></div>
+        </div>
+        <p class="hint">仅统计桌面模式转发到本地应用和中转引擎的成功写入字节，每次启动重新计数；后台服务未接入。不能用于计费。</p>
+      </section>
       <section>
         <div class="section-title"><h2>Windows 后台服务</h2><span>只读 SCM 状态</span></div>
         <div class="fields">

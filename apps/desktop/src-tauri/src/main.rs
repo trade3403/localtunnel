@@ -4,6 +4,7 @@ mod profile;
 mod credentials;
 mod engine_integrity;
 mod transport;
+mod traffic;
 #[cfg(windows)]
 mod engine_job;
 #[cfg(windows)]
@@ -51,6 +52,7 @@ struct Running {
     _directory: TempDir,
     count: usize,
     relay_target: Option<transport::Target>,
+    meter: Option<traffic::Meter>,
 }
 
 impl Running {
@@ -71,6 +73,7 @@ impl Running {
             _directory: directory,
             count,
             relay_target: None,
+            meter: None,
         })
     }
 }
@@ -117,8 +120,8 @@ impl Supervisor {
         if !engine.extension().is_some_and(|s| s.eq_ignore_ascii_case("exe")) {
             return Err("Windows 引擎必须为 EXE 文件".into());
         }
-        let config = build_config(&request)?;
-        let relay_target = transport::Target::new(&request.remote, request.mappings.iter().map(|m| m.local_port).collect())?;
+        // Validate original configuration before allocating any listeners.
+        let original_config = build_config(&request)?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("localtunnel-client-");
         let directory = match runtime_root {
@@ -126,6 +129,19 @@ impl Supervisor {
             None => builder.tempdir(),
         }.map_err(|_| "无法创建临时配置目录")?;
         let staged_engine = engine_integrity::stage(engine, directory.path())?;
+        // Desktop session metering only. SCM keeps its existing direct path.
+        let meter = if runtime_root.is_none() {
+            let relay_port = request.remote.rsplit_once(':').and_then(|(_,p)| p.parse::<u16>().ok())
+                .ok_or("invalid relay port")?;
+            Some(traffic::Meter::start(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port)?)
+        } else { None };
+        let (config, target_ports) = if let Some(meter) = &meter {
+            let mappings = request.mappings.iter().zip(meter.ports()).map(|(m, &port)| ClientMapping {
+                name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
+            }).collect::<Vec<_>>();
+            (client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)?, meter.ports().to_vec())
+        } else { (original_config, request.mappings.iter().map(|m| m.local_port).collect()) };
+        let relay_target = transport::Target::new(&request.remote, target_ports)?;
         let config_path = directory.path().join("client.toml");
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -148,6 +164,7 @@ impl Supervisor {
         }
         let mut running = Running::spawn(&mut command, directory, request.mappings.len())?;
         running.relay_target = Some(relay_target);
+        running.meter = meter;
         self.running = Some(running);
         self.last_error = None;
         self.status()
@@ -160,6 +177,12 @@ impl Supervisor {
         let running = self.running.as_ref().ok_or("engine unavailable")?;
         let Some(target) = &running.relay_target else { return Ok(transport::Observation::unknown()); };
         Ok(transport::observe(running.child.id(), target))
+    }
+
+    fn traffic_status(&mut self) -> Result<traffic::Snapshot, String> {
+        if self.status()?.state != "running" { return Ok(traffic::Snapshot::inactive()); }
+        Ok(self.running.as_mut().and_then(|r| r.meter.as_mut())
+            .map(|m| m.snapshot()).unwrap_or_else(traffic::Snapshot::inactive))
     }
 
     fn stop(&mut self) -> Result<Status, String> {
@@ -230,6 +253,11 @@ async fn transport_status(app: tauri::AppHandle) -> Result<transport::Observatio
         let result = supervisor.lock().map_err(|_| "进程状态不可用")?.transport_status();
         result
     }).await.map_err(|_| "TCP 状态读取失败")?
+}
+
+#[tauri::command]
+fn traffic_status(supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<traffic::Snapshot, String> {
+    supervisor.lock().map_err(|_| "进程状态不可用")?.traffic_status()
 }
 
 #[cfg(windows)]
@@ -324,7 +352,7 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, service_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, service_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
@@ -499,6 +527,10 @@ mod tests {
         }
         assert!(forwarded, "desktop supervisor failed to forward real bytes");
         fixture.join().unwrap();
+        let measured = supervisor.traffic_status().unwrap();
+        assert_eq!(measured.state, "measured");
+        assert!(measured.download_bytes.unwrap() >= 4);
+        assert!(measured.upload_bytes.unwrap() >= 4);
         #[cfg(windows)]
         {
             let observed = supervisor.transport_status().unwrap();
@@ -513,6 +545,7 @@ mod tests {
         assert!(!client_dir.exists(), "temporary directory survived stop");
         assert!(supervisor.running.is_none());
         assert_eq!(supervisor.transport_status().unwrap().state, "inactive");
+        assert_eq!(supervisor.traffic_status().unwrap().state, "inactive");
     }
 
     #[test]
