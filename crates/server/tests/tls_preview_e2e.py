@@ -378,6 +378,162 @@ try:
                 assert request(bp,hostname) is None
                 assert request(probe,"localtunnel-probe.invalid")[0]==421
                 report["real_https_runtime_api_start_stop"]=True
+                # Exercise the shared recovery mechanism with actual HTTPS,
+                # a verified certificate and two owned encrypted tunnel children.
+                import signal
+                def resident(bundle):
+                    return subprocess.Popen([exe,"--runtime-tls-resident",str(root),mid3,"1",str(rp),bundle,"tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                def state():
+                    return expect(call(base,path+"/runtime",token=admin),200)["request"]
+                def wait_state(phase,rid):
+                    end=time.monotonic()+40
+                    while time.monotonic()<end:
+                        current=state()
+                        if current and current["state"]==phase and current["request_id"]==rid:
+                            return current
+                        time.sleep(.2)
+                    raise AssertionError("TLS resident state did not converge: "+phase)
+                lock=root/"worker-tls_gateway.lock"
+                sup_lock=root/"supervisor-tls_gateway.lock"
+                def ready():
+                    end=time.monotonic()+10
+                    while time.monotonic()<end:
+                        assert supervisor.poll() is None,"TLS resident exited before readiness"
+                        if lock.exists():
+                            return
+                        time.sleep(.1)
+                    raise AssertionError("TLS resident lock missing")
+                def start_run():
+                    rid=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)["request_id"]
+                    end=time.monotonic()+45
+                    while time.monotonic()<end:
+                        assert supervisor.poll() is None,"TLS resident exited during start"
+                        current=state()
+                        try:
+                            if current["request_id"]==rid and current["state"]=="running" and tls_request(gp,hostname,ca2)==(200,body):
+                                return rid
+                        except (OSError,http.client.HTTPException):
+                            pass
+                        time.sleep(.25)
+                    raise AssertionError("TLS resident traffic did not converge")
+                def closed_port(port):
+                    with socket.socket() as sock:
+                        sock.settimeout(.5)
+                        return sock.connect_ex(("127.0.0.1",port))==__import__("errno").ECONNREFUSED
+                def closed_tunnel():
+                    end=time.monotonic()+15
+                    while time.monotonic()<end:
+                        if closed_port(rp) and closed_port(bp):
+                            return
+                        time.sleep(.2)
+                    raise AssertionError("TLS relay or mapping listener remained reachable")
+                def empty_gateway():
+                    rejects(gp,hostname,ca2)
+                    assert request(probe,"localtunnel-probe.invalid")[0]==421
+                    assert all(proc.poll() is None for proc in processes),"dedicated Nginx exited"
+                def recovery_record(rid):
+                    record=root/("recovery-tls_gateway-"+rid+".json")
+                    assert record.stat().st_mode&0o077==0
+                    saved=json.loads(record.read_text())
+                    assert saved=={"mapping_id":mid3,"revision":1,"request_id":rid,"prefix":"tls_gateway","relay":rp,"bind":bp,"listen":gp,"probe":probe,"cert_dir":"cert_v2"}
+                    return record
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=resident("tls_resident")
+                ready()
+                assert operator("--runtime-tls-resident",mid3,1,rp,"competing_resident","tls_gateway",gp,"expected_body",probe,"cert_v2").returncode!=0
+                for _ in range(2):
+                    rid=start_run()
+                    recovery_record(rid)
+                    assert (root/("tls_resident-"+rid)/"client.toml").is_file()
+                    expect(call(base,path+"/stop","POST",admin,{"request_id":rid}),202)
+                    wait_state("stopped",rid)
+                    closed_tunnel()
+                    empty_gateway()
+                    assert not (root/("tls_resident-"+rid)).exists()
+                    assert supervisor.poll() is None
+                report["real_https_resident_multiple_start_stop"]=True
+                # Fail one direct engine child only after identifying the exact
+                # test executable and private per-request configuration.
+                rid=start_run()
+                recovery_record(rid)
+                failed_bundle=root/("tls_resident-"+rid)
+                assert operator("--recover-runtime","tls_gateway",rid).returncode!=0
+                assert tls_request(gp,hostname,ca2)==(200,body)
+                children=set()
+                for task in (Path("/proc")/str(supervisor.pid)/"task").iterdir():
+                    try:
+                        candidates=(task/"children").read_text().split()
+                    except FileNotFoundError:
+                        continue
+                    for child in candidates:
+                        try:
+                            proc=Path("/proc")/child
+                            if (proc/"exe").resolve()==engine.resolve() and str(failed_bundle).encode() in (proc/"cmdline").read_bytes():
+                                children.add(int(child))
+                        except FileNotFoundError:
+                            pass
+                assert len(children)==2,"expected two owned TLS tunnel children"
+                os.kill(min(children),signal.SIGKILL)
+                assert supervisor.wait(timeout=40)!=0
+                wait_state("failed_or_unknown",rid)
+                closed_tunnel()
+                empty_gateway()
+                assert failed_bundle.is_dir()
+                expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),409)
+                expect(call(base,path+"?expected_revision=1","DELETE",admin),409)
+                assert operator("--recover-runtime","tls_gateway","0"*32).returncode!=0
+                # Recovery must not clear SQL while a listener is still live.
+                with socket.socket() as occupied:
+                    occupied.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+                    occupied.bind(("127.0.0.1",rp))
+                    occupied.listen(1)
+                    assert operator("--recover-runtime","tls_gateway",rid).returncode!=0
+                    assert state()["state"]=="failed_or_unknown"
+                assert operator("--recover-runtime","tls_gateway",rid).returncode==0
+                wait_state("stopped",rid)
+                empty_gateway()
+                assert failed_bundle.is_dir()
+                report["real_https_child_failure_recovery_rejects_live_listener"]=True
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=resident("tls_crash")
+                ready()
+                rid=start_run()
+                recovery_record(rid)
+                assert operator("--recover-runtime","tls_gateway",rid).returncode!=0
+                assert tls_request(gp,hostname,ca2)==(200,body)
+                # No graceful handler: parent-death protection must stop
+                # both owned engines, while Nginx stays independently alive.
+                supervisor.kill()
+                assert supervisor.wait(timeout=10)!=0
+                closed_tunnel()
+                assert lock.exists() and sup_lock.exists()
+                expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),409)
+                assert operator("--recover-runtime","tls_gateway",rid).returncode==0
+                wait_state("stopped",rid)
+                empty_gateway()
+                assert not lock.exists() and not sup_lock.exists()
+                assert (root/("tls_crash-"+rid)).is_dir()
+                assert operator("--recover-runtime","tls_gateway",rid).returncode!=0
+                report["real_https_supervisor_sigkill_parent_death_and_recovery"]=True
+                # Prove a new request can really serve HTTPS after explicit
+                # recovery; no automatic reuse of failed bundle or request.
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=resident("tls_recovered")
+                ready()
+                fresh=start_run()
+                assert fresh!=rid
+                assert tls_request(gp,hostname,ca2)==(200,body)
+                rejects(gp,hostname,ca)
+                marker=root/"worker-tls_gateway.stop"
+                marker.touch(mode=0o600)
+                assert supervisor.wait(timeout=40)==0
+                wait_state("stopped",fresh)
+                closed_tunnel()
+                empty_gateway()
+                assert not lock.exists() and not sup_lock.exists()
+                assert not (root/("tls_recovered-"+fresh)).exists()
+                marker.unlink()
+                report["real_https_restart_after_recovery_and_local_stop"]=True
             finally:
                 if supervisor is not None and supervisor.poll() is None:
                     try:
