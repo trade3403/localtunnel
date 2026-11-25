@@ -91,3 +91,8 @@
 ## 2026-11-25：服务注册删除验收、引擎异常退出恢复
 - HEAD 20a5bf0563d3303aaf947dcde287d99b82d1a29b，CI #61 https://github.com/trade3403/localtunnel/actions/runs/45537179713 全部通过，17/17 单测、1/1 桌面真实 TCP（0.78s 测试耗时）、真实 SCM 注册删除及拒绝非法注册/运行中删除、真实隧道、锁定构建及安装卸载通过。EXE 3.15 MiB；预览包 https://github.com/trade3403/localtunnel/actions/runs/45537179713/artifacts/14986739741 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45537179713/artifacts/14987388757 。核心 #74、Runner #156 通过。
 - 服务宿主新增引擎异常退出恢复，单次 SCM 服务生命周期最多3次，1/2/4秒递增间隔，主动停止时取消；重新读取密文凭据和校验 ACL/引擎指纹，旧进程停止且 runtime 为空才继续，失败耗尽后服务停止并报告失败。初次配置不合法仍直接拒绝启动；SCM Running 代表宿主活跃（包括恢复），不等于隧道在线。真实 CI 注入故障：按 SCM PID 精确定位其 runtime 下的 Rathole 子进程，强制结束，验证新子进程 PID、原宿主未变、旧临时目录消失、HTTP 再次真实转发。新增预算单测。全部新代码待 CI，未实现宿主自身异常退出的 SCM recovery policy 或跨宿主残留安全清理；禁止自动递归删除未知数据。未修改 main，不涉及生产设备。下一阶段按实际 CI 验收后继续宿主恢复及残留清理。
+
+
+## 2026-11-25：引擎恢复验收、宿主崩溃残留清理
+- HEAD 411b6e287ec36fc6872168fad5b3f15d2f960239，CI #63 https://github.com/trade3403/localtunnel/actions/runs/45538735734 全部通过，18/18 单测、1/1 桌面真实 TCP（0.93s 测试耗时）、真实 SCM 子进程强制退出后恢复转发/旧 runtime 消失、安装卸载通过。EXE 3.16 MiB；预览包 https://github.com/trade3403/localtunnel/actions/runs/45538735734/artifacts/14988158394 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45538735734/artifacts/14988238217 。核心 #75、Runner #158 通过。
+- 新增初次 SCM 启动时专用 runtime 崩溃残留清理：先验证部署 ACL 及密封凭据，仅接受一个 tempfile 生成的 localtunnel-client-<6字母数字> 目录、普通 client.toml/rathole.exe 文件，逐项严格 ACL/所有者/重解析点检查、拒绝未知数据、检测独占读取、先删除旧引擎再配置、非递归删除空目录。仅 runtime 子项允许 LocalService/服务 SID 所有者；部署根/密文/引擎仍必须管理员或 SYSTEM 所有。新增真实 CI 整个 SCM 宿主强制结束、Job Object 子进程退出、未知文件阻止清理、人工移除未知测试文件后显式启动恢复 HTTP。所有新增功能待验收；尚非整个宿主自动重启，需后续 SCM 恢复策略。独占打开与删除间仍有竞态，依赖专用目录 ACL 和 SCM 单宿主约束；不是完整安全擦除，也未覆盖恶意管理员或同 LocalService 身份。未修改 main。

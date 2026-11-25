@@ -76,7 +76,9 @@ def main(executable, evidence):
               "unsafe_profile_acl_rejected": False, "autostart_unsafe_rejected": False,
               "autostart_enabled": False, "autostart_disabled": False, "forwarded": False,
               "stopped": False, "runtime_cleaned": False, "deleted": False,
-              "engine_recovered": False, "old_runtime_cleaned": False}
+              "engine_recovered": False, "old_runtime_cleaned": False,
+              "host_crash_restart": False, "host_crash_runtime_cleaned": False,
+              "unknown_runtime_preserved": False}
     created = False
     relay = None
     fixture = None
@@ -235,6 +237,37 @@ bind_addr = "127.0.0.1:{mapped}"
                 report["old_runtime_cleaned"] = True
                 e2e.wait_for(url, body, [relay], seconds=35)
                 report["engine_recovered"] = True
+                # End only the SCM host identified above. Job-object close
+                # must terminate its assigned engine, leaving the crash data.
+                if service_pid(name) != host_pid:
+                    raise RuntimeError("SCM host changed before crash injection")
+                run("taskkill.exe", "/PID", str(host_pid), "/F")
+                wait_state(name, 1)
+                crashed_dir = new_child[1]
+                if not (crashed_dir / "client.toml").is_file():
+                    raise RuntimeError("host crash did not leave the expected fixture")
+                # Wait until the original engine image is no longer in use.
+                deadline = time.monotonic() + 10
+                while engine_child(host_pid, root) is not None:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("engine survived host crash")
+                    time.sleep(.25)
+                # Unknown data must not be removed or overwritten.
+                unknown = crashed_dir / "unknown.txt"
+                unknown.write_bytes(b"preserve this fixture")
+                sc("start", name, check=False)
+                wait_state(name, 1)
+                if unknown.read_bytes() != b"preserve this fixture" or not (crashed_dir / "client.toml").is_file():
+                    raise RuntimeError("unknown runtime caused destructive cleanup")
+                report["unknown_runtime_preserved"] = True
+                unknown.unlink()
+                control("start")
+                wait_state(name, 4)
+                if crashed_dir.exists():
+                    raise RuntimeError("stale runtime survived host restart")
+                report["host_crash_runtime_cleaned"] = True
+                e2e.wait_for(url, body, [relay], seconds=35)
+                report["host_crash_restart"] = True
                 if control("unregister", check=False).returncode == 0:
                     raise RuntimeError("running service unregistered")
                 report["running_unregister_rejected"] = True

@@ -98,7 +98,7 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
     }
     let mut supervisor = crate::Supervisor::default();
     let tunnel = TUNNEL.load(Ordering::Acquire);
-    if tunnel && start_provisioned(&mut supervisor).is_err() {
+    if tunnel && (prepare_initial_runtime().is_err() || start_provisioned(&mut supervisor).is_err()) {
         let _ = report(handle, SERVICE_STOPPED, ERROR_GEN_FAILURE);
         return;
     }
@@ -160,6 +160,15 @@ pub fn seal_profile_from_stdin(name: &str) -> Result<(), String> {
     let dir = deployment_dir(name)?;
     crate::service_acl::validate(&dir, name, false)?;
     crate::credentials::seal_service(&dir, std::io::stdin().lock())
+}
+
+fn prepare_initial_runtime() -> Result<(), String> {
+    let name = std::env::args().nth(2).ok_or("service name missing")?;
+    let dir = deployment_dir(&name)?;
+    crate::service_acl::validate(&dir, &name, true)?;
+    // Verify sealed profile before modifying any stale files.
+    crate::credentials::load_service(&dir)?;
+    crate::service_acl::clear_stale_runtime(&dir, &name)
 }
 
 fn start_provisioned(supervisor: &mut crate::Supervisor) -> Result<(), String> {

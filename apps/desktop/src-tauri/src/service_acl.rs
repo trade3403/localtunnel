@@ -55,7 +55,7 @@ fn service_sid(name: &str) -> Result<String, String> {
     Ok(value)
 }
 
-fn check(path: &Path, directory: bool, service: &str, limit: u32) -> Result<(), String> {
+fn check_entry(path: &Path, directory: bool, service: &str, limit: u32, runtime: bool) -> Result<(), String> {
     let meta = std::fs::symlink_metadata(path).map_err(|_| "deployment entry missing")?;
     if meta.file_attributes() & 0x400 != 0 || (directory && !meta.is_dir())
         || (!directory && !meta.is_file()) {
@@ -73,7 +73,9 @@ fn check(path: &Path, directory: bool, service: &str, limit: u32) -> Result<(), 
         return Err("missing or invalid deployment ACL".into());
     }
     let owner = sid_string(owner)?;
-    if owner != ADMIN && owner != SYSTEM { return Err("untrusted deployment owner".into()); }
+    if owner != ADMIN && owner != SYSTEM && !(runtime && (owner == "S-1-5-19" || owner == service)) {
+        return Err("untrusted deployment owner".into());
+    }
     let mut admin = 0;
     let mut system = 0;
     let mut service_mask = 0;
@@ -102,6 +104,69 @@ fn check(path: &Path, directory: bool, service: &str, limit: u32) -> Result<(), 
         return Err("required deployment rights missing".into());
     }
     Ok(())
+}
+
+fn check(path: &Path, directory: bool, service: &str, limit: u32) -> Result<(), String> {
+    check_entry(path, directory, service, limit, false)
+}
+
+// Only SCM-owned startup uses this cleanup. The root is validated first.
+// No recursive deletion: inspect the complete candidate before unlinking
+// only the two files created by Supervisor::start_in.
+fn runtime_name(name: &str) -> bool {
+    name.strip_prefix("localtunnel-client-").is_some_and(|suffix|
+        suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+pub fn clear_stale_runtime(dir: &Path, name: &str) -> Result<(), String> {
+    let service = service_sid(name)?;
+    let root = dir.join("runtime");
+    check(&root, true, &service, MODIFY)?;
+    let mut entries = std::fs::read_dir(&root).map_err(|_| "runtime unavailable")?;
+    let Some(entry) = entries.next() else { return Ok(()); };
+    let entry = entry.map_err(|_| "runtime entry unavailable")?;
+    if entries.next().is_some() { return Err("multiple stale runtime entries; manual inspection required".into()); }
+    if !entry.file_name().to_str().is_some_and(runtime_name) {
+        return Err("unknown runtime entry; manual inspection required".into());
+    }
+    let stale = entry.path();
+    check_entry(&stale, true, &service, MODIFY, true)?;
+    let mut engine = None;
+    let mut config = None;
+    for item in std::fs::read_dir(&stale).map_err(|_| "stale runtime unavailable")? {
+        let item = item.map_err(|_| "stale entry unavailable")?;
+        let path = item.path();
+        check_entry(&path, false, &service, MODIFY, true)?;
+        match item.file_name().to_str() {
+            Some("rathole.exe") if engine.is_none() => engine = Some(path),
+            Some("client.toml") if config.is_none() => config = Some(path),
+            _ => return Err("unknown stale runtime file; manual inspection required".into()),
+        }
+    }
+    // A surviving image or open file must block cleanup rather than
+    // deleting live credentials. Never terminate arbitrary processes here.
+    use std::os::windows::fs::OpenOptionsExt;
+    for path in engine.iter().chain(config.iter()) {
+        std::fs::OpenOptions::new().read(true).share_mode(0).open(path)
+            .map_err(|_| "stale runtime file still in use")?;
+    }
+    if let Some(path) = engine { std::fs::remove_file(path).map_err(|_| "stale engine removal failed")?; }
+    if let Some(path) = config { std::fs::remove_file(path).map_err(|_| "stale credential removal failed")?; }
+    std::fs::remove_dir(stale).map_err(|_| "stale runtime directory not empty or unavailable")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_generated_runtime_names() {
+        assert!(runtime_name("localtunnel-client-aB12Z9"));
+        assert!(!runtime_name("localtunnel-client-"));
+        assert!(!runtime_name("localtunnel-client-abcdefg"));
+        assert!(!runtime_name("localtunnel-client-../abc"));
+        assert!(!runtime_name("other-abcdef"));
+    }
 }
 
 // Before SCM registration, no service SID may have rights yet. The
