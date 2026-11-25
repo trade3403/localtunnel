@@ -23,6 +23,13 @@ try{
   assert.equal(spawnSync(exe,['--init-admin',root],{input:JSON.stringify({username:'operator',password}),timeout:20000}).status,0)
   const node=spawnSync(exe,['--add-node',root,'Local relay'],{timeout:20000,encoding:'utf8'})
   assert.equal(node.status,0)
+  // Real SQLite fixtures to exercise server cursor boundaries without
+  // manufacturing fake HTTP responses. The real CLI-created node sorts first.
+  const seed=spawnSync('python3',['-c',`import sqlite3,sys
+with sqlite3.connect(sys.argv[1]) as db:
+    db.executemany("INSERT INTO nodes(id,name) VALUES (?,?)",[(f'z{i:03d}',f'Pagination fixture {i:03d}') for i in range(101)])
+`,join(root,'control.sqlite3')],{timeout:20000})
+  assert.equal(seed.status,0)
   server=spawn(exe,[root,'0'],{stdio:['ignore','pipe','ignore']})
   const apiPort=await new Promise((resolve,reject)=>{
     const t=setTimeout(()=>reject(new Error('server startup timeout')),20000)
@@ -57,6 +64,11 @@ try{
   const menu=name=>page.getByRole('menuitem',{name,exact:true})
   await menu('节点管理').click()
   await page.getByText('Local relay',{exact:true}).waitFor()
+  await page.getByTestId('nodes-count').filter({hasText:/^已加载 100 条$/}).waitFor()
+  await page.getByTestId('nodes-more').click()
+  await page.getByTestId('nodes-count').filter({hasText:/^已加载 102 条$/}).waitFor()
+  await page.getByTestId('nodes-more').waitFor({state:'hidden'})
+  report.real_cursor_pagination=true
   await menu('设备管理').click()
   await page.getByRole('button',{name:'生成配对码'}).click()
   const code=await page.getByTestId('pairing').textContent()
@@ -88,6 +100,28 @@ try{
   await page.getByRole('button',{name:'请求启动'}).click()
   await page.getByText('状态冲突，请刷新并检查版本、域名验证或执行器状态',{exact:true}).waitFor()
   report.real_mapping_and_unverified_activation_denied=true
+  stage='edit and delete'
+  await page.getByRole('button',{name:'编辑映射',exact:true}).click()
+  await page.locator('#edit-local-port').fill('8181')
+  await page.getByRole('button',{name:'保存端口',exact:true}).click()
+  await page.getByText('映射已更新',{exact:true}).waitFor()
+  await page.getByRole('cell',{name:'8181',exact:true}).waitFor()
+  await page.getByRole('cell',{name:'2',exact:true}).waitFor()
+  await menu('域名管理').click()
+  await page.getByRole('button',{name:'删除域名',exact:true}).click()
+  await page.locator('.ant-popover:visible').getByRole('button',{name:'确认删除',exact:true}).click()
+  await page.getByText('状态冲突，请刷新并检查版本、域名验证或执行器状态',{exact:true}).waitFor()
+  await menu('映射管理').click()
+  await page.getByRole('button',{name:'删除映射',exact:true}).click()
+  await page.locator('.ant-popover:visible').getByRole('button',{name:'确认删除',exact:true}).click()
+  await page.getByText('映射已删除',{exact:true}).waitFor()
+  await page.getByRole('button',{name:'运行详情'}).waitFor({state:'hidden'})
+  await menu('域名管理').click()
+  await page.getByRole('button',{name:'删除域名',exact:true}).click()
+  await page.locator('.ant-popover:visible').getByRole('button',{name:'确认删除',exact:true}).click()
+  await page.getByText('域名已删除',{exact:true}).waitFor()
+  await page.getByRole('cell',{name:'browser.example.test',exact:true}).waitFor({state:'hidden'})
+  report.real_edit_delete_and_domain_reference_guard=true
   stage='logout'
   await page.getByRole('button',{name:'退出登录'}).click()
   await page.getByRole('heading',{name:'管理后台登录'}).waitFor()

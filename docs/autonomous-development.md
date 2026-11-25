@@ -248,3 +248,7 @@
 ## 2026-11-25：Chromium 环境修复成功、浏览器按钮定位修复
 - HEAD 7a42c9597ec051fee61732874c9e50ed6a84cd1f 管理 #31 https://github.com/trade3403/localtunnel/actions/runs/45627326098 、#32 https://github.com/trade3403/localtunnel/actions/runs/45627336659 失败；Windows #115、Gateway #109、Runner #226/#227 成功，均已结束。实际 job 139250881722/139250924736 的旧回归、锁安装、Vue 构建和 Chromium 安装均成功；浏览器首次点击 getByRole('button',{name:'登录',exact:true}) 在 browser.mjs:46 等待30秒超时。推断 Ant Design Vue 双字自动间隔导致可访问名称变化，未取得旧DOM直接证明。
 - 增加登录按钮明确 aria-label，保留真实点击/认证断言；对下拉控件使用稳定组件标识及实际可见弹层，对状态文本等待明确元素，登录后等待刷新结束；失败阶段诊断不输出DOM/凭据。无依赖变化、没有跳过测试或改业务认证。新CI待验收；未进入后台功能增量，未改main、未部署公网、未开启定时任务。
+
+## 2026-11-25：Web 管理后台第一批验收、编辑删除及游标分页
+- HEAD b8b4a6de99f6277563404792f835aefa6d1817cd 六个CI全绿：Management #33 https://github.com/trade3403/localtunnel/actions/runs/45629013762 、#34 https://github.com/trade3403/localtunnel/actions/runs/45629024157 、Windows #116、Gateway #110、Runner #228/#229。#34 job 139256895633 实际 Chromium 浏览器第一批功能及全部旧回归、npm/Rust严格锁门禁通过，报告/构建 https://github.com/trade3403/localtunnel/actions/runs/45629024157/artifacts/15030670448 。
+- 新增四类列表真实after游标加载更多、当前已加载数（非全局），刷新及变更重置首批；映射端口编辑保留打开时版本、映射版本删除及域名引用删除保护，确认操作。新增真实Chromium测试节点102条（1 CLI + 101 SQLite夹具）跨100边界、端口修改与revision、引用拒绝及实际删除。保留旧测试和严格锁，无新增依赖/后端修改。仍仅回环预览、非全量一致性快照、未完成浏览器真实worker启停、HTTPS worker专项、流量/审计/常驻执行器。新功能待CI。未改main、未部署公网、未开启定时任务。
