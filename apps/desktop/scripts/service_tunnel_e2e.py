@@ -83,7 +83,7 @@ def main(executable, evidence):
               "recovery_disabled": False, "readonly_scm_status": False, "service_traffic_measured": False,
               "recovered_traffic_measured": False, "history_checkpoint": False,
               "history_after_host_recovery": False, "history_after_stop": False,
-              "history_preserved_unregister": False, "unsafe_history_rejected": False, "desktop_service_controls": False, "one_click_provision": False}
+              "history_preserved_unregister": False, "unsafe_history_rejected": False, "desktop_service_controls": False, "one_click_provision": False, "profile_update": False, "desktop_unregister": False}
     created = False
     relay = None
     fixture = None
@@ -433,13 +433,81 @@ bind_addr = "127.0.0.1:{mapped}"
                             raise RuntimeError("provisioning started or enabled new service")
                         if token.encode() in (fresh_root / "service-profile.bin").read_bytes():
                             raise RuntimeError("provisioning wrote plaintext credentials")
+                        def update(data, confirmation=fresh):
+                            return subprocess.run([str(source_exe), "--service-update", fresh, confirmation],
+                                                  input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+                        saved_profile = fresh_root / "service-profile.bin"
+                        before = saved_profile.read_bytes()
                         run(str(source_exe), "--service-manage", fresh, "start")
                         e2e.wait_for(url, body, [relay], seconds=35)
+                        if update(profile).returncode == 0 or saved_profile.read_bytes() != before:
+                            raise RuntimeError("running service profile replaced")
+                        if run(str(source_exe), "--service-unregister", fresh, fresh, check=False).returncode == 0:
+                            raise RuntimeError("running service unregistered by desktop")
                         run(str(source_exe), "--service-manage", fresh, "stop")
                         wait_state(fresh, 1)
-                        if not (fresh_root / "history" / "traffic-history.json").is_file():
+                        history_file = fresh_root / "history" / "traffic-history.json"
+                        if not history_file.is_file():
                             raise RuntimeError("one-click service did not persist traffic")
                         report["one_click_provision"] = True
+                        before_history = json.loads(history_file.read_text(encoding="utf-8"))
+                        invalid = json.loads(profile)
+                        invalid["mappings"][0]["localPort"] = 0
+                        if update(json.dumps(invalid).encode()).returncode == 0 or saved_profile.read_bytes() != before:
+                            raise RuntimeError("invalid profile update changed saved credentials")
+                        if update(profile, "wrong").returncode == 0 or saved_profile.read_bytes() != before:
+                            raise RuntimeError("incorrect confirmation accepted")
+                        alternate = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+                        changed_body = secrets.token_hex(40).encode()
+                        # Handler closes over body, so use a distinct fixture handler.
+                        class AlternateHandler(http.server.BaseHTTPRequestHandler):
+                            def do_GET(self):
+                                self.send_response(200)
+                                self.send_header("Content-Length", str(len(changed_body)))
+                                self.end_headers()
+                                self.wfile.write(changed_body)
+                            def log_message(self, *args):
+                                pass
+                        alternate.RequestHandlerClass = AlternateHandler
+                        threading.Thread(target=alternate.serve_forever, daemon=True).start()
+                        try:
+                            changed = json.loads(profile)
+                            changed["mappings"][0]["localPort"] = alternate.server_port
+                            result = update(json.dumps(changed).encode())
+                            if result.returncode:
+                                raise RuntimeError("profile update failed: " + result.stderr.decode(errors="replace"))
+                            if saved_profile.read_bytes() == before or token.encode() in saved_profile.read_bytes():
+                                raise RuntimeError("updated profile not encrypted/replaced")
+                            state = json.loads(run(str(source_exe), "--service-status", fresh).stdout)
+                            if state["state"] != "stopped" or state["startup"] != "disabled":
+                                raise RuntimeError("updated service did not remain disabled")
+                            if run(str(source_exe), "--service-manage", fresh, "start", check=False).returncode == 0:
+                                raise RuntimeError("disabled service started")
+                            run(str(source_exe), "--service-manage", fresh, "autostart-off")
+                            run(str(source_exe), "--service-manage", fresh, "start")
+                            e2e.wait_for(url, changed_body, [relay], seconds=35)
+                            run(str(source_exe), "--service-manage", fresh, "stop")
+                            wait_state(fresh, 1)
+                            report["profile_update"] = True
+                        finally:
+                            alternate.shutdown()
+                            alternate.server_close()
+                        after_history = json.loads(history_file.read_text(encoding="utf-8"))
+                        if after_history["uploadBytes"] < before_history["uploadBytes"] + len(changed_body):
+                            raise RuntimeError("profile update lost saved traffic")
+                        if run(str(source_exe), "--service-unregister", fresh, "wrong", check=False).returncode == 0:
+                            raise RuntimeError("incorrect unregister confirmation accepted")
+                        run(str(source_exe), "--service-unregister", fresh, fresh)
+                        if not saved_profile.is_file() or json.loads(history_file.read_text(encoding="utf-8")) != after_history:
+                            raise RuntimeError("unregister deleted protected data")
+                        deadline = time.monotonic() + 25
+                        while time.monotonic() < deadline:
+                            if sc("query", fresh, check=False).returncode == 1060:
+                                break
+                            time.sleep(.25)
+                        else:
+                            raise RuntimeError("desktop unregister did not remove SCM registration")
+                        report["desktop_unregister"] = True
                     finally:
                         fresh_control("recovery-off", check=False)
                         fresh_control("stop", check=False)

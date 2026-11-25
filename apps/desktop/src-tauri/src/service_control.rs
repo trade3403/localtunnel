@@ -326,6 +326,52 @@ pub fn manage_existing(name: &str, action: &str) -> Result<(), String> {
     execute_existing(name, action, &dir, exe.to_str().ok_or("invalid executable path")?)
 }
 
+fn confirmed_directory(name: &str, confirmation: &str) -> Result<std::path::PathBuf, String> {
+    if !crate::service_host::valid_name(name) || name != confirmation {
+        return Err("exact service name confirmation required".into());
+    }
+    Ok(crate::service_provision::program_data()?.join(name))
+}
+
+// Keep this separate from the ordinary action allowlist. A configuration
+// replacement is deliberately not a live reload, and never starts a service.
+pub fn update_profile(name: &str, confirmation: &str, request: crate::StartRequest) -> Result<(), String> {
+    let dir = confirmed_directory(name, confirmation)?;
+    if !request.engine.is_empty() { return Err("service requires bundled engine".into()); }
+    let _validated = zeroize::Zeroizing::new(crate::build_config(&request)?);
+    let encoded = zeroize::Zeroizing::new(serde_json::to_vec(&request).map_err(|_| "profile encode failed")?);
+    if encoded.len() > 256 * 1024 { return Err("service profile too large".into()); }
+    let exe = dir.join("localtunnel-desktop.exe");
+    let exe = exe.to_str().ok_or("invalid executable path")?;
+    let service = open(name, SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG)?;
+    config(&service, name, exe)?;
+    if status(&service)? != SERVICE_STOPPED { return Err("stop service before changing configuration".into()); }
+    crate::service_acl::validate(&dir, name, true)?;
+    crate::service_acl::history_dir(&dir, name)?;
+    crate::credentials::load_service(&dir)?;
+    let scratch = tempfile::tempdir().map_err(|_| "engine check directory unavailable")?;
+    crate::engine_integrity::stage(&crate::bundled_engine(&dir)?, scratch.path())?;
+    // Disable first to block new SCM starts during replacement. Do not
+    // restore automatic/manual mode implicitly, even on successful update.
+    set_start_type(&service, SERVICE_DISABLED)?;
+    if config(&service, name, exe)? != SERVICE_DISABLED || status(&service)? != SERVICE_STOPPED {
+        return Err("service disabled but no longer stopped; inspect SCM".into());
+    }
+    if let Err(e) = crate::credentials::replace_service(&dir, name, &request) {
+        return Err(format!("service left disabled; inspect saved configuration: {e}"));
+    }
+    if config(&service, name, exe)? != SERVICE_DISABLED || status(&service)? != SERVICE_STOPPED {
+        return Err("configuration written; service state changed concurrently; inspect SCM".into());
+    }
+    Ok(())
+}
+
+pub fn unregister_confirmed(name: &str, confirmation: &str) -> Result<(), String> {
+    let dir = confirmed_directory(name, confirmation)?;
+    let exe = dir.join("localtunnel-desktop.exe");
+    execute_existing(name, "unregister", &dir, exe.to_str().ok_or("invalid executable path")?)
+}
+
 pub(crate) fn execute_existing(name: &str, action: &str, dir: &std::path::Path, exe: &str) -> Result<(), String> {
     let rights = access(action)?;
     let service = open(name, rights)?;
@@ -437,6 +483,8 @@ mod tests {
             assert!(!desktop_action_allowed(action));
         }
         assert!(manage_existing("Spooler", "stop").is_err());
+        assert!(unregister_confirmed("Spooler", "Spooler").is_err());
+        assert!(unregister_confirmed("LocalTunnelPreview-0123456789abcdef0123456789abcdef", "wrong").is_err());
         assert!(manage_existing("LocalTunnelPreview-0123456789abcdef0123456789abcdef", "unregister").is_err());
         assert!(access("start").unwrap() & SERVICE_START != 0);
         assert_eq!(access("check").unwrap() & SERVICE_CHANGE_CONFIG, 0);

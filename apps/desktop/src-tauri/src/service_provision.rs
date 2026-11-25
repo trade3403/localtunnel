@@ -17,7 +17,7 @@ use windows_sys::Win32::{
 fn path_wide(path: &Path) -> Vec<u16> { path.as_os_str().encode_wide().chain(Some(0)).collect() }
 fn last_error() -> String { io::Error::last_os_error().to_string() }
 
-fn program_data() -> Result<PathBuf, String> {
+pub(crate) fn program_data() -> Result<PathBuf, String> {
     let mut raw = ptr::null_mut();
     let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, ptr::null_mut(), &mut raw) };
     if hr < 0 || raw.is_null() {
@@ -73,7 +73,7 @@ fn create_root(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn set_acl(path: &Path, directory: bool, service: Option<(&str, bool)>) -> Result<(), String> {
+pub(crate) fn set_acl(path: &Path, directory: bool, service: Option<(&str, bool)>) -> Result<(), String> {
     let meta = fs::symlink_metadata(path).map_err(|_| "provisioned entry missing")?;
     if meta.file_attributes() & 0x400 != 0 || (directory && !meta.is_dir()) || (!directory && !meta.is_file()) {
         return Err("unsafe provisioned entry".into());

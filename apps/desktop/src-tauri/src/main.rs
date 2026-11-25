@@ -318,12 +318,46 @@ async fn traffic_history(app: tauri::AppHandle) -> Result<HistoryStatus, String>
 }
 
 #[cfg(windows)]
+static SERVICE_MUTATION: Mutex<()> = Mutex::new(());
+
+#[cfg(windows)]
+#[tauri::command]
+async fn update_service_profile(name: String, confirmation: String, request: StartRequest) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = SERVICE_MUTATION.try_lock().map_err(|_| "another service action is running")?;
+        service_control::update_profile(&name, &confirmation, request)
+    }).await.map_err(|_| "service configuration update failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn update_service_profile(name: String, confirmation: String, request: StartRequest) -> Result<(), String> {
+    let _ = (name, confirmation, request);
+    Err("Windows SCM unavailable".into())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+async fn unregister_service(name: String, confirmation: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = SERVICE_MUTATION.try_lock().map_err(|_| "another service action is running")?;
+        service_control::unregister_confirmed(&name, &confirmation)
+    }).await.map_err(|_| "service unregister failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn unregister_service(name: String, confirmation: String) -> Result<(), String> {
+    let _ = (name, confirmation);
+    Err("Windows SCM unavailable".into())
+}
+
+#[cfg(windows)]
 #[tauri::command]
 async fn provision_service(app: tauri::AppHandle, request: StartRequest) -> Result<String, String> {
     let resource = app.path().resource_dir().map_err(|_| "application resource directory unavailable")?;
     tauri::async_runtime::spawn_blocking(move || {
-        static PROVISION: Mutex<()> = Mutex::new(());
-        let _guard = PROVISION.try_lock().map_err(|_| "another provisioning action is running")?;
+        let _guard = SERVICE_MUTATION.try_lock().map_err(|_| "another provisioning action is running")?;
         service_provision::provision(request, &resource)
     }).await.map_err(|_| "service provisioning failed")?
 }
@@ -341,8 +375,7 @@ async fn manage_service(name: String, action: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         // Only one desktop mutation per process; Windows SCM remains
         // authoritative for cross-process state transitions.
-        static ACTION: Mutex<()> = Mutex::new(());
-        let _guard = ACTION.try_lock().map_err(|_| "another service action is running")?;
+        let _guard = SERVICE_MUTATION.try_lock().map_err(|_| "another service action is running")?;
         service_control::manage_existing(&name, &action)
     }).await.map_err(|_| "service action failed")?
 }
@@ -423,6 +456,25 @@ fn main() {
             }
             std::process::exit(if result.is_ok() { 0 } else { 1 });
         }
+        if args.get(1).is_some_and(|arg| arg == "--service-update" || arg == "--service-unregister") {
+            let result = (|| -> Result<(), String> {
+                if args.len() != 4 { return Err("exact service name and confirmation required".into()); }
+                if args[1] == "--service-unregister" {
+                    return service_control::unregister_confirmed(&args[2], &args[3]);
+                }
+                use std::io::Read;
+                let mut data = zeroize::Zeroizing::new(Vec::new());
+                std::io::stdin().lock().take(256 * 1024 + 1).read_to_end(&mut data)
+                    .map_err(|_| "profile read failed")?;
+                if data.len() > 256 * 1024 { return Err("profile too large".into()); }
+                let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "invalid service profile")?;
+                service_control::update_profile(&args[2], &args[3], request)
+            })();
+            if let Err(error) = &result {
+                let _ = writeln!(std::io::stderr(), "service maintenance failed: {error}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
         if args.get(1).is_some_and(|arg| arg == "--service-provision") {
             use std::io::Read;
             let result = (|| -> Result<String, String> {
@@ -473,7 +525,7 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;

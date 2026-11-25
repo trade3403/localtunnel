@@ -102,6 +102,29 @@ mod windows {
         Ok(())
     }
 
+    // Caller holds the exact SCM service stopped and disabled. Prepare
+    // an encrypted candidate with a protected ACL before replacing old data.
+    pub fn replace_service(dir: &Path, name: &str, request: &StartRequest) -> Result<(), String> {
+        if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
+        validate(request)?;
+        let data = Zeroizing::new(serde_json::to_vec(request).map_err(|_| "服务凭据序列化失败")?);
+        let encrypted = transform_scoped(&data, true, true)?;
+        let decoded = transform(&encrypted, false)?;
+        if decoded.as_slice() != data.as_slice() { return Err("服务凭据加密校验失败".into()); }
+        let mut file = NamedTempFile::new_in(dir).map_err(|_| "无法创建服务凭据候选文件")?;
+        file.write_all(&encrypted).and_then(|_| file.as_file().sync_all())
+            .map_err(|_| "无法同步服务凭据候选文件")?;
+        let sid = crate::service_acl::service_sid(name)?;
+        crate::service_provision::set_acl(file.path(), false, Some((&sid, false)))?;
+        file.persist(dir.join("service-profile.bin"))
+            .map_err(|_| "无法原子替换服务凭据")?;
+        crate::service_acl::validate(dir, name, true)?;
+        let saved = load_service(dir)?;
+        let saved_bytes = Zeroizing::new(serde_json::to_vec(&saved).map_err(|_| "服务凭据回读失败")?);
+        if saved_bytes.as_slice() != data.as_slice() { return Err("服务凭据回读不匹配".into()); }
+        Ok(())
+    }
+
     pub fn load_service(dir: &Path) -> Result<StartRequest, String> {
         let file = fs::File::open(dir.join("service-profile.bin")).map_err(|_| "服务凭据缺失")?;
         let mut encrypted = Vec::new();
@@ -179,7 +202,7 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use windows::{save, load, forget, load_service, seal_service};
+pub use windows::{save, load, forget, load_service, seal_service, replace_service};
 #[cfg(not(windows))]
 pub fn save(_: &std::path::Path, _: &crate::StartRequest) -> Result<(), String> { Err("仅 Windows 支持凭据保护".into()) }
 #[cfg(not(windows))]

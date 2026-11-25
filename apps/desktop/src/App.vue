@@ -23,6 +23,41 @@ const serviceActionError = ref('')
 const serviceActionNotice = ref('')
 const serviceBusy = ref(false)
 const provisionConfirm = ref(false)
+const maintenanceConfirm = ref('')
+async function maintainService(action: 'update' | 'unregister') {
+  const name = watchedService.value
+  if (!name || serviceName.value.trim() !== name || maintenanceConfirm.value !== name ||
+      serviceSnapshot.value?.state !== 'stopped' || serviceBusy.value || busy.value) return
+  if (action === 'update' && (running.value || engine.value.trim() ||
+      mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535))) {
+    serviceActionError.value = '请停止桌面隧道，清空自定义引擎路径并填写有效端口'; return
+  }
+  serviceBusy.value = true
+  serviceGeneration++
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
+  try {
+    if (action === 'update') {
+      await invoke('update_service_profile', { name, confirmation: maintenanceConfirm.value, request: {
+        engine: '', remote: remote.value.trim(), serverKey: serverKey.value.trim(),
+        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+      } })
+      serviceActionNotice.value = '配置已更新，服务保持禁用；检查后可设为手动启动'
+    } else {
+      await invoke('unregister_service', { name, confirmation: maintenanceConfirm.value })
+      watchedService.value = ''
+      serviceName.value = ''
+      serviceActionNotice.value = '已注销 SCM 注册，受保护目录、凭据和历史流量仍保留'
+    }
+    maintenanceConfirm.value = ''
+  } catch (e) {
+    serviceActionError.value = '服务维护失败：' + String(e)
+  } finally {
+    serviceSnapshot.value = null
+    serviceBusy.value = false
+    void refreshService()
+  }
+}
 async function provisionService() {
   if (serviceBusy.value || busy.value || running.value || !ready.value || !provisionConfirm.value) return
   if (engine.value.trim()) { serviceActionError.value = '后台服务只允许内置引擎，请清空自定义路径'; return }
@@ -93,6 +128,7 @@ async function refreshService() {
 }
 function watchService() {
   if (serviceBusy.value) return
+  maintenanceConfirm.value = ''
   serviceActionError.value = ''
   serviceActionNotice.value = ''
   serviceGeneration++
@@ -109,6 +145,7 @@ function watchService() {
 }
 function unwatchService() {
   if (serviceBusy.value) return
+  maintenanceConfirm.value = ''
   serviceActionError.value = ''
   serviceActionNotice.value = ''
   serviceGeneration++
@@ -352,6 +389,14 @@ async function toggle() {
           <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.recovery === 'disabled'" @click="serviceAction('recovery-off')">关闭故障恢复</button>
           <span>故障恢复：{{ serviceSnapshot.recovery === 'enabled' ? '已启用' : serviceSnapshot.recovery === 'disabled' ? '已关闭' : '默认 / 未验证' }}</span>
         </div>
+        <div v-if="serviceSnapshot?.state === 'stopped'" class="fields">
+          <label class="wide">维护确认：完整输入当前服务名称<input v-model="maintenanceConfirm" :disabled="serviceBusy" maxlength="51" autocomplete="off" :placeholder="watchedService" /></label>
+        </div>
+        <div v-if="serviceSnapshot?.state === 'stopped'" class="profile-actions">
+          <button type="button" class="secondary" :disabled="serviceBusy || busy || running || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService" @click="maintainService('update')">使用下方表单更新服务配置</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || busy || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService" @click="maintainService('unregister')">注销服务注册</button>
+        </div>
+        <p v-if="serviceSnapshot?.state === 'stopped'" class="hint">更新将替换整套加密配置并保持禁用，需手动恢复启动方式；注销只删除服务注册，不删除配置或历史目录。不会读取或显示旧 Token。</p>
         <p v-if="serviceBusy" class="hint" role="status">正在执行服务操作…</p>
         <p v-if="serviceActionNotice" class="hint" role="status">{{ serviceActionNotice }}</p>
         <p v-if="serviceActionError" class="error" role="alert">{{ serviceActionError }}</p>
