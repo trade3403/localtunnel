@@ -7,6 +7,8 @@ mod transport;
 mod traffic;
 mod history;
 #[cfg(windows)]
+mod management;
+#[cfg(windows)]
 mod engine_job;
 #[cfg(windows)]
 mod service_host;
@@ -442,6 +444,47 @@ async fn check_local_port(port: u16) -> Result<bool, String> {
         .map_err(|_| "本地端口检测失败")?
 }
 
+// Management IPC sends only typed, secret-free observations back to the UI.
+#[tauri::command]
+async fn management_saved(app:tauri::AppHandle)->Result<serde_json::Value,String>{
+    #[cfg(windows)]{
+        let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
+        return serde_json::to_value(management::saved(&dir).await?).map_err(|_|"管理状态格式无效".into())
+    }
+    #[cfg(not(windows))]{let _=app;Err("仅 Windows 支持设备配对".into())}
+}
+#[tauri::command]
+async fn management_enroll(app:tauri::AppHandle,port:u16,name:String,pairing_code:String)->Result<serde_json::Value,String>{
+    #[cfg(windows)]{
+        let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
+        return serde_json::to_value(management::enroll(&dir,port,name,pairing_code).await?).map_err(|_|"管理状态格式无效".into())
+    }
+    #[cfg(not(windows))]{let _=(app,port,name,pairing_code);Err("仅 Windows 支持设备配对".into())}
+}
+#[tauri::command]
+async fn management_sync(app:tauri::AppHandle)->Result<serde_json::Value,String>{
+    #[cfg(windows)]{
+        let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
+        return serde_json::to_value(management::sync(&dir).await?).map_err(|_|"管理状态格式无效".into())
+    }
+    #[cfg(not(windows))]{let _=app;Err("仅 Windows 支持设备配对".into())}
+}
+#[tauri::command]
+fn management_snapshot()->Result<serde_json::Value,String>{
+    #[cfg(windows)]{
+        return serde_json::to_value(management::snapshot()?).map_err(|_|"管理状态格式无效".into())
+    }
+    #[cfg(not(windows))]{Err("仅 Windows 支持设备配对".into())}
+}
+#[tauri::command]
+async fn management_forget(app:tauri::AppHandle)->Result<(),String>{
+    #[cfg(windows)]{
+        let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
+        return management::forget(&dir).await
+    }
+    #[cfg(not(windows))]{let _=app;Err("仅 Windows 支持设备配对".into())}
+}
+
 fn main() {
     #[cfg(windows)]
     {
@@ -525,8 +568,13 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port,management_saved,management_enroll,management_sync,management_snapshot,management_forget])
         .setup(|app| {
+            #[cfg(windows)]
+            {
+                let dir=app.path().app_config_dir()?;
+                tauri::async_runtime::spawn(management::automatic(dir));
+            }
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出 LocalTunnel", true, None::<&str>)?;

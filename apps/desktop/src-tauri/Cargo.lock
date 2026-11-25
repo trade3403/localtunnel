@@ -1864,6 +1864,7 @@ name = "localtunnel-desktop"
 version = "0.3.0"
 dependencies = [
  "localtunnel",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",

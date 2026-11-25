@@ -1,0 +1,86 @@
+name: V0.4 Management API CI
+on:
+  push:
+    branches: ['feat/v0.4-management-api']
+  pull_request:
+    paths:
+      - 'crates/server/**'
+      - 'apps/admin/**'
+      - '.github/workflows/v04-management.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  management:
+    # Playwright 1.56.1 supports Ubuntu 24.04, not the current 26.04 latest image.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Rust build and tests
+        working-directory: crates/server
+        run: |
+          rustc --version
+          cargo test --locked
+          cargo build --release --locked
+      - name: Real management HTTP and SQLite lifecycle
+        run: python3 crates/server/tests/http_e2e.py crates/server/target/release/localtunnel-server management-evidence/http.json
+      - name: Real administrator authentication lifecycle
+        run: python3 crates/server/tests/auth_e2e.py crates/server/target/release/localtunnel-server management-evidence/auth.json
+      - name: Real device enrollment and authorization lifecycle
+        run: python3 crates/server/tests/devices_e2e.py crates/server/target/release/localtunnel-server management-evidence/devices.json
+      - name: Real device desired configuration and heartbeat lifecycle
+        run: python3 crates/server/tests/sync_e2e.py crates/server/target/release/localtunnel-server management-evidence/sync.json
+      - name: Real administrator mapping CRUD and revision lifecycle
+        run: python3 crates/server/tests/mappings_e2e.py crates/server/target/release/localtunnel-server management-evidence/mappings.json
+      - name: Install DNS query utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dnsutils nginx curl openssl
+      - name: Real node inventory and DNS TXT proof lifecycle
+        run: python3 crates/server/tests/domains_e2e.py crates/server/target/release/localtunnel-server management-evidence/domains.json
+      - name: Build existing core CLI for preview integration
+        run: cargo build --release --locked
+      - name: Actual management draft to encrypted tunnel and gateway preview
+        run: python3 crates/server/tests/preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/preview.json
+      - name: Real HTTPS management preview, certificate rotation and rollback
+        run: python3 crates/server/tests/tls_preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/tls-preview.json
+      - name: Install committed admin dependency graph
+        working-directory: apps/admin
+        run: |
+          node --version
+          npm --version
+          npm ci --no-audit --no-fund
+          git diff --exit-code -- package-lock.json
+      - name: Build Vue admin and install Chromium
+        working-directory: apps/admin
+        run: |
+          npm run build
+          npx --no-install playwright install chromium --with-deps
+      - name: Real browser admin login and API-backed management
+        working-directory: apps/admin
+        run: npm run test:e2e -- ../../crates/server/target/release/localtunnel-server ../../management-evidence/admin-browser.json
+      - name: Require complete V0.4 management evidence
+        run: python3 tests/verify_v04_evidence.py management management-evidence
+      - name: Collect admin dependency lock and build
+        if: always()
+        run: |
+          mkdir -p management-evidence
+          if test -f apps/admin/package-lock.json; then cp apps/admin/package-lock.json management-evidence/admin-package-lock.json; fi
+          if test -d apps/admin/dist; then cp -r apps/admin/dist management-evidence/admin-dist; fi
+      - name: Verify committed dependency lock unchanged
+        run: git diff --exit-code -- crates/server/Cargo.lock apps/admin/package-lock.json
+      - name: Collect committed lock
+        if: always()
+        run: |
+          mkdir -p management-evidence
+          if test -f crates/server/Cargo.lock; then cp crates/server/Cargo.lock management-evidence/Cargo.lock; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v04-management-evidence
+          path: management-evidence/
+          retention-days: 7
+          if-no-files-found: error
