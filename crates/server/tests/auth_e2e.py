@@ -137,6 +137,25 @@ try:
             report["restart_and_bounded_login"]=True
         finally:
             stop(p)
+        # A separately launched process has a fresh existing login budget.
+        # Corrupt the PHC in this private fixture, never a production database.
+        p,base=launch(root)
+        try:
+            for invalid in (phc.replace("m=19456","m=1048576"),
+                            phc.replace("t=2","t=1000"),
+                            phc.replace("p=1","p=64"),
+                            phc.replace("argon2id","argon2i")):
+                with sqlite3.connect(db_path) as db:
+                    db.execute("UPDATE users SET password_hash=? WHERE id=?",(invalid,uid))
+                assert login(base)[0]==401
+                assert call(base,"me",token=persisted)[0]==401
+            with sqlite3.connect(db_path) as db:
+                db.execute("UPDATE users SET password_hash=? WHERE id=?",(phc,uid))
+            fresh=token_from(login(base))
+            assert call(base,"me",token=fresh)[0]==200
+            report["unsupported_stored_argon2_parameters_rejected"]=True
+        finally:
+            stop(p)
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")

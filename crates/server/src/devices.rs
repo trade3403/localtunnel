@@ -13,6 +13,9 @@ const MISSING:Failure=(StatusCode::NOT_FOUND,"device not found");
 const BAD:Failure=(StatusCode::BAD_REQUEST,"invalid device input");
 const LIMITED:Failure=(StatusCode::TOO_MANY_REQUESTS,"try again later");
 const PAIR_TTL:i64=600;
+const ACTIVE_DEVICE_LIMIT:i64=64;
+const TOTAL_DEVICE_LIMIT:i64=256;
+const QUOTA:Failure=(StatusCode::CONFLICT,"device quota reached");
 
 #[derive(Clone)]
 struct DeviceState {pool:SqlitePool,budget:Arc<Mutex<(Instant,u32)>>}
@@ -90,9 +93,20 @@ async fn enroll(State(s):State<DeviceState>,Json(c):Json<Enrollment>)->Result<Re
     // the same transaction; failure rolls consumption back.
     let owner=sqlx::query_scalar::<_,String>("DELETE FROM device_pairings WHERE code_digest=? AND expires_at>unixepoch() AND EXISTS (SELECT 1 FROM users WHERE id=device_pairings.owner_id AND role='admin' AND enabled=1) RETURNING owner_id")
         .bind(code_digest).fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
-    sqlx::query("INSERT INTO devices(id,owner_id,name,credential_digest) VALUES (?,?,?,?)")
-        .bind(&id).bind(owner).bind(name).bind(digest(&token,"ltdev_")?)
+    // The pairing DELETE acquired the SQLite write transaction. Check both
+    // quotas in the INSERT, including retained revoked rows. Bounded indexed
+    // lookups need not count the entire owner inventory.
+    let inserted=sqlx::query("INSERT INTO devices(id,owner_id,name,credential_digest) SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM devices WHERE owner_id=? AND enabled=1 LIMIT 1 OFFSET ?) AND NOT EXISTS (SELECT 1 FROM devices WHERE owner_id=? LIMIT 1 OFFSET ?)")
+        .bind(&id).bind(&owner).bind(name).bind(digest(&token,"ltdev_")?)
+        .bind(&owner).bind(ACTIVE_DEVICE_LIMIT-1)
+        .bind(&owner).bind(TOTAL_DEVICE_LIMIT-1)
         .execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    if inserted.rows_affected()!=1{
+        // Do not consume the pairing or emit a successful device audit on
+        // quota failure. Retry after capacity is freed, before code expiry.
+        tx.rollback().await.map_err(|_|INTERNAL)?;
+        return Err(QUOTA)
+    }
     tx.commit().await.map_err(|_|INTERNAL)?;
     Ok(auth::uncached((StatusCode::CREATED,Json(Enrolled{id,device_token:token}))))
 }

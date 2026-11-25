@@ -186,6 +186,15 @@ REQUIRED = {
 # V0.5 retains the entire V0.4 management gate and adds its own report.
 REQUIRED["management-v05"] = {
     **REQUIRED["management"],
+    "auth.json": [
+        *REQUIRED["management"]["auth.json"],
+        "unsupported_stored_argon2_parameters_rejected",
+    ],
+    "devices.json": [
+        *REQUIRED["management"]["devices.json"],
+        "active_device_quota_transaction_and_pairing_retry",
+        "retained_device_quota_concurrent_and_owner_isolated",
+    ],
     "protection.json": [
         "real_request_bounds_and_response_headers",
         "real_concurrent_requests_rejected_without_queue",
@@ -255,7 +264,7 @@ class EvidenceGateTests(unittest.TestCase):
                 (root / filename).write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
             self.assertFalse(validate("management", root)[1])
             self.assertTrue(validate("management-v05", root)[1])
-            for name in ("protection.json", "transport.json"):
+            for name in ("auth.json", "devices.json", "protection.json", "transport.json"):
                 filename = root / name
                 keys = REQUIRED["management-v05"][name]
                 filename.write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")

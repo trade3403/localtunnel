@@ -36,7 +36,20 @@ fn hash(password:&str)->Result<String,Failure>{
     hasher().hash_password(password.as_bytes(),&salt).map(|h|h.to_string()).map_err(|_|INTERNAL)
 }
 fn verify(password:&str,encoded:&str)->bool{
-    PasswordHash::new(encoded).ok().is_some_and(|h|hasher().verify_password(password.as_bytes(),&h).is_ok())
+    // PasswordVerifier uses the PHC's embedded parameters, not only the
+    // constructor's defaults. Reject unsupported stored work factors before
+    // any expensive verification. A future rehash policy must be explicit.
+    if encoded.len()>256{return false}
+    let Ok(h)=PasswordHash::new(encoded) else{return false};
+    if h.algorithm.as_str()!="argon2id"||h.version!=Some(19)||
+        h.params.iter().count()!=3||
+        h.params.get_decimal("m")!=Some(19456)||
+        h.params.get_decimal("t")!=Some(2)||
+        h.params.get_decimal("p")!=Some(1)||
+        h.salt.is_none()||h.hash.as_ref().map(|v|v.len())!=Some(32){
+        return false
+    }
+    hasher().verify_password(password.as_bytes(),&h).is_ok()
 }
 fn valid(c:&Credentials)->bool{
     (3..=64).contains(&c.username.len()) && c.username.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-') && (12..=256).contains(&c.password.len())
@@ -125,6 +138,16 @@ mod tests{
         assert!(verify("fixture-password",&a));
         assert!(!verify("wrong-password",&a));
         assert!(!verify("fixture-password","malformed"));
+        for invalid in [
+            a.replace("m=19456","m=1048576"),
+            a.replace("t=2","t=1000"),
+            a.replace("p=1","p=64"),
+            a.replace("argon2id","argon2i"),
+            a.replace("v=19","v=16"),
+            a.replace("m=19456","m=8"),
+        ]{
+            assert!(!verify("fixture-password",&invalid));
+        }
     }
     #[test]
     fn strict_bearer(){
