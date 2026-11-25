@@ -30,16 +30,27 @@ const selectedMapping = ref<Mapping|null>(null)
 const runtime = ref<Runtime|null>(null)
 type TrafficObservation={request_id:string;mapping_revision:number;requests:number;request_bytes:number;response_bytes:number;sampled_at:number;sampling_state:string}
 const traffic=ref<TrafficObservation[]>([])
+type AuditEvent={seq:number;event:string;resource_id:string;revision:number|null;request_id:string|null;state:string|null;occurred_at:number}
+const auditEvents=ref<AuditEvent[]>([])
+const auditBefore=ref<number|null>(null)
+async function loadAudit(append=false){
+  if(append&&auditBefore.value===null)return
+  const result=await get<{events:AuditEvent[];next_before:number|null}>('/audit'+(append?'?before='+auditBefore.value:''))
+  auditEvents.value=append?[...auditEvents.value,...result.events]:result.events
+  auditBefore.value=result.next_before
+}
+const auditLabels:Record<string,string>={'session.created':'会话创建','session.replaced':'会话替换','session.removed':'会话移除','pairing.issued':'配对码签发','pairing.replaced':'配对码替换','device.created':'设备创建','device.authorization_changed':'设备授权变更','domain.created':'域名创建','domain.proof_changed':'域名证明变更','domain.deleted':'域名删除','mapping.created':'映射创建','mapping.updated':'映射更新','mapping.deleted':'映射删除','runtime.transition':'执行状态变更'}
 async function readTraffic(id:string){
   traffic.value=(await get<{observations:TrafficObservation[]}>('/mappings/'+id+'/traffic')).observations
 }
 const deviceStatus = ref<Record<string,unknown>|null>(null)
 const create = reactive({device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
-const nav = [{key:'dashboard',label:'仪表盘'},{key:'devices',label:'设备管理'},{key:'mappings',label:'映射管理'},{key:'domains',label:'域名管理'},{key:'nodes',label:'节点管理'}]
+const nav = [{key:'dashboard',label:'仪表盘'},{key:'devices',label:'设备管理'},{key:'mappings',label:'映射管理'},{key:'domains',label:'域名管理'},{key:'nodes',label:'节点管理'},{key:'audit',label:'操作审计'}]
 const title = computed(() => nav.find(n=>n.key===page.value)?.label)
 const labels:Record<string,string> = {queued:'等待执行器',starting:'启动中',running:'已应用（执行器报告）',stopping:'停止中',stopped:'已停止',failed_or_unknown:'失败或未知'}
 function clearPair(){pairing.value='';if(pairTimer) clearTimeout(pairTimer)}
 function reset(){
+  auditEvents.value=[];auditBefore.value=null
   token.value='';user.value='';password.value='';devices.value=[];nodes.value=[];domains.value=[];mappings.value=[];
   selectedMapping.value=null;runtime.value=null;traffic.value=[];deviceStatus.value=null;clearPair();notice.value='';page.value='dashboard'
   Object.assign(create,{device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
@@ -57,6 +68,7 @@ async function run(fn:()=>Promise<void>){
 async function get<T>(path:string){return api<T>(path,token.value)}
 async function send<T>(path:string,method:string,body?:unknown){return api<T>(path,token.value,method,body)}
 async function refresh(){
+  if(page.value==='audit'){await loadAudit();return}
   const [d,n,h,m]=await Promise.all([get<Device[]>('/devices'),get<Node[]>('/nodes'),get<Domain[]>('/domains'),get<Mapping[]>('/mappings')])
   devices.value=d;nodes.value=n;domains.value=h;mappings.value=m
   more.devices=d.length===100;more.nodes=n.length===100;more.domains=h.length===100;more.mappings=m.length===100
@@ -84,7 +96,7 @@ async function login(){await run(async()=>{
   try{user.value=(await get<{username:string}>('/auth/me')).username;await refresh()}catch(e){reset();throw e}
 })}
 async function logout(){await run(async()=>{try{await send('/auth/logout','POST')}finally{reset()}})}
-function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value=''}
+function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value='';auditEvents.value=[];auditBefore.value=null;if(key==='audit')void run(()=>loadAudit())}
 async function issue(){await run(async()=>{clearPair();const p=await send<{pairing_code:string;expires_in:number}>('/devices/pairing-code','POST');pairing.value=p.pairing_code;pairTimer=setTimeout(clearPair,p.expires_in*1000)})}
 async function revoke(d:Device){await run(async()=>{await send('/devices/'+d.id+'/revoke','POST');await refresh();deviceStatus.value=null;notice.value='设备凭据已吊销'})}
 async function inspectDevice(d:Device){await run(async()=>{deviceStatus.value=await get('/devices/'+d.id+'/status')})}
@@ -182,6 +194,20 @@ onBeforeUnmount(clearPair)
             <a-table-column title="TXT 证明"><template #default="{record}"><div class="wrap-code">{{record.txt_name}}<br>{{record.txt_value||'请轮换挑战'}}</div></template></a-table-column>
             <a-table-column title="操作"><template #default="{record}"><a-space><a-button size="small" :disabled="busy" @click="verifyDomain(record)">验证</a-button><a-popconfirm title="轮换会使旧验证失效，继续？" @confirm="rotate(record)"><a-button size="small" :disabled="busy">轮换</a-button></a-popconfirm><a-popconfirm ok-text="确认删除" cancel-text="取消" title="删除该域名？存在映射引用时服务端会拒绝。" @confirm="removeDomain(record)"><a-button danger size="small" aria-label="删除域名" :disabled="busy">删除</a-button></a-popconfirm></a-space></template></a-table-column>
           </a-table><div class="cursor-footer"><span data-testid="domains-count">已加载 {{domains.length}} 条</span><a-button v-if="more.domains" :disabled="busy" @click="loadMore('domains')" data-testid="domains-more">加载更多</a-button></div></a-card>
+        </template>
+        <template v-if="page==='audit'">
+          <a-card title="所属资源的已提交状态变更">
+            <p class="muted">记录会话、配对、设备、域名、映射及运行状态变更；不是全部访问、失败尝试或操作者身份审计。不记录密码、令牌、请求正文。</p>
+            <a-table data-testid="audit-table" :data-source="auditEvents" row-key="seq" size="small" :pagination="{pageSize:10}" :scroll="{x:800}">
+              <a-table-column title="时间"><template #default="{record}">{{time(record.occurred_at)}}</template></a-table-column>
+              <a-table-column title="事件"><template #default="{record}">{{auditLabels[record.event]||record.event}}</template></a-table-column>
+              <a-table-column title="资源 ID" data-index="resource_id"/>
+              <a-table-column title="版本" data-index="revision"/>
+              <a-table-column title="状态" data-index="state"/>
+              <a-table-column title="请求 ID" data-index="request_id"/>
+            </a-table>
+            <div class="cursor-footer"><span>已加载 {{auditEvents.length}} 条</span><a-button v-if="auditBefore!==null" :disabled="busy" @click="run(()=>loadAudit(true))">加载更多</a-button></div>
+          </a-card>
         </template>
         <template v-if="page==='mappings'">
           <a-card title="新建映射草稿"><p class="muted">设备、节点与域名选择来自已加载列表，可在对应页面加载更多。</p><form class="mapping-form" @submit.prevent="addMapping">

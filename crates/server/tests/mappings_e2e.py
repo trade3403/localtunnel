@@ -165,6 +165,31 @@ try:
             expect(create(dict(spec,bind_port=25000)),409)
             assert snapshot()==before
             report["restart_delete_and_mapping_limit"]=True
+            # Audit the real committed operations, not attempted requests.
+            expect(call(base,"audit"),401)
+            expect(call(base,"audit",token=token),401)
+            expect(call(base,"audit?before=0",token=admin),400)
+            a_log=expect(call(base,"audit",token=admin),200)
+            assert a_log["scope"]=="committed_owner_state_changes"
+            mine=[e for e in a_log["events"] if e["resource_id"]==mid]
+            assert [(e["event"],e["revision"]) for e in mine]==[
+                ("mapping.deleted",4),("mapping.updated",4),("mapping.updated",3),("mapping.updated",2),("mapping.created",1)]
+            other_log=expect(call(base,"audit",token=other),200)
+            assert not any(e["resource_id"] in (mid,aid,web["id"]) for e in other_log["events"])
+            assert all(set(e)=={"seq","event","resource_id","revision","request_id","state","occurred_at"} for e in a_log["events"])
+            assert token not in json.dumps(a_log) and admin not in json.dumps(a_log)
+            # Controlled SQLite fixtures only for cursor boundary/retention.
+            with sqlite3.connect(db_path) as db:
+                db.executemany("INSERT INTO management_audit(owner_id,event,resource_id,occurred_at) VALUES (?,'fixture.old','fixture',unixepoch()-8000000)",[(owner,)]*110)
+            first=expect(call(base,"audit",token=admin),200)
+            second=expect(call(base,"audit?before="+str(first["next_before"]),token=admin),200)
+            assert len(first["events"])==100 and second["events"]
+            assert min(e["seq"] for e in first["events"])>max(e["seq"] for e in second["events"])
+            assert subprocess.run([exe,"--prune-history",str(root)],capture_output=True,timeout=20).returncode==0
+            remaining=expect(call(base,"audit",token=admin),200)
+            assert not any(e["event"]=="fixture.old" for e in remaining["events"])
+            assert any(e["resource_id"]==mid and e["event"]=="mapping.deleted" for e in remaining["events"])
+            report["real_committed_audit_owner_cursor_and_local_retention"]=True
         finally:
             stop(p)
 finally:

@@ -6,6 +6,7 @@ mod domains;
 mod preview;
 mod runtime;
 mod traffic;
+mod audit;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -20,10 +21,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(11) => (StatusCode::OK, "ready"),
+        Ok(12) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -71,11 +72,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let resident = args.first().is_some_and(|a| a=="--runtime-resident");
     let tls_resident = args.first().is_some_and(|a| a=="--runtime-tls-resident");
     let recover = args.first().is_some_and(|a| a=="--recover-runtime");
-    let expected = if recover {4} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
+    let prune_history = args.first().is_some_and(|a| a=="--prune-history");
+    let expected = if prune_history {2} else if recover {4} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id>".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir>".into());
     }
-    let operator = init || add_node || set_node || export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover;
+    let operator = init || add_node || set_node || export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
@@ -101,6 +103,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if set_node {
         let enabled=args[3].to_str().ok_or("invalid node state")?.parse::<bool>()?;
         nodes::set_enabled(&pool,args[2].to_str().ok_or("invalid node id")?,enabled).await.map_err(|_|"node state change refused")?;
+        return Ok(());
+    }
+    if prune_history{
+        audit::prune(&pool).await?;
         return Ok(());
     }
     if recover{
@@ -147,6 +153,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .merge(nodes::routes(pool.clone()))
         .merge(runtime::routes(pool.clone()))
         .merge(traffic::routes(pool.clone()))
+        .merge(audit::routes(pool.clone()))
         .merge(domains::routes(pool).map_err(|_|"invalid DNS resolver configuration")?);
     // No configurable public bind or unauthenticated data API in this increment.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;

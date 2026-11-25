@@ -268,3 +268,7 @@
 ## 2026-11-25：异常恢复验收、真实网关流量观测
 - HEAD 869a037f445fdd2b84c6dfb13da18d46ae537b5c 全部6个CI通过：Management #41 https://github.com/trade3403/localtunnel/actions/runs/45636601598 、#42 https://github.com/trade3403/localtunnel/actions/runs/45636615751 、Windows #120、Gateway #114、Runner #236/#237。#42 job 139283676297 真实主进程SIGKILL/显式恢复、全部旧回归及双锁门禁成功，报告 https://github.com/trade3403/localtunnel/actions/runs/45636615751/artifacts/15033087787 。
 - 受检单路由Nginx按revision写数字-only HTTP请求长度/响应发送字节/状态；运行worker有界增量读取、按request_id持久化（迁移9），所属管理员最近50次观测API及后台详情，真实HTTP请求/隔离/终止快照、Chromium流量展示测试。不是加密链路字节或计费；含业务探测、异常仅保留上次采样、停止partial，文件4MiB采样上限非磁盘上限，无轮转保留期、跨主机/TCP/UDP或完整报表。无新依赖，待CI；下一步审计/日志及流量保留策略。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-25：流量观测验收、操作审计与历史维护
+- HEAD 48992420bc099325fbabd7a75ed8438340a3aa81 六个CI全绿：Management #43 https://github.com/trade3403/localtunnel/actions/runs/45638825561 、#44 https://github.com/trade3403/localtunnel/actions/runs/45638840885 、Windows #121、Gateway #115、Runner #238/#239。#44 job 139291533460 实际HTTP流量/权限隔离、Chromium展示、全部旧回归及双锁门禁成功，报告 https://github.com/trade3403/localtunnel/actions/runs/45638840885/artifacts/15034348146 。
+- 新增迁移10同事务资源状态审计触发器、所属管理员递减游标API、中文后台操作审计、可信本地显式90日历史清理（保留当前请求流量），实际CRUD/隔离/保留/游标及浏览器运行状态转换用例。非完整请求/操作者/失败登录审计，无敏感凭据、无自动调度/防篡改/文件轮转。新功能待CI，无新依赖。下一步Windows客户端管理联动及未完成TLS专项/最终验收。未改main、未部署公网、未开启定时任务。

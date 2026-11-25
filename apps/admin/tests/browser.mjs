@@ -219,6 +219,18 @@ with sqlite3.connect(sys.argv[1]) as db:
   assert.equal((await probe(gatewayUrl))[0],421)
   assert.equal(await probe('http://127.0.0.1:'+mapping.bind_port+'/'),null)
   report.real_browser_start_stop_noise_gateway=true
+  stage='committed audit'
+  await menu('操作审计').click()
+  await page.getByTestId('audit-table').getByText('执行状态变更',{exact:true}).first().waitFor()
+  await page.getByTestId('audit-table').getByRole('cell',{name:'stopped',exact:true}).first().waitFor()
+  const audit=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/audit',{headers:{Authorization:adminBearer}})
+  assert.equal(audit.status,200)
+  const history=await audit.json()
+  const transitions=history.events.filter(x=>x.request_id===requestId).map(x=>x.state)
+  assert.deepEqual(transitions,['stopped','stopping','running','starting','queued'])
+  assert.ok(history.events.some(x=>x.event==='mapping.deleted'))
+  assert.ok(history.events.some(x=>x.event==='domain.deleted'))
+  report.real_committed_audit_visible_in_browser=true
   stage='logout'
   await page.getByRole('button',{name:'退出登录'}).click()
   await page.getByRole('heading',{name:'管理后台登录'}).waitFor()
