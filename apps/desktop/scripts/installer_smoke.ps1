@@ -26,6 +26,12 @@ try {
     if (!$engineProcess.WaitForExit(15000)) { $engineProcess.Kill(); throw "Installed engine version check timed out" }
     if ($engineProcess.ExitCode -ne 0) { throw "Installed engine failed to run" }
     $report.bundled_engine_runs = $true
+    # Use the installed executable and bundled engine. The dedicated script
+    # starts a disposable fixture and launches its own test-only WebView2.
+    $guiEvidence = Join-Path (Split-Path -Parent $Evidence) "installed-gui-e2e.json"
+    & node (Join-Path $PSScriptRoot "installed_gui_e2e.mjs") $exe $guiEvidence
+    if ($LASTEXITCODE -ne 0) { throw "Installed GUI E2E failed" }
+    $report.installed_gui_e2e = $true
     $app = Start-Process -FilePath $exe -PassThru
     $deadline = (Get-Date).AddSeconds(40)
     do {
