@@ -183,6 +183,17 @@ REQUIRED = {
     }
 }
 
+# V0.5 retains the entire V0.4 management gate and adds its own report.
+REQUIRED["management-v05"] = {
+    **REQUIRED["management"],
+    "protection.json": [
+        "real_request_bounds_and_response_headers",
+        "real_concurrent_requests_rejected_without_queue",
+        "real_partial_body_deadline_and_capacity_recovery",
+        "real_global_rate_limit_and_refill",
+    ],
+}
+
 def unique_object(pairs):
     obj = {}
     for key, value in pairs:
@@ -230,6 +241,22 @@ class EvidenceGateTests(unittest.TestCase):
             self.assertTrue(validate("management", root)[1])
             first.unlink()
             self.assertTrue(validate("management", root)[1])
+
+    def test_v05_requires_additional_real_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename, keys in REQUIRED["management"].items():
+                (root / filename).write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
+            self.assertFalse(validate("management", root)[1])
+            self.assertTrue(validate("management-v05", root)[1])
+            filename = root / "protection.json"
+            keys = REQUIRED["management-v05"][filename.name]
+            filename.write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
+            total, errors = validate("management-v05", root)
+            self.assertEqual(total, sum(map(len, REQUIRED["management-v05"].values())))
+            self.assertFalse(errors)
+            filename.write_text(json.dumps(dict.fromkeys(keys, False)), encoding="utf-8")
+            self.assertTrue(validate("management-v05", root)[1])
 
 def main():
     parser = argparse.ArgumentParser()

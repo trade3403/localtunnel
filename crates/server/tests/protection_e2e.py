@@ -1,4 +1,5 @@
 """Real loopback API admission, timeout and recovery; no external target."""
+from contextlib import closing
 import http.client
 import json
 from pathlib import Path
@@ -14,7 +15,7 @@ evidence = Path(sys.argv[2])
 report = {}
 
 def request(port, path="/healthz", headers=None, method="GET", body=None):
-    with http.client.HTTPConnection("127.0.0.1", port, timeout=5) as conn:
+    with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as conn:
         conn.request(method, path, body=body, headers=headers or {})
         response = conn.getresponse()
         return response.status, response.read(), dict(response.getheaders())
@@ -76,7 +77,8 @@ try:
             # All bodies deliberately incomplete, so they hold application
             # permits rather than executing authentication or mutating SQL.
             started = time.monotonic()
-            sockets = [slow(port) for _ in range(32)]
+            for _ in range(32):
+                sockets.append(slow(port))
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
                 result = request(port, "/readyz")
@@ -108,7 +110,7 @@ try:
             # The application budget must reject burst traffic, not merely
             # report a configured number. Auth-specific budgets are separate.
             limited = False
-            with http.client.HTTPConnection("127.0.0.1",port,timeout=5) as conn:
+            with closing(http.client.HTTPConnection("127.0.0.1",port,timeout=5)) as conn:
                 end = time.monotonic()+10
                 for _ in range(3000):
                     conn.request("GET","/healthz")

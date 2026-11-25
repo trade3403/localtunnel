@@ -305,3 +305,7 @@
 ## 2026-11-26：V0.4 最终验收全绿，V0.5 资源保护第一批
 - V0.4 HEAD d6440ab87c7f9b782ef32a3689d32719935124d0 六CI全部成功：Management #59 https://github.com/trade3403/localtunnel/actions/runs/45664984037 、#60 https://github.com/trade3403/localtunnel/actions/runs/45664993154 ，Windows #129 https://github.com/trade3403/localtunnel/actions/runs/45664993096 ，Gateway #123、Runner #255/#256。管理job 139384634049 与桌面job 139384634216 的54/88项证据门禁均成功；报告 https://github.com/trade3403/localtunnel/actions/runs/45664993154/artifacts/15045534976 、https://github.com/trade3403/localtunnel/actions/runs/45664993096/artifacts/15047221649 ，未签名安装包 https://github.com/trade3403/localtunnel/actions/runs/45664993096/artifacts/15048435188 。
 - 新叠加分支 feat/v0.5-security-stability，第一批 Axum 全局固定内存令牌桶120/s、突发240、32并发无队列、12秒处理期限、URI/header/声明body边界、统一安全响应头；原业务限流不变。真实慢body/并发/期限/突发429/恢复测试及确定性单测，显式启用已锁定Tokio time feature，无新版本/依赖。仅应用层，不保证连接级/全局公平/公网DoS或超时写入撤销。待CI，下一步连接级保护及配额。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 资源保护测试修复
+- HEAD 80bc16c6533cb4534a0fa1cb35ee911d250b7939 正式分支 push 两项结束：Runner #257 https://github.com/trade3403/localtunnel/actions/runs/45667046953 成功，Management #61 https://github.com/trade3403/localtunnel/actions/runs/45667046956 失败。job 139391901278 实际 Rust 编译/单测和基础 HTTP/SQLite 成功；protection_e2e.py:17 TypeError HTTPConnection object does not support context manager protocol，业务断言尚未执行。
+- 修复两处 HTTPConnection 生命周期为 contextlib.closing，逐个保存慢连接确保失败清理；管理证据门禁在旧54项基础上新增4项及负例测试。产品限制、依赖及原验收断言不改。恢复全量 CI，建立叠加草稿PR；新版本待CI，不提前开发连接级保护。未改main、未部署公网、未开启定时任务。
