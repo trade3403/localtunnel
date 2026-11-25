@@ -2,7 +2,7 @@
 //! exposes private keys via HTTP. The operator owns all participating processes.
 use crate::auth;
 use sqlx::SqlitePool;
-use std::{ffi::OsString,fs,path::{Path,PathBuf},process::{Command,Stdio}};
+use std::{ffi::OsString,fs,path::{Path,PathBuf},process::{Child,Command,Stdio},time::{Duration,Instant}};
 
 type Result<T> = std::result::Result<T,&'static str>;
 #[derive(sqlx::FromRow)]
@@ -120,5 +120,120 @@ pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,
     let outcome=if result.is_ok(){"succeeded"}else{"failed_or_unknown"};
     sqlx::query("UPDATE preview_attempts SET outcome=?,finished_at=unixepoch() WHERE id=? AND outcome='pending'")
         .bind(outcome).bind(attempt).execute(pool).await.map_err(|_|"preview outcome unknown; inspect runtime and pending record")?;
+    result
+}
+
+
+// This foreground supervisor owns only children it actually spawned.
+// No PID file, arbitrary PID kill, shell command or HTTP execution endpoint.
+struct TunnelChildren(Vec<Child>);
+impl TunnelChildren {
+    fn start(&mut self,engine:&Path,config:&Path)->Result<()>{
+        let child=Command::new(engine).arg(config).env_clear().env("PATH","/usr/bin:/bin")
+            .env("RUST_LOG","warn").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().map_err(|_|"engine launch failed")?;
+        self.0.push(child);
+        Ok(())
+    }
+    fn healthy(&mut self)->bool{
+        self.0.len()==2&&self.0.iter_mut().all(|p|matches!(p.try_wait(),Ok(None)))
+    }
+    fn stop(&mut self)->Result<()>{
+        let mut ok=true;
+        // Stop the relay first to close the ingress and then the agent.
+        for child in &mut self.0{
+            match child.try_wait(){
+                Ok(Some(_))=>{},
+                Ok(None)=>{
+                    if child.kill().is_err() {
+                        if !matches!(child.try_wait(),Ok(Some(_))){ok=false;continue}
+                    }
+                    if child.wait().is_err(){ok=false}
+                },
+                Err(_)=>{ok=false}
+            }
+        }
+        if ok{Ok(())}else{Err("one or more tunnel children could not be confirmed stopped")}
+    }
+}
+impl Drop for TunnelChildren {fn drop(&mut self){let _=self.stop();}}
+struct PreviewLock(PathBuf);
+impl Drop for PreviewLock {fn drop(&mut self){let _=fs::remove_file(&self.0);}}
+
+fn read_expected(root:&Path,name:&str)->Result<Vec<u8>>{
+    use std::io::Read;
+    if !safe_name(name){return Err("invalid expected body filename")}
+    let path=root.join(name);
+    let m=fs::symlink_metadata(&path).map_err(|_|"expected body unavailable")?;
+    if !m.file_type().is_file()||!(1..=65536).contains(&m.len()){return Err("invalid expected body file")}
+    #[cfg(unix)]{
+        use std::os::unix::fs::PermissionsExt;
+        if m.permissions().mode()&0o077!=0{return Err("expected body must be private")}
+    }
+    let mut data=Vec::new();
+    fs::File::open(path).map_err(|_|"expected body unavailable")?.take(65537)
+        .read_to_end(&mut data).map_err(|_|"expected body read failed")?;
+    if data.is_empty()||data.len()>65536{return Err("invalid expected body length")}
+    Ok(data)
+}
+fn relay_probe(m:&Mapping,expected:&[u8])->bool{
+    let url=format!("http://127.0.0.1:{}/",m.bind_port);
+    let host=format!("Host: {}",m.hostname);
+    let out=Command::new("/usr/bin/curl").env_clear().env("PATH","/usr/bin:/bin")
+        .args(["--disable","--silent","--fail","--noproxy","*","--connect-timeout","1","--max-time","2","--max-filesize","65536","--header",&host,"--write-out","%{http_code}",&url])
+        .stdin(Stdio::null()).output();
+    out.is_ok_and(|o|o.status.success()&&o.stdout.len()==expected.len()+3&&o.stdout.ends_with(b"200")&&&o.stdout[..expected.len()]==expected)
+}
+
+/// Opt-in Linux foreground preview. The trusted operator must already have
+/// started an exclusive, empty managed HTTP gateway; never use a shared prefix.
+pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle)||!safe_name(prefix)||bundle==prefix{return Err("invalid supervisor request")}
+    let m=checked(pool,id,revision).await?;
+    if relay_port==listen||i64::from(listen)==m.bind_port{return Err("conflicting preview port")}
+    port(listen)?;
+    private_dir(&root.join(prefix))?;
+    let expected=read_expected(root,expected_file)?;
+    let engine=PathBuf::from(std::env::var_os("LOCALTUNNEL_ENGINE").ok_or("set trusted engine path")?);
+    if !engine.is_absolute()||!engine.is_file(){return Err("invalid engine path")}
+    let engine=engine.canonicalize().map_err(|_|"invalid engine path")?;
+    // Exclusive among supervised operations. Manual operator commands still
+    // require external coordination; a stale lock is recovery evidence.
+    let lock=root.join(format!("supervisor-{prefix}.lock"));
+    let mut opts=fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
+    opts.open(&lock).map_err(|_|"supervisor lock exists or unavailable")?;
+    let _lock=PreviewLock(lock);
+    // Reset the exclusive gateway to empty and verify the revision first.
+    // This dedicated prefix must not serve other mappings.
+    gateway(pool,root,"clear",0,prefix,listen,"apply",None).await?;
+    export(pool,root,id,revision,relay_port,bundle).await?;
+    let mut children=TunnelChildren(Vec::new());
+    let result=async {
+        children.start(&engine,&root.join(bundle).join("server.toml"))?;
+        children.start(&engine,&root.join(bundle).join("client.toml"))?;
+        let deadline=Instant::now()+Duration::from_secs(30);
+        loop{
+            checked(pool,id,revision).await?;
+            if !children.healthy(){return Err("tunnel child exited")}
+            if relay_probe(&m,&expected){break}
+            if Instant::now()>=deadline{return Err("relay business probe timeout")}
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        gateway(pool,root,id,revision,prefix,listen,"apply-checked",Some(expected_file)).await?;
+        // Authorization is re-read after apply and every 500ms. Database
+        // errors also fail closed. DNS age is checked, not continuous DNS.
+        loop{
+            if checked(pool,id,revision).await.is_err(){return Ok(())}
+            if !children.healthy(){return Err("tunnel child exited")}
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }.await;
+    // Stop owned tunnel processes even if the gateway clear fails.
+    let stopped=children.stop();
+    let cleared=gateway(pool,root,"clear",0,prefix,listen,"apply",None).await;
+    stopped?;
+    cleared?;
     result
 }

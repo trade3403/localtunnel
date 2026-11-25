@@ -61,11 +61,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let set_node = args.first().is_some_and(|a| a=="--set-node-enabled");
     let export = args.first().is_some_and(|a| a=="--export-preview");
     let gateway = args.first().is_some_and(|a| a=="--preview-gateway");
-    let expected = if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
+    let supervise = args.first().is_some_and(|a| a=="--supervise-preview");
+    let expected = if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename]".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename>".into());
     }
-    let operator = init || add_node || set_node || export || gateway;
+    let operator = init || add_node || set_node || export || gateway || supervise;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
@@ -93,9 +94,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
         nodes::set_enabled(&pool,args[2].to_str().ok_or("invalid node id")?,enabled).await.map_err(|_|"node state change refused")?;
         return Ok(());
     }
-    if export || gateway {
+    if export || gateway || supervise {
         let arg=|i:usize|args[i].to_str().ok_or("invalid preview argument");
-        if export {
+        if supervise {
+            preview::supervise(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?,arg(6)?,arg(7)?.parse()?,arg(8)?).await?;
+        } else if export {
             preview::export(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?).await?;
         } else {
             preview::gateway(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?,arg(5)?.parse()?,arg(6)?,if args.len()==8{Some(arg(7)?)}else{None}).await?;

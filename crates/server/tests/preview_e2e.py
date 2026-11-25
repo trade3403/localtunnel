@@ -174,7 +174,7 @@ try:
             keys=subprocess.check_output([str(engine),"--genkey"],text=True,timeout=15)
             private=re.search(r"Private Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
             public=re.search(r"Public Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
-            env=dict(os.environ,LOCALTUNNEL_CORE_CLI=str(core),LOCALTUNNEL_SERVER_PRIVATE_KEY=private,LOCALTUNNEL_SERVER_PUBLIC_KEY=public)
+            env=dict(os.environ,LOCALTUNNEL_CORE_CLI=str(core),LOCALTUNNEL_SERVER_PRIVATE_KEY=private,LOCALTUNNEL_SERVER_PUBLIC_KEY=public,LOCALTUNNEL_ENGINE=str(engine))
             def operator(*args):
                 return subprocess.run([exe,args[0],str(root),*map(str,args[1:])],env=env,capture_output=True,timeout=40)
             assert subprocess.run([exe,"--init-admin",str(root)],input=json.dumps({"username":"operator","password":password}).encode(),capture_output=True,timeout=20).returncode==0
@@ -299,6 +299,45 @@ try:
                 assert db.execute("SELECT count(*) FROM preview_attempts WHERE finished_at IS NULL").fetchone()==(0,)
             report["actual_route_removal_no_false_activation"]=True
             report["persistent_attempt_outcomes_and_revoked_apply_denied"]=True
+            # Release the earlier manually owned processes before the
+            # foreground supervisor starts its own independent tunnel pair.
+            for proc in processes[:2]:
+                stop(proc)
+            processes=processes[2:]
+            p,base=launch(root)
+            supervisor=None
+            try:
+                expect(call(base,"mappings/"+mid+"?expected_revision=1","DELETE",admin),204)
+                device2=expect(enroll(base,issue(base,admin)),201)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                mapping2=expect(call(base,"mappings","POST",admin,{"device_id":device2["id"],"node_id":nid,"domain_id":domain["id"],"protocol":"http","local_port":fixture.server_port,"bind_port":bp}),201)
+                mid2=mapping2["id"]
+                supervisor=subprocess.Popen([exe,"--supervise-preview",str(root),mid2,"1",str(rp),"supervised_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                assert request(bp,"preview.example.test")== (200,body)
+                assert (root/"supervisor-gateway.lock").exists()
+                competing=operator("--supervise-preview",mid2,1,rp,"competing_bundle","gateway",gp,"expected_body")
+                assert competing.returncode!=0 and not (root/"competing_bundle").exists()
+                expect(call(base,"devices/"+device2["id"]+"/revoke","POST",admin),204)
+                assert supervisor.wait(timeout=40)==0,"supervisor did not cleanly stop revoked tunnel"
+                assert request(gp,"preview.example.test")[0]==421
+                assert request(bp,"preview.example.test") is None
+                assert not (root/"supervisor-gateway.lock").exists()
+                with sqlite3.connect(db_path) as db:
+                    assert db.execute("SELECT outcome FROM preview_attempts WHERE mapping_id=? AND operation='apply-checked'",(mid2,)).fetchall()==[("succeeded",)]
+                    assert db.execute("SELECT enabled FROM devices WHERE id=?",(device2["id"],)).fetchone()==(0,)
+                    assert db.execute("SELECT enabled FROM mappings WHERE id=?",(mid2,)).fetchone()==(0,)
+                report["actual_supervised_tunnel_revocation_and_gateway_clear"]=True
+            finally:
+                # Test failure cleanup: revoke before waiting so that the
+                # supervisor gets the opportunity to stop its own children.
+                if supervisor is not None and supervisor.poll() is None:
+                    try:
+                        call(base,"devices/"+device2["id"]+"/revoke","POST",admin)
+                        supervisor.wait(timeout=40)
+                    except (OSError,subprocess.TimeoutExpired):
+                        stop(supervisor)
+                stop(p)
         finally:
             for proc in reversed(processes):
                 stop(proc)
