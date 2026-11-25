@@ -534,6 +534,116 @@ try:
                 assert not (root/("tls_recovered-"+fresh)).exists()
                 marker.unlink()
                 report["real_https_restart_after_recovery_and_local_stop"]=True
+
+                # Boundary inventory fixtures are sparse local files only.
+                # Actual admission, TLS traffic, stop and recovery use the
+                # existing real API, supervisor, Noise and Nginx.
+                mib=1024*1024
+                def logs():
+                    return {p.name:p.stat().st_size for p in prefix.iterdir()
+                            if re.fullmatch(r"traffic-[0-9]+-[0-9]+\.log",p.name)}
+                baseline=logs()
+                assert 0<len(baseline)<31 and 0<sum(baseline.values())<mib
+                def fillers(count,size):
+                    paths=[]
+                    for i in range(count):
+                        p=prefix/("traffic-0-"+str(10000+i)+".log")
+                        with p.open("xb") as out:
+                            out.truncate(size)
+                        paths.append(p)
+                    return paths
+                def rejected_start(bundle):
+                    global supervisor
+                    expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                    supervisor=resident(bundle)
+                    ready()
+                    before=logs()
+                    failed=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)["request_id"]
+                    assert supervisor.wait(timeout=40)!=0
+                    wait_state("failed_or_unknown",failed)
+                    recovery_record(failed)
+                    assert not (root/(bundle+"-"+failed)).exists()
+                    closed_tunnel()
+                    empty_gateway()
+                    assert logs()==before,"admission changed retained log generations"
+                    assert operator("--recover-runtime","tls_gateway",failed).returncode==0
+                    wait_state("stopped",failed)
+                    return failed
+
+                # Exactly 32 existing logs is within the runtime cap, but
+                # cannot reserve a new generation. No tunnel may start.
+                fill=fillers(32-len(baseline),0)
+                assert len(logs())==32
+                rejected_start("tls_count_quota")
+                for p in fill:p.unlink()
+                assert logs()==baseline
+                report["real_https_log_count_reservation_rejected"]=True
+
+                # Seven individually valid 4MiB files plus the actual
+                # existing logs exceed the 28MiB startup reservation only.
+                fill=fillers(7,4*mib)
+                assert 28*mib<sum(logs().values())<32*mib
+                assert len(logs())<32
+                rejected_start("tls_size_quota")
+                for p in fill:p.unlink()
+                assert logs()==baseline
+                report["real_https_log_byte_reservation_rejected"]=True
+
+                # Admit a real generation just below the reserved budget;
+                # then grow several retained fixtures without exceeding the
+                # per-file cap. Only aggregate quota is violated.
+                fill=fillers(6,4*mib)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=resident("tls_total_quota")
+                ready()
+                rid=start_run()
+                first=logs()
+                new=set(first)-set(baseline)-{p.name for p in fill}
+                assert len(new)==1
+                first_name=new.pop()
+                assert first[first_name]>0
+                assert all(first[k]==v for k,v in baseline.items())
+                added=[]
+                for i in range(3):
+                    p=prefix/("traffic-0-"+str(20000+i)+".log")
+                    with p.open("xb") as out:
+                        out.truncate(4*mib)
+                    added.append(p)
+                exceeded=logs()
+                assert sum(exceeded.values())>32*mib and max(exceeded.values())<=4*mib
+                assert len(exceeded)<=32
+                assert supervisor.wait(timeout=40)!=0
+                wait_state("failed_or_unknown",rid)
+                closed_tunnel()
+                empty_gateway()
+                assert (root/("tls_total_quota-"+rid)).is_dir()
+                assert set(exceeded)<=set(logs())
+                assert operator("--recover-runtime","tls_gateway",rid).returncode==0
+                wait_state("stopped",rid)
+                for p in fill+added:p.unlink()
+                report["real_https_aggregate_log_quota_stops_and_recovers"]=True
+
+                # Re-admission after removing only test-created fixtures
+                # must produce a new numeric log, not reuse old generation.
+                retained=logs()
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=resident("tls_quota_recovered")
+                ready()
+                next_id=start_run()
+                assert next_id!=rid
+                current=logs()
+                generated=set(current)-set(retained)
+                assert len(generated)==1 and first_name not in generated
+                assert current[next(iter(generated))]>0
+                assert all(current[k]==v for k,v in retained.items())
+                marker.touch(mode=0o600)
+                assert supervisor.wait(timeout=40)==0
+                wait_state("stopped",next_id)
+                closed_tunnel()
+                empty_gateway()
+                marker.unlink()
+                assert (root/("tls_total_quota-"+rid)).is_dir()
+                report["real_https_log_generation_isolation_after_quota_recovery"]=True
             finally:
                 if supervisor is not None and supervisor.poll() is None:
                     try:

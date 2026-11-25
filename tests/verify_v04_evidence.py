@@ -205,6 +205,13 @@ REQUIRED["management-v05"] = {
         "real_gateway_log_budget_stops_and_preserves_evidence",
         "offline_gateway_log_retention_preserves_recent_and_unrelated",
     ],
+    "tls-preview.json": [
+        *REQUIRED["management"]["tls-preview.json"],
+        "real_https_log_count_reservation_rejected",
+        "real_https_log_byte_reservation_rejected",
+        "real_https_aggregate_log_quota_stops_and_recovers",
+        "real_https_log_generation_isolation_after_quota_recovery",
+    ],
     "protection.json": [
         "real_request_bounds_and_response_headers",
         "real_concurrent_requests_rejected_without_queue",
@@ -275,7 +282,7 @@ class EvidenceGateTests(unittest.TestCase):
                 (root / filename).write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
             self.assertFalse(validate("management", root)[1])
             self.assertTrue(validate("management-v05", root)[1])
-            for name in ("http.json", "auth.json", "devices.json", "preview.json", "protection.json", "transport.json"):
+            for name in ("http.json", "auth.json", "devices.json", "preview.json", "tls-preview.json", "protection.json", "transport.json"):
                 filename = root / name
                 keys = REQUIRED["management-v05"][name]
                 filename.write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
