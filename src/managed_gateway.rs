@@ -10,6 +10,8 @@ mod linux {
     const HOST: &str = "localtunnel-probe.invalid";
     const TLS_MARKER: &str = "# localtunnel-managed-https ";
     const PROBE_PATH: &str = "/.localtunnel-revision";
+    // curl >= 7.84 uses %header{name}, not a %{header:name} variable.
+    const BUSINESS_WRITE_OUT: &str = "\n%{http_code} %header{x-localtunnel-revision}";
 
     pub struct TlsSettings<'a> {
         pub probe: SocketAddr,
@@ -155,6 +157,9 @@ mod linux {
         while Instant::now() < end {
             if let Ok(out) = invoke() {
                 if out.status.success() {
+                    // curl may return 0 even for an unknown write-out
+                    // variable. A diagnostic is not a verified response.
+                    if !out.stderr.is_empty() { return false; }
                     match classify_business(&out.stdout, revision, expected) {
                         Business::Accept => return true,
                         Business::Reject => return false,
@@ -170,6 +175,51 @@ mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        // Exercise the actual CLI format, not only synthetic parser bytes.
+        // All network activity is a disposable local TCP fixture.
+        #[test]
+        fn curl_write_out_reports_real_revision_header() {
+            use std::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let fixture = thread::spawn(move || -> std::io::Result<()> {
+                let until = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                            stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+                            let mut request = Vec::new();
+                            let mut chunk = [0u8; 1024];
+                            while !request.ends_with(b"\r\n\r\n") {
+                                let n = stream.read(&mut chunk)?;
+                                if n == 0 || request.len() + n > 8192 {
+                                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "incomplete fixture request"));
+                                }
+                                request.extend_from_slice(&chunk[..n]);
+                            }
+                            stream.write_all(b"HTTP/1.1 200 OK\r\nX-LocalTunnel-Revision: 10-20\r\nContent-Length: 9\r\nConnection: close\r\n\r\nreal\nbody")?;
+                            return Ok(());
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < until => {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            });
+            let url = format!("http://{addr}/");
+            let out = Command::new("/usr/bin/curl").args([
+                "--disable","--silent","--noproxy","*","--connect-timeout","2","--max-time","4",
+                "--max-filesize","65536","--write-out",BUSINESS_WRITE_OUT,&url
+            ]).output().unwrap();
+            fixture.join().unwrap().unwrap();
+            assert!(out.status.success() && out.stderr.is_empty());
+            assert_eq!(out.stdout, b"real\nbody\n200 10-20");
+            assert_eq!(classify_business(&out.stdout,"10-20",b"real\nbody"),Business::Accept);
+        }
+
         #[test]
         fn business_requires_same_revision_and_exact_status_body() {
             let expected = b"real\nbody";
@@ -257,7 +307,7 @@ mod linux {
             // disabled user curl configuration, bounded time and response.
             let url=format!("http://{bind}/");
             let header=format!("Host: {host}");
-            checked_business(revision, expected, || Command::new("/usr/bin/curl").args(["--disable","--silent","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--header",&header,"--write-out","\n%{http_code} %{header:x-localtunnel-revision}",&url]).output())
+            checked_business(revision, expected, || Command::new("/usr/bin/curl").args(["--disable","--silent","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--header",&header,"--write-out",BUSINESS_WRITE_OUT,&url]).output())
         })
     }
     pub fn apply_checked_tls(prefix: &Path, bind: SocketAddr, route: Route<'_>, tls: &TlsSettings<'_>, expected: &[u8]) -> Result<(), String> {
@@ -268,7 +318,7 @@ mod linux {
         apply_mode(prefix, bind, &[route], Some(tls), true, |revision| {
             let resolve=format!("{host}:{}:127.0.0.1",bind.port());
             let url=format!("https://{host}:{}/",bind.port());
-            checked_business(revision, expected, || Command::new("/usr/bin/curl").args(["--disable","--silent","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--cacert",tls.ca,"--resolve",&resolve,"--write-out","\n%{http_code} %{header:x-localtunnel-revision}",&url]).output())
+            checked_business(revision, expected, || Command::new("/usr/bin/curl").args(["--disable","--silent","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--cacert",tls.ca,"--resolve",&resolve,"--write-out",BUSINESS_WRITE_OUT,&url]).output())
         })
     }
     pub fn init_tls(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: &TlsSettings<'_>) -> Result<(), String> {
