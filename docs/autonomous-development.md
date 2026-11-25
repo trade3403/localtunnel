@@ -66,3 +66,8 @@
 - HEAD ac9cb8dd6f7041d716a61183f22167d094402552，CI #51 https://github.com/trade3403/localtunnel/actions/runs/45525710159 三个工作流通过；14/14 单测、1/1 桌面真实生命周期（0.89s 测试耗时）、独立 SCM LocalService Noise HTTP 隧道/停止后断开/运行时清理/删除、锁定构建及安装卸载通过，EXE 3.15 MiB。预览包 https://github.com/trade3403/localtunnel/actions/runs/45525710159/artifacts/14982322952 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45525710159/artifacts/14983360432 。
 - 新增 Rust --service-seal-profile <preview-name> 入口，仅在约定 ProgramData 部署目录从 stdin 读取有界 JSON，复用核心验证、禁止外部引擎、DPAPI LocalMachine、原子无覆盖写入 service-profile.bin；桌面 DPAPI 仍为 CurrentUser。部署根目录拒绝重解析点；仍依赖管理员预先配置严格 ACL，不是完整 ACL 自检或生产安装工具。无明文文件/命令行 token，不自动注册服务，不启用自启。配置轮换需后续单独实现。
 - CI 改用实际 Rust 配置入口代替 Python 测试专用 DPAPI 加密；加入错误配置拒绝、已存在密文不覆盖、实际服务解密转发门禁，新增 Rust 单测；全部待新 CI 验收。下一步完成安全部署 ACL 验证、显式服务管理、自启、异常恢复及状态/流量；未修改 main，未涉及生产或付费 runner。
+
+
+## 2026-11-25：Rust 凭据配置验收、服务 ACL 自检
+- HEAD 6a652f4ce0cfc1080c21f832afbc0599ff11b71c，CI #53 https://github.com/trade3403/localtunnel/actions/runs/45528325145 全部通过，15/15 单测及 1/1 真实桌面隧道（0.87s 测试耗时）、Rust 服务密封配置、错误引擎拒绝、无覆盖及 SCM 真 HTTP 隧道、锁定构建、安装卸载通过。EXE 3.15 MiB；预览包 https://github.com/trade3403/localtunnel/actions/runs/45528325145/artifacts/14982944647 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45528325145/artifacts/14983623040 。核心 #70、Runner #148 通过。
+- 新增 Windows native service_acl.rs，以 GetNamedSecurityInfoW/GetAce/LookupAccountNameW 校验部署根目录、宿主 EXE、engine 目录/EXE、runtime 目录及启动时密文配置。仅允许管理员/SYSTEM 持有所有者和完全权限、对应服务 SID 仅 RX（runtime 允许 Modify），拒绝未知 ACE、额外身份、过度授权、缺失 ACL、重解析点；密封前及实际启动前均自检。CI 设置所有者为 Administrators，注入 Everyone RX，验证密封拒绝以及不安全密文文件导致启动失败，恢复严格 ACL 后验证真实转发。新代码待 CI。此检查是严格预览目录门禁，尚非完整 Windows 安全审计；不覆盖父目录/管理员篡改、并发 ACL 变更或所有异常残留路径。未自动注册/自启任何用户设备。下一步验收、正式显式服务部署管理及开机自启、恢复与状态流量。

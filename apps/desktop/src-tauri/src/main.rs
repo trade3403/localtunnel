@@ -7,6 +7,8 @@ mod engine_integrity;
 mod engine_job;
 #[cfg(windows)]
 mod service_host;
+#[cfg(windows)]
+mod service_acl;
 
 use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};

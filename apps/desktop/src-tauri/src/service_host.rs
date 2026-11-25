@@ -117,12 +117,14 @@ fn deployment_dir(name: &str) -> Result<std::path::PathBuf, String> {
 
 pub fn seal_profile_from_stdin(name: &str) -> Result<(), String> {
     let dir = deployment_dir(name)?;
+    crate::service_acl::validate(&dir, name, false)?;
     crate::credentials::seal_service(&dir, std::io::stdin().lock())
 }
 
 fn start_provisioned(supervisor: &mut crate::Supervisor) -> Result<(), String> {
     let name = std::env::args().nth(2).ok_or("service name missing")?;
     let dir = deployment_dir(&name)?;
+    crate::service_acl::validate(&dir, &name, true)?;
     let runtime = dir.join("runtime");
     if !runtime.is_dir() { return Err("service runtime directory missing".into()); }
     let mut request = crate::credentials::load_service(&dir)?;

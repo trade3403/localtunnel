@@ -44,7 +44,8 @@ def main(executable, evidence):
     root = Path(os.environ["ProgramData"]) / name
     report = {"scope": "real SCM LocalService same-host encrypted HTTP; no public E2E",
               "registered": False, "sealed_profile": False, "invalid_profile_rejected": False,
-              "overwrite_rejected": False, "forwarded": False,
+              "overwrite_rejected": False, "unsafe_acl_rejected": False,
+              "unsafe_profile_acl_rejected": False, "forwarded": False,
               "stopped": False, "runtime_cleaned": False, "deleted": False}
     created = False
     relay = None
@@ -69,6 +70,7 @@ def main(executable, evidence):
         service = "NT SERVICE\\" + name
         run("icacls.exe", str(root), "/grant:r", service + ":(OI)(CI)RX")
         run("icacls.exe", str(root / "runtime"), "/grant:r", service + ":(OI)(CI)M")
+        run("icacls.exe", str(root), "/setowner", "*S-1-5-32-544", "/T")
         report["registered"] = True
         body = secrets.token_hex(32).encode()
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -119,6 +121,13 @@ bind_addr = "127.0.0.1:{mapped}"
                 def provision(data):
                     return subprocess.run(command, input=data, stdout=subprocess.DEVNULL,
                                           stderr=subprocess.DEVNULL, timeout=20).returncode
+                # A valid profile must still be refused before writing if
+                # any unrelated account has read access to the deployment.
+                run("icacls.exe", str(root), "/grant:r", "*S-1-1-0:RX")
+                if provision(profile) == 0 or (root / "service-profile.bin").exists():
+                    raise RuntimeError("unsafe deployment ACL accepted")
+                report["unsafe_acl_rejected"] = True
+                run("icacls.exe", str(root), "/remove:g", "*S-1-1-0")
                 bad = json.loads(profile)
                 bad["engine"] = str(engine)
                 if provision(json.dumps(bad).encode()) == 0 or (root / "service-profile.bin").exists():
@@ -126,6 +135,7 @@ bind_addr = "127.0.0.1:{mapped}"
                 report["invalid_profile_rejected"] = True
                 if provision(profile) != 0:
                     raise RuntimeError("Rust service credential provisioning failed")
+                run("icacls.exe", str(root / "service-profile.bin"), "/setowner", "*S-1-5-32-544")
                 encrypted = (root / "service-profile.bin").read_bytes()
                 if token.encode() in encrypted:
                     raise RuntimeError("plaintext token in sealed profile")
@@ -135,6 +145,15 @@ bind_addr = "127.0.0.1:{mapped}"
                 report["overwrite_rejected"] = True
                 relay = subprocess.Popen([str(engine), str(config)], stdin=subprocess.DEVNULL,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Machine DPAPI is not sufficient by itself. Even read
+                # access to ciphertext by another principal must block SCM start.
+                run("icacls.exe", str(root / "service-profile.bin"), "/grant:r", "*S-1-1-0:RX")
+                sc("start", name, check=False)
+                wait_state(name, 1)
+                if any((root / "runtime").iterdir()):
+                    raise RuntimeError("unsafe profile started an engine")
+                report["unsafe_profile_acl_rejected"] = True
+                run("icacls.exe", str(root / "service-profile.bin"), "/remove:g", "*S-1-1-0")
                 sc("start", name)
                 wait_state(name, 4)
                 url = f"http://127.0.0.1:{mapped}/"
