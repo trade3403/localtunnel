@@ -63,7 +63,12 @@ mod linux {
                 return Err("probe port conflicts with HTTPS listener or upstream".into());
             }
             let domains = routes.iter().map(|r| r.domain.to_owned()).collect::<Vec<_>>();
-            crate::certificates::check(tls.chain, tls.key, tls.ca, tls.minimum_days, &domains)?;
+            // Empty TLS gateway rejects every handshake. It must remain
+            // clearable even after proof/certificate expiry; nginx -t still
+            // checks the certificate/key files and generated configuration.
+            if !domains.is_empty() {
+                crate::certificates::check(tls.chain, tls.key, tls.ca, tls.minimum_days, &domains)?;
+            }
             gateway_config(bind, routes, Some(Certificate { chain: tls.chain, key: tls.key })).map_err(err)?
         } else {
             gateway_config(bind, routes, None).map_err(err)?
@@ -84,7 +89,7 @@ mod linux {
     fn verify_tls(bind: SocketAddr, route: &Route<'_>, tls: &TlsSettings<'_>, revision: &str) -> bool {
         let resolve = format!("{}:{}:127.0.0.1", route.domain, bind.port());
         let url = format!("https://{}:{}{PROBE_PATH}", route.domain, bind.port());
-        let out = Command::new("/usr/bin/curl").args(["--silent", "--show-error", "--fail", "--noproxy", "*", "--connect-timeout", "2", "--max-time", "3", "--cacert", tls.ca, "--resolve", &resolve, &url]).output();
+        let out = Command::new("/usr/bin/curl").args(["--disable", "--silent", "--show-error", "--fail", "--noproxy", "*", "--connect-timeout", "2", "--max-time", "3", "--max-filesize", "65536", "--cacert", tls.ca, "--resolve", &resolve, &url]).output();
         out.is_ok_and(|o| o.status.success() && o.stdout == revision.as_bytes())
     }
 
@@ -199,6 +204,18 @@ mod linux {
             out.is_ok_and(|o| o.status.success() && o.stdout.len()==expected.len()+3 && o.stdout.ends_with(b"200") && &o.stdout[..expected.len()]==expected)
         })
     }
+    pub fn apply_checked_tls(prefix: &Path, bind: SocketAddr, route: Route<'_>, tls: &TlsSettings<'_>, expected: &[u8]) -> Result<(), String> {
+        if expected.is_empty() || expected.len() > 65536 {
+            return Err("expected body must be 1-65536 bytes".into());
+        }
+        let host=route.domain;
+        apply_mode(prefix, bind, &[route], Some(tls), || {
+            let resolve=format!("{host}:{}:127.0.0.1",bind.port());
+            let url=format!("https://{host}:{}/",bind.port());
+            let out=Command::new("/usr/bin/curl").args(["--disable","--silent","--fail","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--cacert",tls.ca,"--resolve",&resolve,"--write-out","%{http_code}",&url]).output();
+            out.is_ok_and(|o| o.status.success() && o.stdout.len()==expected.len()+3 && o.stdout.ends_with(b"200") && &o.stdout[..expected.len()]==expected)
+        })
+    }
     pub fn init_tls(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: &TlsSettings<'_>) -> Result<(), String> {
         init_mode(prefix, bind, routes, Some(tls))
     }
@@ -208,4 +225,4 @@ mod linux {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{apply, init, apply_tls, init_tls, apply_checked_http, TlsSettings};
+pub use linux::{apply, init, apply_tls, init_tls, apply_checked_http, apply_checked_tls, TlsSettings};

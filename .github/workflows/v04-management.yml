@@ -36,13 +36,15 @@ jobs:
       - name: Install DNS query utility
         run: |
           sudo apt-get update
-          sudo apt-get install -y dnsutils nginx curl
+          sudo apt-get install -y dnsutils nginx curl openssl
       - name: Real node inventory and DNS TXT proof lifecycle
         run: python3 crates/server/tests/domains_e2e.py crates/server/target/release/localtunnel-server management-evidence/domains.json
       - name: Build existing core CLI for preview integration
         run: cargo build --release --locked
       - name: Actual management draft to encrypted tunnel and gateway preview
         run: python3 crates/server/tests/preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/preview.json
+      - name: Real HTTPS management preview, certificate rotation and rollback
+        run: python3 crates/server/tests/tls_preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/tls-preview.json
       - name: Verify committed dependency lock unchanged
         run: git diff --exit-code -- crates/server/Cargo.lock
       - name: Collect committed lock

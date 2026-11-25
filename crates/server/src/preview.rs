@@ -6,13 +6,16 @@ use std::{ffi::OsString,fs,path::{Path,PathBuf},process::{Child,Command,Stdio},t
 
 type Result<T> = std::result::Result<T,&'static str>;
 #[derive(sqlx::FromRow)]
-struct Mapping {id:String,revision:i64,local_port:i64,bind_port:i64,hostname:String}
-async fn checked(pool:&SqlitePool,id:&str,revision:i64)->Result<Mapping>{
+struct Mapping {id:String,revision:i64,local_port:i64,bind_port:i64,hostname:String,protocol:String}
+async fn checked_protocol(pool:&SqlitePool,id:&str,revision:i64,protocol:&str)->Result<Mapping>{
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{return Err("invalid mapping identity")}
-    // Only HTTP, disabled draft, currently enabled owner/device/node and a
+    // Only web protocols, disabled draft, currently enabled owner/device/node and a
     // recent successful TXT observation. This is not continuous DNS proof.
-    sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='http' AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch()")
-        .bind(id).bind(revision).fetch_optional(pool).await.map_err(|_|"mapping read failed")?.ok_or("preview requires current eligible HTTP draft and recent TXT proof")
+    sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname,m.protocol FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND (?='web' OR m.protocol=?) AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch()")
+        .bind(id).bind(revision).bind(protocol).bind(protocol).fetch_optional(pool).await.map_err(|_|"mapping read failed")?.ok_or("preview requires current eligible web draft and recent TXT proof")
+}
+async fn checked(pool:&SqlitePool,id:&str,revision:i64)->Result<Mapping>{
+    checked_protocol(pool,id,revision,"http").await
 }
 fn core()->Result<PathBuf>{
     let path=PathBuf::from(std::env::var_os("LOCALTUNNEL_CORE_CLI").ok_or("set trusted core CLI path")?);
@@ -55,7 +58,7 @@ fn mkdir(_path:&Path)->Result<()>{Err("Linux preview only")}
 
 pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,name:&str)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(name){return Err("invalid preview request")}
-    let m=checked(pool,id,revision).await?;
+    let m=checked_protocol(pool,id,revision,"web").await?;
     let relay=port(relay_port)?;
     if i64::from(relay_port)==m.bind_port{return Err("conflicting relay port")}
     let core=core()?;
@@ -78,7 +81,7 @@ pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:
         options.write(true).create_new(true);
         #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
         let mut file=options.open(dir.join("manifest.json")).map_err(|_|"manifest creation failed")?;
-        let manifest=serde_json::json!({"mapping_id":m.id,"revision":m.revision,"hostname":m.hostname,"bind_port":m.bind_port,"scope":"operator_loopback_preview"});
+        let manifest=serde_json::json!({"mapping_id":m.id,"revision":m.revision,"hostname":m.hostname,"bind_port":m.bind_port,"protocol":m.protocol,"scope":"operator_loopback_preview"});
         file.write_all(manifest.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"manifest write failed")?;
         Ok(())
     })();
@@ -111,12 +114,16 @@ pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,
         }
         args.push(path.into_os_string());
     }
+    record_attempt(pool,id,revision,name,listen,mode,"http",&args).await
+}
+
+async fn record_attempt(pool:&SqlitePool,id:&str,revision:i64,name:&str,listen:u16,mode:&str,transport:&str,args:&[OsString])->Result<()>{
     let cli=core()?;
     let attempt=hex::encode(auth::random::<16>().map_err(|_|"random generation failed")?);
-    sqlx::query("INSERT INTO preview_attempts(id,mapping_id,mapping_revision,prefix_name,listen_port,operation) VALUES (?,?,?,?,?,?)")
-        .bind(&attempt).bind(if id=="clear"{None}else{Some(id)}).bind(revision).bind(name).bind(i64::from(listen)).bind(mode)
+    sqlx::query("INSERT INTO preview_attempts(id,mapping_id,mapping_revision,prefix_name,listen_port,operation,transport) VALUES (?,?,?,?,?,?,?)")
+        .bind(&attempt).bind(if id=="clear"{None}else{Some(id)}).bind(revision).bind(name).bind(i64::from(listen)).bind(mode).bind(transport)
         .execute(pool).await.map_err(|_|"cannot record pending preview operation")?;
-    let result=invoke(&cli,&args,&[]);
+    let result=invoke(&cli,args,&[]);
     let outcome=if result.is_ok(){"succeeded"}else{"failed_or_unknown"};
     sqlx::query("UPDATE preview_attempts SET outcome=?,finished_at=unixepoch() WHERE id=? AND outcome='pending'")
         .bind(outcome).bind(attempt).execute(pool).await.map_err(|_|"preview outcome unknown; inspect runtime and pending record")?;
@@ -236,4 +243,43 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     stopped?;
     cleared?;
     result
+}
+
+
+/// TLS preview deliberately requires an immutable, private operator-owned
+/// certificate directory. Empty configurations reject all TLS handshakes.
+pub async fn tls_gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,probe:u16,cert_dir:&str,mode:&str,expected_file:Option<&str>)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(name)||!safe_name(cert_dir)||name==cert_dir||listen==probe||
+        !matches!((mode,id),("init","clear")|("apply","clear")|("apply-checked",_))||
+        (mode=="apply-checked")!=expected_file.is_some(){return Err("invalid TLS preview request")}
+    let dir=root.join(name);
+    let certs=root.join(cert_dir);
+    private_dir(&dir)?;
+    private_dir(&certs)?;
+    let mut args:Vec<OsString>=vec![format!("gateway-tls-{mode}").into(),dir.into_os_string(),port(listen)?.into(),port(probe)?.into()];
+    for filename in ["chain.pem","key.pem","ca.pem"]{
+        let path=certs.join(filename);
+        let m=fs::symlink_metadata(&path).map_err(|_|"certificate file unavailable")?;
+        if !m.file_type().is_file()||m.len()==0||m.len()>1048576{return Err("invalid certificate file")}
+        #[cfg(unix)]{
+            use std::os::unix::fs::PermissionsExt;
+            if m.permissions().mode()&0o077!=0{return Err("certificate files must be private")}
+        }
+        args.push(path.into_os_string());
+    }
+    // Fixed one-day validity margin for nonempty preview configurations.
+    args.push("1".into());
+    if id=="clear"{
+        if revision!=0||expected_file.is_some(){return Err("invalid clear revision")}
+    }else{
+        let m=checked_protocol(pool,id,revision,"https").await?;
+        if i64::from(listen)==m.bind_port||i64::from(probe)==m.bind_port{return Err("conflicting TLS gateway port")}
+        args.push(m.hostname.into());
+        args.push(m.bind_port.to_string().into());
+    }
+    if let Some(file)=expected_file{
+        read_expected(root,file)?;
+        args.push(root.join(file).into_os_string());
+    }
+    record_attempt(pool,id,revision,name,listen,mode,"https",&args).await
 }
