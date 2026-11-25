@@ -43,7 +43,9 @@ def main(executable, evidence):
     name = "LocalTunnelPreview-" + uuid.uuid4().hex
     root = Path(os.environ["ProgramData"]) / name
     report = {"scope": "real SCM LocalService same-host encrypted HTTP; no public E2E",
-              "registered": False, "sealed_profile": False, "invalid_profile_rejected": False,
+              "registered": False, "unsafe_registration_rejected": False,
+              "duplicate_registration_rejected": False, "running_unregister_rejected": False,
+              "sealed_profile": False, "invalid_profile_rejected": False,
               "overwrite_rejected": False, "unsafe_acl_rejected": False,
               "unsafe_profile_acl_rejected": False, "autostart_unsafe_rejected": False,
               "autostart_enabled": False, "autostart_disabled": False, "forwarded": False,
@@ -63,10 +65,20 @@ def main(executable, evidence):
         (root / "engine").mkdir()
         shutil.copyfile(engine, root / "engine" / "rathole.exe")
         (root / "runtime").mkdir()
-        binary = f'"{exe}" --service-tunnel {name}'
-        sc("create", name, "binPath=", binary, "start=", "demand", "obj=", r"NT AUTHORITY\LocalService")
+        run("icacls.exe", str(root), "/setowner", "*S-1-5-32-544", "/T")
+        def control(action, check=True):
+            return run(str(exe), "--service-control", name, action, check=check)
+        run("icacls.exe", str(root), "/grant:r", "*S-1-1-0:RX")
+        if control("register", check=False).returncode == 0:
+            created = True
+            raise RuntimeError("unsafe service registration accepted")
+        report["unsafe_registration_rejected"] = True
+        run("icacls.exe", str(root), "/remove:g", "*S-1-1-0")
+        control("register")
         created = True
-        sc("sidtype", name, "unrestricted")
+        if control("register", check=False).returncode == 0:
+            raise RuntimeError("duplicate service registration accepted")
+        report["duplicate_registration_rejected"] = True
         # Per-service SID, rather than every process running as LocalService.
         service = "NT SERVICE\\" + name
         run("icacls.exe", str(root), "/grant:r", service + ":(OI)(CI)RX")
@@ -149,8 +161,6 @@ bind_addr = "127.0.0.1:{mapped}"
                 # Machine DPAPI is not sufficient by itself. Even read
                 # access to ciphertext by another principal must block SCM start.
                 run("icacls.exe", str(root / "service-profile.bin"), "/grant:r", "*S-1-1-0:RX")
-                def control(action, check=True):
-                    return run(str(exe), "--service-control", name, action, check=check)
                 if control("autostart-on", check=False).returncode == 0:
                     raise RuntimeError("unsafe service autostart accepted")
                 report["autostart_unsafe_rejected"] = True
@@ -176,6 +186,10 @@ bind_addr = "127.0.0.1:{mapped}"
                 url = f"http://127.0.0.1:{mapped}/"
                 e2e.wait_for(url, body, [relay], seconds=35)
                 report["forwarded"] = True
+                if control("unregister", check=False).returncode == 0:
+                    raise RuntimeError("running service unregistered")
+                report["running_unregister_rejected"] = True
+                e2e.wait_for(url, body, [relay], seconds=10)
                 control("stop")
                 wait_state(name, 1)
                 control("stop")  # idempotent once SCM confirms stopped
@@ -193,7 +207,10 @@ bind_addr = "127.0.0.1:{mapped}"
                 if relay is not None:
                     e2e.terminate(relay)
                     relay = None
-        sc("delete", name)
+        control("unregister")
+        if not (root / "service-profile.bin").is_file():
+            raise RuntimeError("unregister unexpectedly deleted credentials")
+        report["unregister_preserved_profile"] = True
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             result = sc("query", name, check=False)

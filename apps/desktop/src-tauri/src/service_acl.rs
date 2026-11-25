@@ -104,6 +104,28 @@ fn check(path: &Path, directory: bool, service: &str, limit: u32) -> Result<(), 
     Ok(())
 }
 
+// Before SCM registration, no service SID may have rights yet. The
+// deployment is administrator/SYSTEM owned and contains no saved profile.
+pub fn validate_registration(dir: &Path) -> Result<(), String> {
+    for (path, directory) in [
+        (dir.to_path_buf(), true),
+        (dir.join("localtunnel-desktop.exe"), false),
+        (dir.join("engine"), true),
+        (dir.join("engine").join("rathole.exe"), false),
+        (dir.join("runtime"), true),
+    ] {
+        check(&path, directory, "", 0)?;
+    }
+    match std::fs::symlink_metadata(dir.join("service-profile.bin")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        _ => return Err("registration requires an empty credential slot".into()),
+    }
+    if std::fs::read_dir(dir.join("runtime")).map_err(|_| "runtime unavailable")?.next().is_some() {
+        return Err("registration requires empty runtime directory".into());
+    }
+    Ok(())
+}
+
 pub fn validate(dir: &Path, name: &str, profile: bool) -> Result<(), String> {
     let service = service_sid(name)?;
     check(dir, true, &service, RX)?;
