@@ -36,7 +36,9 @@ report.service_config_updated = false
 report.service_updated_http = false
 report.service_unregistered = false
 report.service_data_preserved = false
+report.tray_first_restore_clicked = false
 report.tray_show_clicked = false
+report.tray_second_hidden_http = false
 report.tray_stop_clicked = false
 report.tray_quit_clicked = false
 report.tray_quit_clean_exit = false
@@ -219,22 +221,28 @@ function windowAction(handle, action) {
     'public static class GuiNative {',
     '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h,uint m,IntPtr w,IntPtr l);',
     '[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);',
-    '[DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr h,int n);',
     '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);',
     '}',
     "'@",
     '$ProgressPreference="SilentlyContinue"; $h=[IntPtr]::new(' + handle + '); $owner=[uint32]0; [void][GuiNative]::GetWindowThreadProcessId($h,[ref]$owner);',
     'if($owner -ne ' + app.pid + '){throw "unexpected window owner"}',
     action === 'close' ? 'if(![GuiNative]::PostMessage($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero)){throw "WM_CLOSE failed"}' :
-      action === 'show' ? '[void][GuiNative]::ShowWindowAsync($h,9)' :
       '[Console]::WriteLine([GuiNative]::IsWindowVisible($h))'
   ].join('\r\n')
-  return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script,'utf16le').toString('base64')], { encoding: 'utf8', timeout: 10000 }).trim()
+  return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script,'utf16le').toString('base64')], { encoding: 'utf8', timeout: 10000, windowsHide:true }).trim()
 }
 function trayMenu(action) {
   const script = fileURLToPath(new URL('./native_tray_e2e.ps1',import.meta.url))
-  execFileSync('pwsh.exe',['-NoProfile','-NonInteractive','-File',script,'-ProcessId',String(app.pid),'-Executable',exe,'-Action',action],
-    {encoding:'utf8',timeout:40000,windowsHide:true,stdio:['ignore','pipe','pipe']})
+  try {
+    execFileSync('pwsh.exe',['-NoProfile','-NonInteractive','-File',script,'-ProcessId',String(app.pid),'-Executable',exe,'-Action',action],
+      {encoding:'utf8',timeout:40000,windowsHide:true,stdio:['ignore','pipe','pipe']})
+  } catch (error) {
+    // Only the native helper's diagnostic output, never CDP/form/fixture data.
+    report.tray_failed_action = action
+    report.tray_helper_error = String(error.stderr || error.code || 'native helper failed').slice(0,2000)
+    console.error('Native tray helper failed (' + action + '): ' + report.tray_helper_error)
+    throw Error('native tray menu action failed: ' + action)
+  }
 }
 function windowHandle() {
   const result = execFileSync('powershell.exe', ['-NoProfile','-NonInteractive','-Command',
@@ -300,10 +308,15 @@ try {
   report.native_close_hides = true
   await until('hidden window tunnel still forwards', async () => await get(url) === body, 10000)
   report.hidden_tunnel_works = true
-  // OS restore of this exact HWND only; physical tray menu click is separate.
-  windowAction(hwnd,'show')
-  await until('native window visible', () => windowAction(hwnd,'visible') === 'True')
+  // Tao 0.37.3 caches visibility in WindowState. External ShowWindowAsync
+  // bypasses set_visible/apply_diff, leaving the next hide a possible no-op.
+  // Restore through the real product tray menu instead, then independently
+  // observe the original HWND with Win32. Never force visibility from the test.
+  trayMenu('show')
+  await until('first tray restore makes native window visible', () => windowAction(hwnd,'visible') === 'True')
   report.native_restore = true
+  report.tray_first_restore_clicked = true
+  await until('first tray restore preserves forwarding', async () => await get(url) === body, 10000)
   await until('stop button accepted', async () => {
     if (await has('已停止') && !await has('进程运行中') && !await has('处理中…')) return true
     if (await has('处理中…')) return false
@@ -399,7 +412,7 @@ try {
   if(!(await readFile(profilePath)).equals(updatedProfile)||JSON.stringify(JSON.parse(await readFile(historyPath,'utf8')))!==JSON.stringify(savedAfter)) throw Error('unregister changed protected data')
   report.service_data_preserved=true
 
-  // Native tray gate, separate from WebView DOM controls and ShowWindowAsync.
+  // Repeat the native tray gate after the full SCM GUI lifecycle.
   // Reuse the alternate target now shown in the desktop form.
   async function startDesktopAgain() {
     await until('desktop starts for tray test',async()=>{
@@ -422,6 +435,8 @@ try {
   windowAction(trayHwnd,'close')
   await until('original main window hidden for tray restore',()=>windowAction(trayHwnd,'visible')==='False')
   report.tray_original_window_hidden=true
+  await until('second hidden window still forwards',async()=>await get(url)===changedBody,10000)
+  report.tray_second_hidden_http=true
   trayMenu('show')
   await until('tray show restores window',()=>windowAction(trayHwnd,'visible')==='True')
   report.tray_show_clicked=true
