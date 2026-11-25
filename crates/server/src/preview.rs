@@ -136,9 +136,11 @@ async fn record_attempt(pool:&SqlitePool,id:&str,revision:i64,name:&str,listen:u
 struct TunnelChildren(Vec<Child>);
 impl TunnelChildren {
     fn start(&mut self,engine:&Path,config:&Path)->Result<()>{
-        let child=Command::new(engine).arg(config).env_clear().env("PATH","/usr/bin:/bin")
-            .env("RUST_LOG","warn").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .spawn().map_err(|_|"engine launch failed")?;
+        let mut cmd=Command::new(engine);
+        cmd.arg(config).env_clear().env("PATH","/usr/bin:/bin")
+            .env("RUST_LOG","warn").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        protect_child(&mut cmd)?;
+        let child=cmd.spawn().map_err(|_|"engine launch failed")?;
         self.0.push(child);
         Ok(())
     }
@@ -164,17 +166,55 @@ impl TunnelChildren {
     }
 }
 impl Drop for TunnelChildren {fn drop(&mut self){let _=self.stop();}}
-struct PreviewLock(PathBuf);
-impl Drop for PreviewLock {fn drop(&mut self){let _=fs::remove_file(&self.0);}}
-fn acquire_worker_lock(root:&Path,prefix:&str)->Result<PreviewLock>{
-    if !safe_name(prefix){return Err("invalid worker prefix")}
-    let path=root.join(format!("worker-{prefix}.lock"));
+// Linux direct children must not outlive their owning supervisor, even if
+// it receives SIGKILL. pre_exec only performs async-signal-safe syscalls.
+// The parent PID recheck closes the fork-to-prctl race.
+#[cfg(target_os="linux")]
+fn protect_child(cmd:&mut Command)->Result<()>{
+    use std::os::unix::process::CommandExt;
+    let parent=std::process::id() as libc::pid_t;
+    unsafe {
+        cmd.pre_exec(move||{
+            if libc::prctl(libc::PR_SET_PDEATHSIG,libc::SIGKILL as libc::c_ulong,0 as libc::c_ulong,0 as libc::c_ulong,0 as libc::c_ulong)!=0{
+                return Err(std::io::Error::last_os_error())
+            }
+            if libc::getppid()!=parent{libc::_exit(125)}
+            Ok(())
+        });
+    }
+    Ok(())
+}
+#[cfg(not(target_os="linux"))]
+fn protect_child(_: &mut Command)->Result<()>{Err("Linux supervisor only")}
+
+// Persistent inode, never unlink the guard file. Kernel releases flock on
+// process death. A separate create_new marker retains crash evidence.
+#[cfg(target_os="linux")]
+fn guard(root:&Path,kind:&str,prefix:&str)->Result<fs::File>{
+    use std::os::{fd::AsRawFd,unix::fs::{OpenOptionsExt,PermissionsExt}};
+    if !safe_name(prefix){return Err("invalid guard prefix")}
+    let file=fs::OpenOptions::new().read(true).write(true).create(true)
+        .mode(0o600).custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC)
+        .open(root.join(format!("{kind}-{prefix}.guard"))).map_err(|_|"guard unavailable")?;
+    let m=file.metadata().map_err(|_|"guard metadata unavailable")?;
+    if !m.is_file()||m.permissions().mode()&0o077!=0{return Err("unsafe guard")}
+    if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err("worker or supervisor still holds guard")}
+    Ok(file)
+}
+#[cfg(not(target_os="linux"))]
+fn guard(_: &Path,_:&str,_:&str)->Result<fs::File>{Err("Linux supervisor only")}
+struct PreviewLock{path:PathBuf,_guard:fs::File}
+impl Drop for PreviewLock {fn drop(&mut self){let _=fs::remove_file(&self.path);}}
+fn acquire_lock(root:&Path,kind:&str,prefix:&str)->Result<PreviewLock>{
+    let held=guard(root,kind,prefix)?;
+    let path=root.join(format!("{kind}-{prefix}.lock"));
     let mut opts=fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
-    opts.open(&path).map_err(|_|"worker lock exists or unavailable")?;
-    Ok(PreviewLock(path))
+    opts.open(&path).map_err(|_|"lock exists or unavailable; inspect recovery evidence")?;
+    Ok(PreviewLock{path,_guard:held})
 }
+fn acquire_worker_lock(root:&Path,prefix:&str)->Result<PreviewLock>{acquire_lock(root,"worker",prefix)}
 fn stop_requested(path:Option<&Path>)->Result<bool>{
     let Some(path)=path else{return Ok(false)};
     // Any existing entry, including a symlink, is a fail-closed stop signal.
@@ -249,12 +289,15 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     let engine=engine.canonicalize().map_err(|_|"invalid engine path")?;
     // Exclusive among supervised operations. Manual operator commands still
     // require external coordination; a stale lock is recovery evidence.
-    let lock=root.join(format!("supervisor-{prefix}.lock"));
-    let mut opts=fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
-    opts.open(&lock).map_err(|_|"supervisor lock exists or unavailable")?;
-    let _lock=PreviewLock(lock);
+    let _lock=acquire_lock(root,"supervisor",prefix)?;
+    if let Some(rid)=request{
+        write_recovery(root,&Recovery{
+            mapping_id:id.into(),revision,request_id:rid.into(),prefix:prefix.into(),
+            relay:relay_port,bind:m.bind_port as u16,listen,
+            probe:match transport{PreviewTransport::Http=>None,PreviewTransport::Https{probe,..}=>Some(probe)},
+            cert_dir:match transport{PreviewTransport::Http=>None,PreviewTransport::Https{cert_dir,..}=>Some(cert_dir.into())},
+        })?;
+    }
     // Reset the exclusive gateway to empty and verify the revision first.
     // This dedicated prefix must not serve other mappings.
     transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await?;
@@ -393,4 +436,101 @@ pub async fn resident(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_por
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+
+// A non-secret, immutable record written before any runtime data-plane
+// action. Keep it even after successful cleanup for local diagnostics.
+#[derive(serde::Serialize,serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Recovery{
+    mapping_id:String,revision:i64,request_id:String,prefix:String,
+    relay:u16,bind:u16,listen:u16,probe:Option<u16>,cert_dir:Option<String>,
+}
+fn recovery_path(root:&Path,prefix:&str,rid:&str)->Result<PathBuf>{
+    if !safe_name(prefix)||rid.len()!=32||!rid.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)){
+        return Err("invalid recovery identity")
+    }
+    Ok(root.join(format!("recovery-{prefix}-{rid}.json")))
+}
+fn write_recovery(root:&Path,r:&Recovery)->Result<()>{
+    use std::io::Write;
+    let path=recovery_path(root,&r.prefix,&r.request_id)?;
+    let mut opts=fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
+    let mut file=opts.open(path).map_err(|_|"recovery record unavailable")?;
+    let data=serde_json::to_vec(r).map_err(|_|"recovery record serialization failed")?;
+    file.write_all(&data).and_then(|_|file.sync_all()).map_err(|_|"recovery record write failed")?;
+    fs::File::open(root).and_then(|d|d.sync_all()).map_err(|_|"recovery directory sync failed")?;
+    Ok(())
+}
+fn read_recovery(root:&Path,prefix:&str,rid:&str)->Result<Recovery>{
+    use std::io::Read;
+    let path=recovery_path(root,prefix,rid)?;
+    let m=fs::symlink_metadata(&path).map_err(|_|"recovery record missing")?;
+    if !m.file_type().is_file()||!(1..=4096).contains(&m.len()){return Err("invalid recovery record")}
+    #[cfg(unix)]{
+        use std::os::unix::fs::PermissionsExt;
+        if m.permissions().mode()&0o077!=0{return Err("recovery record must be private")}
+    }
+    let mut data=Vec::new();
+    fs::File::open(path).map_err(|_|"recovery record unavailable")?.take(4097).read_to_end(&mut data).map_err(|_|"recovery record read failed")?;
+    if data.len()>4096{return Err("oversize recovery record")}
+    let r:Recovery=serde_json::from_slice(&data).map_err(|_|"invalid recovery record")?;
+    if r.prefix!=prefix||r.request_id!=rid{return Err("recovery identity mismatch")}
+    Ok(r)
+}
+fn refused(p:u16)->bool{
+    use std::net::{SocketAddr,Ipv4Addr,TcpStream};
+    let addr=SocketAddr::from((Ipv4Addr::LOCALHOST,p));
+    matches!(TcpStream::connect_timeout(&addr,Duration::from_secs(1)),Err(e) if e.kind()==std::io::ErrorKind::ConnectionRefused)
+}
+/// Trusted local recovery only, while the operator has exclusive control of
+/// the dedicated prefix/ports and no manual gateway commands are running.
+/// No arbitrary PID killing, no automatic restart, and no secret deletion.
+pub async fn recover(pool:&SqlitePool,root:&Path,prefix:&str,rid:&str)->Result<()>{
+    if !cfg!(target_os="linux"){return Err("Linux recovery only")}
+    let _worker=guard(root,"worker",prefix)?;
+    let _supervisor=guard(root,"supervisor",prefix)?;
+    let r=read_recovery(root,prefix,rid)?;
+    let protocol=match (&r.probe,&r.cert_dir){
+        (None,None)=>"http",
+        (Some(_),Some(_))=>"https",
+        _=>return Err("invalid recovery transport"),
+    };
+    port(r.relay)?;port(r.bind)?;port(r.listen)?;
+    if r.relay==r.bind||r.relay==r.listen||r.bind==r.listen{return Err("invalid recovery ports")}
+    let transport=match (r.probe,r.cert_dir.as_deref()){
+        (None,None)=>PreviewTransport::Http,
+        (Some(probe),Some(cert_dir))=>{
+            port(probe)?;
+            if probe==r.relay||probe==r.bind||probe==r.listen||!safe_name(cert_dir)||cert_dir==prefix{return Err("invalid recovery TLS parameters")}
+            PreviewTransport::Https{probe,cert_dir}
+        },
+        _=>return Err("invalid recovery transport"),
+    };
+    // Exact request and original mapping binding; never adopt a new request.
+    let eligible=sqlx::query_scalar::<_,i64>("SELECT count(*) FROM runtime_requests q JOIN mappings m ON m.id=q.mapping_id WHERE q.mapping_id=? AND q.request_id=? AND q.mapping_revision=? AND m.revision=? AND m.bind_port=? AND m.protocol=? AND m.enabled=0 AND q.state IN ('starting','running','stopping','failed_or_unknown')")
+        .bind(&r.mapping_id).bind(rid).bind(r.revision).bind(r.revision).bind(i64::from(r.bind)).bind(protocol)
+        .fetch_one(pool).await.map_err(|_|"recovery state read failed")?;
+    if eligible!=1{return Err("request not recoverable")}
+    if !refused(r.relay)||!refused(r.bind){return Err("relay or mapping listener still reachable")}
+    // Core performs real Nginx revision verification; unresolved backups
+    // deliberately block this operation. Preserve private bundles/history.
+    transport.gateway(pool,root,"clear",0,prefix,r.listen,"apply",None).await?;
+    if !refused(r.relay)||!refused(r.bind){return Err("listener became reachable during recovery")}
+    for kind in ["worker","supervisor"]{
+        let path=root.join(format!("{kind}-{prefix}.lock"));
+        match fs::symlink_metadata(&path){
+            Ok(m) if m.file_type().is_file()=>fs::remove_file(path).map_err(|_|"stale marker cleanup failed")?,
+            Ok(_)=>return Err("unsafe stale marker"),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Err(_)=>return Err("stale marker unavailable"),
+        }
+    }
+    let updated=sqlx::query("UPDATE runtime_requests SET state='stopped',updated_at=unixepoch() WHERE mapping_id=? AND request_id=? AND mapping_revision=? AND state IN ('starting','running','stopping','failed_or_unknown')")
+        .bind(&r.mapping_id).bind(rid).bind(r.revision).execute(pool).await.map_err(|_|"recovery result unknown")?;
+    if updated.rows_affected()!=1{return Err("recovery result unknown")}
+    Ok(())
 }

@@ -447,6 +447,45 @@ try:
                 expect(call(base,runtime_path+"?expected_revision=1","DELETE",admin),409)
                 assert operator("--runtime-resident",mid3,1,rp,"retry_unknown","gateway",gp,"expected_body").returncode!=0
                 report["resident_child_exit_cleanup_blocks_unknown_restart"]=True
+                # Explicit recovery of the failed request must verify the
+                # dedicated gateway and closed listeners, not just reset SQL.
+                assert operator("--recover-runtime","gateway","0"*32).returncode!=0
+                assert operator("--recover-runtime","gateway",rid).returncode==0
+                wait_state("stopped")
+                assert request(gp,"preview.example.test")[0]==421
+                assert (root/("fault_bundle-"+rid)).is_dir()
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"crash_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                rid=queued["request_id"]
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                wait_state("running")
+                assert operator("--recover-runtime","gateway",rid).returncode!=0
+                assert request(bp,"preview.example.test")== (200,body)
+                # Kill only our actual supervisor. Linux PDEATHSIG must close
+                # its two direct engine children without any cleanup handler.
+                supervisor.kill()
+                assert supervisor.wait(timeout=10)!=0
+                end=time.monotonic()+15
+                while time.monotonic()<end:
+                    if request(bp,"preview.example.test") is None:
+                        with socket.socket() as sock:
+                            sock.settimeout(.5)
+                            if sock.connect_ex(("127.0.0.1",rp))!=0:
+                                break
+                    time.sleep(.2)
+                else:
+                    raise AssertionError("orphan relay remained reachable after supervisor SIGKILL")
+                assert lock.exists() and (root/"supervisor-gateway.lock").exists()
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),409)
+                assert operator("--recover-runtime","gateway",rid).returncode==0
+                wait_state("stopped")
+                assert request(gp,"preview.example.test")[0]==421
+                assert request(bp,"preview.example.test") is None
+                assert not lock.exists() and not (root/"supervisor-gateway.lock").exists()
+                assert (root/("crash_bundle-"+rid)).is_dir()
+                assert operator("--recover-runtime","gateway",rid).returncode!=0
+                report["real_supervisor_sigkill_parent_death_and_verified_local_recovery"]=True
             finally:
                 # Test failure cleanup: revoke before waiting so that the
                 # supervisor gets the opportunity to stop its own children.
