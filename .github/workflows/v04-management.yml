@@ -62,6 +62,8 @@ jobs:
       - name: Real browser admin login and API-backed management
         working-directory: apps/admin
         run: npm run test:e2e -- ../../crates/server/target/release/localtunnel-server ../../management-evidence/admin-browser.json
+      - name: Require complete V0.4 management evidence
+        run: python3 tests/verify_v04_evidence.py management management-evidence
       - name: Collect admin dependency lock and build
         if: always()
         run: |
