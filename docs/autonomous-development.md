@@ -86,3 +86,8 @@
 ## 2026-11-25：停止竞态修复验收、显式服务注册删除
 - HEAD 7fdc2b2adf5efaac4130e76be10071b5f3e12efc 的 CI #59 https://github.com/trade3403/localtunnel/actions/runs/45536035040 全部通过，17/17 单测、1/1 真实桌面 TCP（0.93s 测试耗时）、实际 SCM 自启配置、真实转发、停止/重复停止、运行目录清理、锁定构建及安装卸载通过。EXE 3.15 MiB；预览包 https://github.com/trade3403/localtunnel/actions/runs/45536035040/artifacts/14986614328 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45536035040/artifacts/14986409921 。核心 #73、Runner #154 通过。
 - 新增显式 --service-control <preview-name> register|unregister，注册前仅 SYSTEM/Administrators 拥有安全部署文件、runtime 为空、无已有凭据、固定引擎校验；原生 CreateServiceW 以 LocalService/Manual/own-process 注册，设独立 SID，失败删除新服务，不覆盖现有服务。管理员仍需显式授权服务 SID 并密封凭据。删除仅针对确认身份且已停止的服务，先禁用自启，再 DeleteService，不删除文件/密文。CI 使用产品实际注册/删除入口取代 sc create/delete 正常路径，新增不安全注册拒绝、重复注册拒绝、运行中删除拒绝、删除保留凭据与 SCM 消失门禁，旧回归不减。新代码待 CI；尚非完整安装器或 GUI，未在真实用户设备注册服务。下一步异常恢复、残留清理及完整安装/卸载管理。未修改 main。自动任务本轮查询为关闭，未重新启用。
+
+
+## 2026-11-25：服务注册删除验收、引擎异常退出恢复
+- HEAD 20a5bf0563d3303aaf947dcde287d99b82d1a29b，CI #61 https://github.com/trade3403/localtunnel/actions/runs/45537179713 全部通过，17/17 单测、1/1 桌面真实 TCP（0.78s 测试耗时）、真实 SCM 注册删除及拒绝非法注册/运行中删除、真实隧道、锁定构建及安装卸载通过。EXE 3.15 MiB；预览包 https://github.com/trade3403/localtunnel/actions/runs/45537179713/artifacts/14986739741 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45537179713/artifacts/14987388757 。核心 #74、Runner #156 通过。
+- 服务宿主新增引擎异常退出恢复，单次 SCM 服务生命周期最多3次，1/2/4秒递增间隔，主动停止时取消；重新读取密文凭据和校验 ACL/引擎指纹，旧进程停止且 runtime 为空才继续，失败耗尽后服务停止并报告失败。初次配置不合法仍直接拒绝启动；SCM Running 代表宿主活跃（包括恢复），不等于隧道在线。真实 CI 注入故障：按 SCM PID 精确定位其 runtime 下的 Rathole 子进程，强制结束，验证新子进程 PID、原宿主未变、旧临时目录消失、HTTP 再次真实转发。新增预算单测。全部新代码待 CI，未实现宿主自身异常退出的 SCM recovery policy 或跨宿主残留安全清理；禁止自动递归删除未知数据。未修改 main，不涉及生产设备。下一阶段按实际 CI 验收后继续宿主恢复及残留清理。

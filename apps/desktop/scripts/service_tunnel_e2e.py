@@ -38,6 +38,32 @@ def wait_state(name, state, seconds=25):
         time.sleep(.25)
     raise RuntimeError(f"service did not reach SCM state {state}")
 
+def service_pid(name):
+    result = sc("queryex", name)
+    match = re.search(r"PID\s*:\s*(\d+)", result.stdout)
+    if not match or int(match.group(1)) <= 0:
+        raise RuntimeError("missing SCM host PID")
+    return int(match.group(1))
+
+def engine_child(parent, root):
+    # Only inspect the exact SCM host's own child process; no global
+    # name-based process termination. Require its image in this runtime.
+    command = (f"Get-CimInstance Win32_Process -Filter 'ParentProcessId={parent}' | "
+               "Where-Object {$_.Name -eq 'rathole.exe'} | "
+               "Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress")
+    result = run("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command)
+    if not result.stdout.strip():
+        return None
+    child = json.loads(result.stdout)
+    if not isinstance(child, dict) or not child.get("ExecutablePath"):
+        raise RuntimeError("unexpected service engine process list")
+    image = Path(child["ExecutablePath"])
+    if (image.name.lower() != "rathole.exe" or
+            image.parent.parent != root / "runtime" or
+            not image.parent.name.startswith("localtunnel-client-")):
+        raise RuntimeError("unexpected engine image location")
+    return int(child["ProcessId"]), image.parent
+
 def main(executable, evidence):
     engine = Path(os.environ["LOCALTUNNEL_TEST_ENGINE"]).resolve()
     name = "LocalTunnelPreview-" + uuid.uuid4().hex
@@ -49,7 +75,8 @@ def main(executable, evidence):
               "overwrite_rejected": False, "unsafe_acl_rejected": False,
               "unsafe_profile_acl_rejected": False, "autostart_unsafe_rejected": False,
               "autostart_enabled": False, "autostart_disabled": False, "forwarded": False,
-              "stopped": False, "runtime_cleaned": False, "deleted": False}
+              "stopped": False, "runtime_cleaned": False, "deleted": False,
+              "engine_recovered": False, "old_runtime_cleaned": False}
     created = False
     relay = None
     fixture = None
@@ -186,6 +213,28 @@ bind_addr = "127.0.0.1:{mapped}"
                 url = f"http://127.0.0.1:{mapped}/"
                 e2e.wait_for(url, body, [relay], seconds=35)
                 report["forwarded"] = True
+                host_pid = service_pid(name)
+                old_child = engine_child(host_pid, root)
+                if old_child is None:
+                    raise RuntimeError("service engine child missing")
+                old_pid, old_dir = old_child
+                # Fault injection targets only the child just verified above.
+                run("taskkill.exe", "/PID", str(old_pid), "/F")
+                deadline = time.monotonic() + 20
+                new_child = None
+                while time.monotonic() < deadline:
+                    candidate = engine_child(host_pid, root)
+                    if candidate and candidate[0] != old_pid:
+                        new_child = candidate
+                        break
+                    time.sleep(.25)
+                if new_child is None or service_pid(name) != host_pid:
+                    raise RuntimeError("engine not recovered under original SCM host")
+                if old_dir.exists():
+                    raise RuntimeError("old runtime directory survived engine exit")
+                report["old_runtime_cleaned"] = True
+                e2e.wait_for(url, body, [relay], seconds=35)
+                report["engine_recovered"] = True
                 if control("unregister", check=False).returncode == 0:
                     raise RuntimeError("running service unregistered")
                 report["running_unregister_rejected"] = True

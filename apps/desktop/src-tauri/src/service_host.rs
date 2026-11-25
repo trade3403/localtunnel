@@ -15,6 +15,30 @@ static TUNNEL: AtomicBool = AtomicBool::new(false);
 const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const ERROR_GEN_FAILURE: u32 = 31;
 
+// Three retries per SCM service lifetime; never reset the budget just
+// because a new child starts. A persistent fault must not spin forever.
+#[derive(Default)]
+struct RecoveryBudget { used: usize }
+
+impl RecoveryBudget {
+    fn next_delay(&mut self) -> Option<Duration> {
+        let seconds = [1, 2, 4].get(self.used).copied()?;
+        self.used += 1;
+        Some(Duration::from_secs(seconds))
+    }
+}
+
+fn backoff(delay: Duration) -> bool {
+    let deadline = std::time::Instant::now() + delay;
+    while !STOP.load(Ordering::Acquire) {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { return true; }
+        thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+    false
+}
+
+
 fn valid_name(name: &str) -> bool {
     let prefix = "LocalTunnelPreview-";
     name.strip_prefix(prefix).is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -83,12 +107,29 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
         let _ = report(handle, SERVICE_STOPPED, ERROR_GEN_FAILURE);
         return;
     }
-    // Running means the process is active, never authenticated online.
+    // SCM Running describes the host, including bounded engine recovery.
+    // It is never evidence of an authenticated/connected tunnel.
     let mut failed = false;
+    let mut recovery = RecoveryBudget::default();
     while !STOP.load(Ordering::Acquire) {
         if tunnel && !supervisor.status().is_ok_and(|status| status.state == "running") {
-            failed = true;
-            break;
+            // Fully dispose of the old child and its runtime files before
+            // retrying. Do not launch a second child if cleanup fails.
+            if supervisor.stop().is_err() { failed = true; break; }
+            let mut recovered = false;
+            while let Some(delay) = recovery.next_delay() {
+                if !backoff(delay) || STOP.load(Ordering::Acquire) { break; }
+                // Re-read protected credentials and repeat all ACL/digest checks.
+                if start_provisioned(&mut supervisor).is_ok() {
+                    recovered = true;
+                    break;
+                }
+                if supervisor.stop().is_err() { break; }
+            }
+            if !recovered {
+                failed = !STOP.load(Ordering::Acquire);
+                break;
+            }
         }
         thread::sleep(Duration::from_millis(100));
     }
@@ -127,6 +168,11 @@ fn start_provisioned(supervisor: &mut crate::Supervisor) -> Result<(), String> {
     crate::service_acl::validate(&dir, &name, true)?;
     let runtime = dir.join("runtime");
     if !runtime.is_dir() { return Err("service runtime directory missing".into()); }
+    // The TempDir from a reaped child should have been removed. Refuse to
+    // run over unknown/orphan data; host-crash cleanup is a later operation.
+    if std::fs::read_dir(&runtime).map_err(|_| "runtime unavailable")?.next().is_some() {
+        return Err("runtime not empty; inspect stale service files".into());
+    }
     let mut request = crate::credentials::load_service(&dir)?;
     request.engine = crate::bundled_engine(&dir)?.to_str().ok_or("invalid engine path")?.to_owned();
     let status = supervisor.start_in(request, Some(&runtime))?;
@@ -137,6 +183,16 @@ fn start_provisioned(supervisor: &mut crate::Supervisor) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_budget_is_bounded_for_entire_service_lifetime() {
+        let mut budget = RecoveryBudget::default();
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(1)));
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(2)));
+        assert_eq!(budget.next_delay(), Some(Duration::from_secs(4)));
+        assert_eq!(budget.next_delay(), None);
+        assert_eq!(budget.next_delay(), None);
+    }
+
     #[test]
     fn only_explicit_preview_service_names() {
         assert!(valid_name("LocalTunnelPreview-0123456789abcdef0123456789abcdef"));
