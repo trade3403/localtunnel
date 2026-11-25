@@ -421,7 +421,7 @@ async function toggle() {
           <button type="button" class="secondary" :disabled="!watchedService || serviceBusy" @click="unwatchService">停止监测</button>
         </div>
         <div class="profile-actions">
-          <label><input type="checkbox" v-model="provisionConfirm" :disabled="serviceBusy" /> 使用下方映射配置创建新服务，允许系统级加密保存 Token</label>
+          <label><input type="checkbox" aria-label="确认部署新服务" v-model="provisionConfirm" :disabled="serviceBusy" /> 使用下方映射配置创建新服务，允许系统级加密保存 Token</label>
           <button type="button" class="secondary" :disabled="locked || !provisionConfirm" @click="provisionService">一键部署新服务</button>
         </div>
         <p class="hint">需要以管理员身份运行客户端；创建全新服务，不覆盖旧配置。默认停止且手动启动。失败时保留受保护目录供检查。</p>

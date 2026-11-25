@@ -276,3 +276,8 @@
 ## 2026-11-25：操作审计验收、Windows 管理设备联动第一批
 - HEAD b92d2a13261f84436dc4496b3c8dc7103a716d3a 六个CI全绿：Management #45 https://github.com/trade3403/localtunnel/actions/runs/45640945788 、#46 https://github.com/trade3403/localtunnel/actions/runs/45640959700 、Windows #122、Gateway #116、Runner #240/#241。#46 job 139299149527 实际审计/权限/历史清理/Chromium及所有旧回归和双锁门禁成功，报告 https://github.com/trade3403/localtunnel/actions/runs/45640959700/artifacts/15034989184 。
 - Windows 客户端新增实际本机管理配对、独立当前用户DPAPI设备token、身份/配置元数据/手动心跳同步、吊销拒绝及本地移除；token不回WebView、固定回环高位端口、禁代理跳转、响应限制。不自动应用远程草稿或影响原隧道。reqwest 0.13.5 已锁定，新增直接引用及根锁引用，不新引入TLS。Windows CI 增加同commit真实控制面构建及安装版GUI配对/实际后台心跳/吊销/DPAPI验证。新功能待CI，仍无远程TLS/自动同步/管理隧道配置下发、服务模式管理设备、真实公网/普通用户验收。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-25：Windows 管理联动 CI 修复
+- HEAD bde2ea61c07795730c4d848ba5b6982483e990e1 六个CI均结束：Management #47 https://github.com/trade3403/localtunnel/actions/runs/45643414508 成功、#48 https://github.com/trade3403/localtunnel/actions/runs/45643428070 失败；Windows #123 https://github.com/trade3403/localtunnel/actions/runs/45643428262 失败；Gateway #117、Runner #242/#243 成功。
+- 实际 Management job 139307897270 在 preview_e2e.py:257 报 AssertionError: candidate was not actually probed。推测Nginx新旧worker切换竞争，无旧连接归属直接证据。受检业务代理响应增加由网关注入的revision并隐藏上游同名头，curl核对同候选版本+200+精确正文；错误代际/连接失败有界重试，候选错误响应直接回滚。旧版本及TLS探测有界等待，原真实探测/回滚测试不放宽，新增解析单测。
+- 实际 Windows job 139307898176 已通过Rust单测、Noise/SCM、NSIS构建、真实控制面构建与锁门禁；真实安装GUI经过新管理配对/DPAPI/同步/吊销/移除后，在 installed_gui_e2e.mjs:396 GUI gate timed out: enabled service button 一键部署新服务。代码证实新增管理checkbox在原SCM确认框前，旧首个checkbox选择错误；SCM独立aria-label与精确测试选择器修复，保留所有业务门禁。无新依赖，不进入自动心跳下一阶段，修复待CI。未改main、未部署公网、未开启定时任务。

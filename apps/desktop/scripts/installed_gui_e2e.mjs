@@ -391,7 +391,7 @@ try {
   // SCM service using the installed app's actual Vue button and Rust IPC.
   await until('desktop form editable', () => evaluate('!!document.querySelector("input[placeholder=\\"relay.example.com:2333\\"]:not(:disabled)")'))
   const beforeDirs = new Set((await readdir(process.env.ProgramData)).filter(n=>/^LocalTunnelPreview-[0-9a-f]{32}$/.test(n)))
-  const checked = await evaluate('(()=>{const e=document.querySelector("input[type=checkbox]");if(!e||e.disabled)return false;if(!e.checked)e.click();return e.checked})()')
+  const checked = await evaluate('(()=>{const e=document.querySelector("input[aria-label=\\\"确认部署新服务\\\"]");if(!e||e.disabled)return false;if(!e.checked)e.click();return e.checked})()')
   if (!checked) throw Error('provision confirmation unavailable')
   await serviceClick('一键部署新服务')
   try {

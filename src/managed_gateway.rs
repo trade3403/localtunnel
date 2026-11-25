@@ -77,7 +77,7 @@ mod linux {
             // Only checked single-route previews. Numeric counters only;
             // never log URLs, IP addresses, headers, cookies or bodies.
             config = config.replace("    access_log off;", "    access_log off;\n    log_format lt_traffic '$request_length $bytes_sent $status';");
-            config = config.replace("        location / {", &format!("        location / {{\n            access_log traffic-{revision}.log lt_traffic;"));
+            config = config.replace("        location / {", &format!("        location / {{\n            access_log traffic-{revision}.log lt_traffic;\n            proxy_hide_header X-LocalTunnel-Revision;\n            add_header X-LocalTunnel-Revision {revision} always;"));
         }
         if let Some(tls) = tls {
             // A dedicated loopback listener checks activation even if a certificate changes.
@@ -121,13 +121,64 @@ mod linux {
         result.unwrap_or(false)
     }
 
-    fn wait_active(bind: SocketAddr, revision: &str) -> bool {
+    fn wait_until(mut check: impl FnMut() -> bool) -> bool {
         let end = Instant::now() + Duration::from_secs(8);
         while Instant::now() < end {
-            if active_revision(bind, revision) { return true; }
+            if check() { return true; }
             thread::sleep(Duration::from_millis(150));
         }
         false
+    }
+
+    fn wait_active(bind: SocketAddr, revision: &str) -> bool {
+        wait_until(|| active_revision(bind, revision))
+    }
+
+    // The default-host revision probe and the next business connection can
+    // reach different Nginx worker generations during a graceful reload.
+    // Attribute the actual response to the checked route's own revision.
+    // The header is injected by Nginx; upstream copies are suppressed.
+    // Retry transport/other-generation responses only. A response from
+    // the candidate with wrong status or body is an immediate failure.
+    #[derive(Debug,PartialEq,Eq)]
+    enum Business { Retry, Reject, Accept }
+
+    fn classify_business(output: &[u8], revision: &str, expected: &[u8]) -> Business {
+        let Some(end) = output.iter().rposition(|b| *b == b'\n') else { return Business::Retry };
+        let Some((status, actual)) = std::str::from_utf8(&output[end+1..]).ok().and_then(|s| s.split_once(' ')) else { return Business::Retry };
+        if actual != revision { return Business::Retry; }
+        if status == "200" && &output[..end] == expected { Business::Accept } else { Business::Reject }
+    }
+
+    fn checked_business(revision: &str, expected: &[u8], mut invoke: impl FnMut() -> std::io::Result<std::process::Output>) -> bool {
+        let end = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < end {
+            if let Ok(out) = invoke() {
+                if out.status.success() {
+                    match classify_business(&out.stdout, revision, expected) {
+                        Business::Accept => return true,
+                        Business::Reject => return false,
+                        Business::Retry => {}
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        false
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        #[test]
+        fn business_requires_same_revision_and_exact_status_body() {
+            let expected = b"real\nbody";
+            assert_eq!(classify_business(b"real\nbody\n200 10-20","10-20",expected), Business::Accept);
+            assert_eq!(classify_business(b"real\nbody\n200 10-19","10-20",expected), Business::Retry);
+            assert_eq!(classify_business(b"old response\n421 ","10-20",expected), Business::Retry);
+            assert_eq!(classify_business(b"wrong\n200 10-20","10-20",expected), Business::Reject);
+            assert_eq!(classify_business(b"real\nbody\n502 10-20","10-20",expected), Business::Reject);
+        }
     }
 
     fn init_mode(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>) -> Result<(), String> {
@@ -145,7 +196,7 @@ mod linux {
         Ok(())
     }
 
-    fn apply_mode(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>, meter: bool, business_check: impl FnOnce() -> bool) -> Result<(), String> {
+    fn apply_mode(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>, meter: bool, business_check: impl FnOnce(&str) -> bool) -> Result<(), String> {
         let prefix = directory(prefix)?;
         let (config, revision) = generate(bind, routes, tls, meter)?;
         let lock = prefix.join("localtunnel.lock");
@@ -159,7 +210,7 @@ mod linux {
         let identity = if let Some(tls) = tls { format!("{TLS_MARKER}{bind} {} ", tls.probe) } else { format!("{MARKER}{bind} ") };
         let old_revision = old.lines().next().and_then(|s| s.strip_prefix(&identity)).ok_or("not a managed configuration for this listener and mode")?;
         let probe = tls.map_or(bind, |t| t.probe);
-        if !active_revision(probe, old_revision) {
+        if !wait_active(probe, old_revision) {
             return Err("previous revision not running; refusing update".into());
         }
 
@@ -175,7 +226,7 @@ mod linux {
             let _ = fs::remove_file(&backup);
             return Err(err(e));
         }
-        if nginx(&prefix, &active, &["-s", "reload"]).is_ok() && wait_active(probe, &revision) && tls.is_none_or(|t| routes.iter().all(|r| verify_tls(bind, r, t, &revision))) && business_check() {
+        if nginx(&prefix, &active, &["-s", "reload"]).is_ok() && wait_active(probe, &revision) && tls.is_none_or(|t| wait_until(|| routes.iter().all(|r| verify_tls(bind, r, t, &revision)))) && business_check(&revision) {
             fs::remove_file(&backup).map_err(err)?;
             return Ok(());
         }
@@ -192,7 +243,7 @@ mod linux {
         init_mode(prefix, bind, routes, None)
     }
     pub fn apply(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>]) -> Result<(), String> {
-        apply_mode(prefix, bind, routes, None, false, || true)
+        apply_mode(prefix, bind, routes, None, false, |_| true)
     }
     /// Operator-provided expected body is checked only after the candidate
     /// revision is observed. A mismatch uses the same real rollback path.
@@ -201,13 +252,12 @@ mod linux {
             return Err("expected body must be 1-65536 bytes".into());
         }
         let host=route.domain;
-        apply_mode(prefix, bind, &[route], None, true, || {
+        apply_mode(prefix, bind, &[route], None, true, |revision| {
             // Fixed loopback destination, validated Host, no redirects,
             // disabled user curl configuration, bounded time and response.
             let url=format!("http://{bind}/");
             let header=format!("Host: {host}");
-            let out=Command::new("/usr/bin/curl").args(["--disable","--silent","--fail","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--header",&header,"--write-out","%{http_code}",&url]).output();
-            out.is_ok_and(|o| o.status.success() && o.stdout.len()==expected.len()+3 && o.stdout.ends_with(b"200") && &o.stdout[..expected.len()]==expected)
+            checked_business(revision, expected, || Command::new("/usr/bin/curl").args(["--disable","--silent","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--header",&header,"--write-out","\n%{http_code} %{header:x-localtunnel-revision}",&url]).output())
         })
     }
     pub fn apply_checked_tls(prefix: &Path, bind: SocketAddr, route: Route<'_>, tls: &TlsSettings<'_>, expected: &[u8]) -> Result<(), String> {
@@ -215,18 +265,17 @@ mod linux {
             return Err("expected body must be 1-65536 bytes".into());
         }
         let host=route.domain;
-        apply_mode(prefix, bind, &[route], Some(tls), true, || {
+        apply_mode(prefix, bind, &[route], Some(tls), true, |revision| {
             let resolve=format!("{host}:{}:127.0.0.1",bind.port());
             let url=format!("https://{host}:{}/",bind.port());
-            let out=Command::new("/usr/bin/curl").args(["--disable","--silent","--fail","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--cacert",tls.ca,"--resolve",&resolve,"--write-out","%{http_code}",&url]).output();
-            out.is_ok_and(|o| o.status.success() && o.stdout.len()==expected.len()+3 && o.stdout.ends_with(b"200") && &o.stdout[..expected.len()]==expected)
+            checked_business(revision, expected, || Command::new("/usr/bin/curl").args(["--disable","--silent","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--cacert",tls.ca,"--resolve",&resolve,"--write-out","\n%{http_code} %{header:x-localtunnel-revision}",&url]).output())
         })
     }
     pub fn init_tls(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: &TlsSettings<'_>) -> Result<(), String> {
         init_mode(prefix, bind, routes, Some(tls))
     }
     pub fn apply_tls(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: &TlsSettings<'_>) -> Result<(), String> {
-        apply_mode(prefix, bind, routes, Some(tls), false, || true)
+        apply_mode(prefix, bind, routes, Some(tls), false, |_| true)
     }
 }
 
