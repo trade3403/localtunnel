@@ -121,3 +121,8 @@
 ## 2026-11-25：桌面流量验收、SCM 实际流量快照
 - HEAD 267dab3402dbc5921af242c4dc059a7722bde8c7，CI #73 https://github.com/trade3403/localtunnel/actions/runs/45553836046 全部通过，24/24 单测（包含32768/65536真实字节及半关闭）、1/1 实际桌面 TCP（0.73s 测试耗时）、真实 SCM 和锁定构建/安装卸载通过，EXE 3.26 MiB。核心 #80、Runner #168 通过。安装包 https://github.com/trade3403/localtunnel/actions/runs/45553836046/artifacts/14995121156 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45553836046/artifacts/14994926553 。
 - SCM 复用桌面真实字节计量层，128 并发、固定本地目标；每秒写入引擎临时目录内固定 traffic.json（只有数值、宿主/引擎 PID、采样时间，无凭据/载荷）。SCM 查询验证路径、ACL、单一 runtime、4KiB 上限、宿主 PID 和5秒新鲜度；未知或无权限返回空，不影响隧道。崩溃清理白名单增加 traffic.json，正常停止关闭文件句柄再删除目录。GUI 展示独立服务上传/下载速度和累计字节。CI 真实 HTTP 后验证服务计数、自动宿主恢复后新 PID 的实际计数及停止无流量快照。所有新增待 CI；当前计量为单次引擎会话，非历史累计/计费，普通非管理员若无法访问 ACL 保护目录仍只显示 SCM 状态；不放宽权限。固定文件非原子写入，读取遇半截 JSON 返回空，下次采样恢复；同 LocalService 身份和本地回环访问不构成防篡改计费证明。未修改 main。下一步安全历史累计与 GUI 服务管理。
+
+
+## 2026-11-25：SCM 流量 CI #75 编译修复
+- HEAD 3aaacc5d6722e94a0fd9cea6ffb3652cacdfd194，CI #75 https://github.com/trade3403/localtunnel/actions/runs/45555726060 在 Rust desktop unit tests 编译阶段失败。实际日志 job 139007181452：src/main.rs:207-208 E0308，publish_service_traffic 返回 Result<(), String>，尾表达式 map_err 返回 &str。核心 #81、Runner #170 通过；后续真实服务测试/安装包均未执行，失败证据 https://github.com/trade3403/localtunnel/actions/runs/45555726060/artifacts/14995353279 。
+- 本次仅将尾表达式错误转换为 String，保留全部测试、安全校验和计量行为，不跳过验收。重新触发 CI，待真实后台计量通过后再做历史累计。未改 main 分支。

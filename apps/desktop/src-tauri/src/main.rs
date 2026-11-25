@@ -205,7 +205,7 @@ impl Supervisor {
         // Fixed file and bounded record; no extra temp files to survive a
         // host crash. Reader rejects partial or stale records.
         file.seek(SeekFrom::Start(0)).and_then(|_| file.set_len(0))
-            .and_then(|_| file.write_all(&bytes)).map_err(|_| "sample write failed")
+            .and_then(|_| file.write_all(&bytes)).map_err(|_| "sample write failed".to_owned())
     }
 
     fn stop(&mut self) -> Result<Status, String> {
