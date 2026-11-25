@@ -9,6 +9,8 @@ mod engine_job;
 mod service_host;
 #[cfg(windows)]
 mod service_acl;
+#[cfg(windows)]
+mod service_control;
 
 use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};
@@ -252,6 +254,10 @@ fn main() {
     #[cfg(windows)]
     {
         let args: Vec<String> = std::env::args().collect();
+        if args.get(1).is_some_and(|arg| arg == "--service-control") {
+            let ok = args.len() == 4 && service_control::execute(&args[2], &args[3]).is_ok();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
         if args.get(1).is_some_and(|arg| arg == "--service-seal-profile") {
             let ok = args.len() == 3 && service_host::seal_profile_from_stdin(&args[2]).is_ok();
             std::process::exit(if ok { 0 } else { 1 });

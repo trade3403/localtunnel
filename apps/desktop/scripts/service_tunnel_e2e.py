@@ -45,7 +45,8 @@ def main(executable, evidence):
     report = {"scope": "real SCM LocalService same-host encrypted HTTP; no public E2E",
               "registered": False, "sealed_profile": False, "invalid_profile_rejected": False,
               "overwrite_rejected": False, "unsafe_acl_rejected": False,
-              "unsafe_profile_acl_rejected": False, "forwarded": False,
+              "unsafe_profile_acl_rejected": False, "autostart_unsafe_rejected": False,
+              "autostart_enabled": False, "autostart_disabled": False, "forwarded": False,
               "stopped": False, "runtime_cleaned": False, "deleted": False}
     created = False
     relay = None
@@ -148,18 +149,34 @@ bind_addr = "127.0.0.1:{mapped}"
                 # Machine DPAPI is not sufficient by itself. Even read
                 # access to ciphertext by another principal must block SCM start.
                 run("icacls.exe", str(root / "service-profile.bin"), "/grant:r", "*S-1-1-0:RX")
+                def control(action, check=True):
+                    return run(str(exe), "--service-control", name, action, check=check)
+                if control("autostart-on", check=False).returncode == 0:
+                    raise RuntimeError("unsafe service autostart accepted")
+                report["autostart_unsafe_rejected"] = True
                 sc("start", name, check=False)
                 wait_state(name, 1)
                 if any((root / "runtime").iterdir()):
                     raise RuntimeError("unsafe profile started an engine")
                 report["unsafe_profile_acl_rejected"] = True
                 run("icacls.exe", str(root / "service-profile.bin"), "/remove:g", "*S-1-1-0")
-                sc("start", name)
+                control("check")
+                if not re.search(r"START_TYPE\s*:\s*3\b", sc("qc", name).stdout):
+                    raise RuntimeError("service did not default to manual")
+                control("autostart-on")
+                if not re.search(r"START_TYPE\s*:\s*2\b", sc("qc", name).stdout):
+                    raise RuntimeError("SCM auto start not configured")
+                report["autostart_enabled"] = True
+                control("autostart-off")
+                if not re.search(r"START_TYPE\s*:\s*3\b", sc("qc", name).stdout):
+                    raise RuntimeError("SCM manual start not restored")
+                report["autostart_disabled"] = True
+                control("start")
                 wait_state(name, 4)
                 url = f"http://127.0.0.1:{mapped}/"
                 e2e.wait_for(url, body, [relay], seconds=35)
                 report["forwarded"] = True
-                sc("stop", name)
+                control("stop")
                 wait_state(name, 1)
                 report["stopped"] = True
                 if any((root / "runtime").iterdir()):

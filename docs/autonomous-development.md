@@ -71,3 +71,8 @@
 ## 2026-11-25：Rust 凭据配置验收、服务 ACL 自检
 - HEAD 6a652f4ce0cfc1080c21f832afbc0599ff11b71c，CI #53 https://github.com/trade3403/localtunnel/actions/runs/45528325145 全部通过，15/15 单测及 1/1 真实桌面隧道（0.87s 测试耗时）、Rust 服务密封配置、错误引擎拒绝、无覆盖及 SCM 真 HTTP 隧道、锁定构建、安装卸载通过。EXE 3.15 MiB；预览包 https://github.com/trade3403/localtunnel/actions/runs/45528325145/artifacts/14982944647 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45528325145/artifacts/14983623040 。核心 #70、Runner #148 通过。
 - 新增 Windows native service_acl.rs，以 GetNamedSecurityInfoW/GetAce/LookupAccountNameW 校验部署根目录、宿主 EXE、engine 目录/EXE、runtime 目录及启动时密文配置。仅允许管理员/SYSTEM 持有所有者和完全权限、对应服务 SID 仅 RX（runtime 允许 Modify），拒绝未知 ACE、额外身份、过度授权、缺失 ACL、重解析点；密封前及实际启动前均自检。CI 设置所有者为 Administrators，注入 Everyone RX，验证密封拒绝以及不安全密文文件导致启动失败，恢复严格 ACL 后验证真实转发。新代码待 CI。此检查是严格预览目录门禁，尚非完整 Windows 安全审计；不覆盖父目录/管理员篡改、并发 ACL 变更或所有异常残留路径。未自动注册/自启任何用户设备。下一步验收、正式显式服务部署管理及开机自启、恢复与状态流量。
+
+
+## 2026-11-25：服务 ACL 验收、显式 SCM 控制及自启配置
+- HEAD 4df1a40aaf3409b28e9367df513771ec3e21194f，Windows CI #55 https://github.com/trade3403/localtunnel/actions/runs/45532163893 全部通过；15/15 单测、1/1 桌面真实生命周期、非法 Everyone ACL 拒绝、服务真实 HTTP 转发及清理、安装卸载通过，EXE 3.15 MiB。预览包 https://github.com/trade3403/localtunnel/actions/runs/45532163893/artifacts/14984394326 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45532163893/artifacts/14984124944 。核心 #71、Runner #150 通过。
+- 新增 service_control.rs 和显式 --service-control <preview-name> check|start|stop|autostart-on|autostart-off；原生 SCM 访问权限最小化、校验已部署服务的完整 ImagePath、LocalService 身份及 own-process 类型，开始/启用前复核 ACL、密封配置和引擎指纹，停止/关闭自启保留故障恢复路径；有界等待启动停止，修改自启后读回验证。默认手动，不创建服务、不自动提权、不修改用户计算机。新增真实 SCM 测试：不安全自启拒绝、手动默认、自启开启与关闭的 SCM 实际配置、通过产品 Rust 控制入口启动停止并验证真实隧道。仅配置级自启测试，不是重启后启动验收。全部新代码待 CI。后续完成显式安装删除工具、异常恢复/孤立配置清理、GUI 控制及真实状态计量。仍仅安全预览分支，未修改 main。

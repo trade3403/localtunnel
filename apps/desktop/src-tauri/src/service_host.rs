@@ -97,7 +97,7 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
     let _ = report(handle, SERVICE_STOPPED, if failed { ERROR_GEN_FAILURE } else { 0 });
 }
 
-fn deployment_dir(name: &str) -> Result<std::path::PathBuf, String> {
+pub fn deployment_dir(name: &str) -> Result<std::path::PathBuf, String> {
     if !valid_name(name) { return Err("invalid service name".into()); }
     let exe = std::env::current_exe().map_err(|_| "service executable unavailable")?;
     let dir = exe.parent().ok_or("service directory missing")?;
