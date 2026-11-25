@@ -95,6 +95,86 @@ fn set_start_type(service: &Handle, mode: u32) -> Result<(), String> {
 }
 
 const DELETE_RIGHT: u32 = 0x0001_0000;
+const RECOVERY_RESET_SECONDS: u32 = 86400;
+
+fn recovery_actions(enabled: bool) -> Vec<SC_ACTION> {
+    let mut actions = Vec::new();
+    if enabled {
+        for delay in [3000, 6000, 12000] {
+            actions.push(SC_ACTION { Type: SC_ACTION_RESTART, Delay: delay });
+        }
+    }
+    // SCM repeats the last action for later failures. End with NONE.
+    actions.push(SC_ACTION { Type: SC_ACTION_NONE, Delay: 0 });
+    actions
+}
+
+fn query_config2(service: &Handle, level: u32) -> Result<Vec<usize>, String> {
+    let mut size = 0;
+    unsafe { QueryServiceConfig2W(service.0, level, ptr::null_mut(), 0, &mut size); }
+    if size == 0 || size > 65536 { return Err("invalid recovery configuration size".into()); }
+    let mut data = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+    if unsafe { QueryServiceConfig2W(service.0, level, data.as_mut_ptr().cast(), size, &mut size) } == 0 {
+        return Err(last_error());
+    }
+    Ok(data)
+}
+
+fn verify_recovery(service: &Handle, expected: &[SC_ACTION]) -> Result<(), String> {
+    let data = query_config2(service, SERVICE_CONFIG_FAILURE_ACTIONS)?;
+    let size = std::mem::size_of_val(data.as_slice());
+    if size < std::mem::size_of::<SERVICE_FAILURE_ACTIONSW>() {
+        return Err("invalid failure actions structure".into());
+    }
+    let info = unsafe { &*data.as_ptr().cast::<SERVICE_FAILURE_ACTIONSW>() };
+    let start = data.as_ptr() as usize;
+    let actions = info.lpsaActions as usize;
+    let bytes = std::mem::size_of_val(expected);
+    if info.dwResetPeriod != RECOVERY_RESET_SECONDS || info.cActions as usize != expected.len()
+        || actions < start || actions % std::mem::align_of::<SC_ACTION>() != 0
+        || actions.checked_add(bytes).is_none_or(|end| end > start + size) {
+        return Err("unexpected failure action configuration".into());
+    }
+    let actual = unsafe { std::slice::from_raw_parts(info.lpsaActions, expected.len()) };
+    if !actual.iter().zip(expected).all(|(a,b)| a.Type == b.Type && a.Delay == b.Delay) {
+        return Err("failure actions readback mismatch".into());
+    }
+    let flag = query_config2(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG)?;
+    if std::mem::size_of_val(flag.as_slice()) < std::mem::size_of::<SERVICE_FAILURE_ACTIONS_FLAG>() {
+        return Err("invalid failure actions flag".into());
+    }
+    let flag = unsafe { &*flag.as_ptr().cast::<SERVICE_FAILURE_ACTIONS_FLAG>() };
+    if flag.fFailureActionsOnNonCrashFailures != 0 {
+        return Err("non-crash recovery must remain disabled".into());
+    }
+    Ok(())
+}
+
+fn set_recovery(service: &Handle, enabled: bool) -> Result<(), String> {
+    // Only unexpected process termination is eligible, not a normal stop
+    // or the host deliberately reporting a bad configuration and stopping.
+    let flag = SERVICE_FAILURE_ACTIONS_FLAG { fFailureActionsOnNonCrashFailures: 0 };
+    if unsafe { ChangeServiceConfig2W(service.0, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+        (&flag as *const SERVICE_FAILURE_ACTIONS_FLAG).cast()) } == 0 {
+        return Err(last_error());
+    }
+    let mut actions = recovery_actions(enabled);
+    // Clear any old command or reboot message; never run external commands.
+    let mut empty = [0u16];
+    let info = SERVICE_FAILURE_ACTIONSW {
+        dwResetPeriod: RECOVERY_RESET_SECONDS,
+        lpRebootMsg: empty.as_mut_ptr(),
+        lpCommand: empty.as_mut_ptr(),
+        cActions: actions.len() as u32,
+        lpsaActions: actions.as_mut_ptr(),
+    };
+    if unsafe { ChangeServiceConfig2W(service.0, SERVICE_CONFIG_FAILURE_ACTIONS,
+        (&info as *const SERVICE_FAILURE_ACTIONSW).cast()) } == 0 {
+        return Err(last_error());
+    }
+    verify_recovery(service, &actions)
+}
+
 
 fn register(name: &str, dir: &std::path::Path, exe: &str) -> Result<(), String> {
     crate::service_acl::validate_registration(dir)?;
@@ -140,7 +220,8 @@ fn access(action: &str) -> Result<u32, String> {
     Ok(common | match action {
         "start" => SERVICE_START,
         "stop" => SERVICE_STOP,
-        "autostart-on" | "autostart-off" => SERVICE_CHANGE_CONFIG,
+        "autostart-on" | "autostart-off" | "recovery-off" => SERVICE_CHANGE_CONFIG,
+        "recovery-on" => SERVICE_CHANGE_CONFIG | SERVICE_START,
         "check" => 0,
         "unregister" => SERVICE_CHANGE_CONFIG | DELETE_RIGHT,
         _ => return Err("unknown service action".into()),
@@ -157,7 +238,7 @@ pub fn execute(name: &str, action: &str) -> Result<(), String> {
     config(&service, name, exe)?;
     // Stop and disabling autostart must remain available even if the
     // profile or ACL was damaged. Never start/enable an unsafe deployment.
-    if matches!(action, "start" | "autostart-on" | "check") {
+    if matches!(action, "start" | "autostart-on" | "recovery-on" | "check") {
         crate::service_acl::validate(&dir, name, true)?;
         crate::credentials::load_service(&dir)?;
         let scratch = tempfile::tempdir().map_err(|_| "engine check directory unavailable")?;
@@ -165,6 +246,11 @@ pub fn execute(name: &str, action: &str) -> Result<(), String> {
     }
     match action {
         "check" => Ok(()),
+        "recovery-on" | "recovery-off" => {
+            // An already queued SCM restart may survive a policy edit.
+            // Disable future recovery explicitly; unregister also disables start.
+            set_recovery(&service, action == "recovery-on")
+        }
         "unregister" => {
             if status(&service)? != SERVICE_STOPPED {
                 return Err("stop service before unregistering".into());
@@ -211,6 +297,20 @@ pub fn execute(name: &str, action: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_policy_has_a_terminal_no_action() {
+        let enabled = recovery_actions(true);
+        assert_eq!(enabled.len(), 4);
+        assert_eq!(enabled[0].Type, SC_ACTION_RESTART);
+        assert_eq!(enabled[0].Delay, 3000);
+        assert_eq!(enabled[1].Delay, 6000);
+        assert_eq!(enabled[2].Delay, 12000);
+        assert_eq!(enabled[3].Type, SC_ACTION_NONE);
+        let disabled = recovery_actions(false);
+        assert_eq!(disabled.len(), 1);
+        assert_eq!(disabled[0].Type, SC_ACTION_NONE);
+    }
+
     #[test]
     fn stop_accepts_running_before_worker_reports_pending() {
         assert!(transition_allowed(SERVICE_RUNNING, SERVICE_STOPPED, SERVICE_STOP_PENDING));

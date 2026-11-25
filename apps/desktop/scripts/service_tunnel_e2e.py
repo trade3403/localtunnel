@@ -78,7 +78,9 @@ def main(executable, evidence):
               "stopped": False, "runtime_cleaned": False, "deleted": False,
               "engine_recovered": False, "old_runtime_cleaned": False,
               "host_crash_restart": False, "host_crash_runtime_cleaned": False,
-              "unknown_runtime_preserved": False}
+              "unknown_runtime_preserved": False, "unsafe_recovery_rejected": False,
+              "automatic_host_recovered": False, "normal_stop_no_recovery": False,
+              "recovery_disabled": False}
     created = False
     relay = None
     fixture = None
@@ -193,6 +195,9 @@ bind_addr = "127.0.0.1:{mapped}"
                 if control("autostart-on", check=False).returncode == 0:
                     raise RuntimeError("unsafe service autostart accepted")
                 report["autostart_unsafe_rejected"] = True
+                if control("recovery-on", check=False).returncode == 0:
+                    raise RuntimeError("unsafe service recovery accepted")
+                report["unsafe_recovery_rejected"] = True
                 sc("start", name, check=False)
                 wait_state(name, 1)
                 if any((root / "runtime").iterdir()):
@@ -268,6 +273,32 @@ bind_addr = "127.0.0.1:{mapped}"
                 report["host_crash_runtime_cleaned"] = True
                 e2e.wait_for(url, body, [relay], seconds=35)
                 report["host_crash_restart"] = True
+                # Recovery is explicitly enabled only after the manual-crash
+                # tests. This is a disposable test service with a unique name.
+                control("recovery-on")
+                previous_host = service_pid(name)
+                previous_child = engine_child(previous_host, root)
+                if previous_child is None:
+                    raise RuntimeError("engine missing before automatic recovery")
+                started_at = time.monotonic()
+                run("taskkill.exe", "/PID", str(previous_host), "/F")
+                deadline = time.monotonic() + 35
+                recovered_host = None
+                while time.monotonic() < deadline:
+                    result = sc("queryex", name)
+                    pid = re.search(r"PID\s*:\s*(\d+)", result.stdout)
+                    if (re.search(r"STATE\s*:\s*4\b", result.stdout) and pid
+                            and int(pid.group(1)) not in (0, previous_host)):
+                        recovered_host = int(pid.group(1))
+                        break
+                    time.sleep(.25)
+                if recovered_host is None:
+                    raise RuntimeError("SCM failed automatic host recovery")
+                if previous_child[1].exists():
+                    raise RuntimeError("automatic recovery left old runtime")
+                e2e.wait_for(url, body, [relay], seconds=35)
+                report["automatic_host_recovered"] = True
+                report["automatic_host_recovery_seconds"] = round(time.monotonic() - started_at, 3)
                 if control("unregister", check=False).returncode == 0:
                     raise RuntimeError("running service unregistered")
                 report["running_unregister_rejected"] = True
@@ -285,6 +316,16 @@ bind_addr = "127.0.0.1:{mapped}"
                     time.sleep(.25)
                 if e2e.get(url) == body:
                     raise RuntimeError("tunnel survived service stop")
+                # Observe longer than the longest configured restart delay.
+                until = time.monotonic() + 14
+                while time.monotonic() < until:
+                    result = sc("query", name)
+                    if not re.search(r"STATE\s*:\s*1\b", result.stdout):
+                        raise RuntimeError("normal stop unexpectedly triggered SCM recovery")
+                    time.sleep(.5)
+                report["normal_stop_no_recovery"] = True
+                control("recovery-off")
+                report["recovery_disabled"] = True
             finally:
                 if relay is not None:
                     e2e.terminate(relay)
@@ -305,6 +346,9 @@ bind_addr = "127.0.0.1:{mapped}"
             raise RuntimeError("service remains after deletion")
     finally:
         if created:
+            # Disable startup before emergency cleanup, including a queued retry.
+            control("recovery-off", check=False)
+            sc("config", name, "start=", "disabled", check=False)
             sc("stop", name, check=False)
             try:
                 wait_state(name, 1, 15)
