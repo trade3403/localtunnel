@@ -301,6 +301,9 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     // Reset the exclusive gateway to empty and verify the revision first.
     // This dedicated prefix must not serve other mappings.
     transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await?;
+    // Preserve recovery metadata and the empty gateway even when a prior
+    // run's retained log inventory prevents admitting a new generation.
+    crate::traffic::check_log_budget(&root.join(prefix),true)?;
     export(pool,root,id,revision,relay_port,bundle).await?;
     let mut children=TunnelChildren(Vec::new());
     let mut meter=None;
@@ -335,6 +338,9 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
             if stop_requested(stop_marker)?{return Ok(())}
             if checked_protocol(pool,id,revision,transport.protocol()).await.is_err(){return Ok(())}
             if !children.healthy(){return Err("tunnel child exited")}
+            // Sampled every supervisor iteration. This is a soft admission
+            // threshold, not a filesystem-enforced hard byte quota.
+            crate::traffic::check_log_budget(&root.join(prefix),false)?;
             if let Some(rid)=request{
                 if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}
                 if let Some(meter)=meter.as_mut(){meter.sample(pool,id,revision,rid,false).await;}
@@ -485,6 +491,45 @@ fn read_recovery(root:&Path,prefix:&str,rid:&str)->Result<Recovery>{
     if r.prefix!=prefix||r.request_id!=rid{return Err("recovery identity mismatch")}
     Ok(r)
 }
+/// Explicit offline retention maintenance; never unlink a live log.
+pub fn prune_gateway_logs(root:&Path,prefix:&str)->Result<usize>{
+    if !cfg!(target_os="linux"){return Err("Linux gateway logs only")}
+    let _worker=guard(root,"worker",prefix)?;
+    let _supervisor=guard(root,"supervisor",prefix)?;
+    let dir=root.join(prefix);
+    private_dir(&dir)?;
+    for kind in ["worker","supervisor"]{
+        if stop_requested(Some(&root.join(format!("{kind}-{prefix}.lock"))))?{
+            return Err("unresolved runtime marker")
+        }
+    }
+    for name in ["nginx.pid","localtunnel.lock","nginx.previous.conf","nginx.candidate.conf"]{
+        if stop_requested(Some(&dir.join(name)))?{return Err("gateway not offline or recovery pending")}
+    }
+    let config_path=dir.join("nginx.conf");
+    let m=fs::symlink_metadata(&config_path).map_err(|_|"gateway config unavailable")?;
+    if !m.is_file()||m.len()>65536{return Err("invalid gateway config")}
+    let config=fs::read_to_string(config_path).map_err(|_|"gateway config unreadable")?;
+    if config.contains("lt_traffic")||config.contains("proxy_pass "){return Err("gateway must be cleared before shutdown")}
+    let first=config.lines().next().ok_or("gateway marker missing")?;
+    let fields:Vec<_>=first.split_ascii_whitespace().collect();
+    let count=match fields.as_slice(){
+        ["#","localtunnel-managed-http",_,_]=>1,
+        ["#","localtunnel-managed-https",_,_,_]=>2,
+        _=>return Err("invalid gateway marker"),
+    };
+    for address in &fields[2..2+count]{
+        let socket:std::net::SocketAddr=address.parse().map_err(|_|"invalid gateway listener")?;
+        if socket.ip()!=std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)||socket.port()<1024||!refused(socket.port()){
+            return Err("gateway listener still reachable or invalid")
+        }
+    }
+    // The trusted operator must also ensure Nginx has fully exited and
+    // no manual gateway commands are running. Never infer process ownership
+    // from an arbitrary PID or delete a PID file.
+    crate::traffic::prune_offline(&dir)
+}
+
 fn refused(p:u16)->bool{
     use std::net::{SocketAddr,Ipv4Addr,TcpStream};
     let addr=SocketAddr::from((Ipv4Addr::LOCALHOST,p));

@@ -103,14 +103,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let tls_resident = args.first().is_some_and(|a| a=="--runtime-tls-resident");
     let recover = args.first().is_some_and(|a| a=="--recover-runtime");
     let prune_history = args.first().is_some_and(|a| a=="--prune-history");
-    let expected = if prune_history {2} else if recover {4} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
+    let prune_logs = args.first().is_some_and(|a| a=="--prune-gateway-logs");
+    let expected = if prune_logs {3} else if prune_history {2} else if recover {4} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir>".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
     }
-    let operator = init || add_node || set_node || export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history;
+    let operator = init || add_node || set_node || export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
+    if prune_logs{
+        let count=preview::prune_gateway_logs(&root,args[2].to_str().ok_or("invalid prefix")?)?;
+        println!("removed {count} expired numeric gateway logs");
+        return Ok(())
+    }
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_secs(3))
