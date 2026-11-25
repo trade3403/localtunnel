@@ -27,6 +27,8 @@ jobs:
           cargo build --release --locked
       - name: Real management HTTP and SQLite lifecycle
         run: python3 crates/server/tests/http_e2e.py crates/server/target/release/localtunnel-server management-evidence/http.json
+      - name: Real consistent SQLite snapshot and isolated recovery
+        run: python3 crates/server/tests/backup_e2e.py crates/server/target/release/localtunnel-server management-evidence/backup.json
       - name: Real management resource admission and deadline
         run: python3 crates/server/tests/protection_e2e.py crates/server/target/release/localtunnel-server management-evidence/protection.json
       - name: Real HTTP transport connection and header limits

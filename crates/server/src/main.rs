@@ -9,6 +9,8 @@ mod traffic;
 mod audit;
 mod protection;
 mod transport;
+#[cfg(target_os = "linux")]
+mod backup;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -89,6 +91,19 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let backup_db = args.first().is_some_and(|a| a=="--backup-db");
+    let restore_db = args.first().is_some_and(|a| a=="--restore-db");
+    if backup_db || restore_db {
+        if args.len()!=3{return Err("usage: --backup-db <data-dir> <new-backup-dir> | --restore-db <backup-dir> <new-data-dir>".into())}
+        #[cfg(target_os = "linux")]
+        {
+            backup::run(Path::new(&args[1]),Path::new(&args[2]),restore_db).await?;
+            println!("verified database snapshot published");
+            return Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err("database snapshot maintenance is Linux-only".into());
+    }
     let init = args.first().is_some_and(|a| a=="--init-admin");
     let add_node = args.first().is_some_and(|a| a=="--add-node");
     let set_node = args.first().is_some_and(|a| a=="--set-node-enabled");
