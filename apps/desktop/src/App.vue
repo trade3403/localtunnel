@@ -62,6 +62,9 @@ function unwatchService() {
 }
 type Traffic = { state: 'inactive' | 'unknown' | 'measured'; uploadBytes: number | null; downloadBytes: number | null; uploadBytesPerSecond: number | null; downloadBytesPerSecond: number | null }
 const traffic = ref<Traffic | null>(null)
+type TrafficHistory = { saved: { uploadBytes: number; downloadBytes: number; savedAtMs: number } | null; writeFailed: boolean }
+const trafficHistory = ref<TrafficHistory | null>(null)
+const historyError = ref(false)
 function formatBytes(value: number | null | undefined, rate = false) {
   if (value == null || !Number.isFinite(value) || value < 0) return '—'
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
@@ -93,6 +96,10 @@ async function refresh() {
     ready.value = true
     try { traffic.value = await invoke<Traffic>('traffic_status') } catch { traffic.value = null }
     try {
+      trafficHistory.value = await invoke<TrafficHistory>('traffic_history')
+      historyError.value = false
+    } catch { trafficHistory.value = null; historyError.value = true }
+    try {
       transport.value = await invoke<Transport>('transport_status')
     } catch {
       transport.value = { state: 'unknown', established: null, matchScope: 'none' }
@@ -100,6 +107,8 @@ async function refresh() {
   } catch {
     ready.value = false
     traffic.value = null
+    trafficHistory.value = null
+    historyError.value = true
     error.value = '无法读取本地 Rust 服务状态。请使用桌面应用打开。'
   } finally { polling = false }
 }
@@ -234,7 +243,14 @@ async function toggle() {
           <div><small>下载速度</small><strong class="protocol">{{ formatBytes(traffic?.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.downloadBytes) }}</span></div>
           <div><small>计量范围</small><strong class="protocol">本次会话</strong><span>不含加密/TCP 开销</span></div>
         </div>
-        <p class="hint">仅统计桌面模式转发到本地应用和中转引擎的成功写入字节，每次启动重新计数；后台服务独立计量。不能用于计费。</p>
+        <p class="hint">以上为本次桌面会话；历史统计每 5 秒保存，正常停止时保存最终值。</p>
+        <div class="summary">
+          <div><small>历史累计上传</small><strong class="protocol">{{ formatBytes(trafficHistory?.saved?.uploadBytes) }}</strong><span>本机已保存</span></div>
+          <div><small>历史累计下载</small><strong class="protocol">{{ formatBytes(trafficHistory?.saved?.downloadBytes) }}</strong><span>本机已保存</span></div>
+          <div><small>最近保存</small><strong class="protocol">{{ trafficHistory?.saved ? new Date(trafficHistory.saved.savedAtMs).toLocaleTimeString() : '—' }}</strong><span>仅桌面模式</span></div>
+        </div>
+        <p v-if="historyError || trafficHistory?.writeFailed" class="error" role="alert">历史流量读取或保存失败，已保留原记录。</p>
+        <p class="hint">历史包含已保存的本次会话流量，不能重复相加；异常断电可能丢失最后一段未保存数据。不包含协议开销、后台服务或计费数据。</p>
       </section>
       <section>
         <div class="section-title"><h2>Windows 后台服务</h2><span>只读 SCM 状态</span></div>

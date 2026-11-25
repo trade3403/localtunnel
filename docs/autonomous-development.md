@@ -126,3 +126,8 @@
 ## 2026-11-25：SCM 流量 CI #75 编译修复
 - HEAD 3aaacc5d6722e94a0fd9cea6ffb3652cacdfd194，CI #75 https://github.com/trade3403/localtunnel/actions/runs/45555726060 在 Rust desktop unit tests 编译阶段失败。实际日志 job 139007181452：src/main.rs:207-208 E0308，publish_service_traffic 返回 Result<(), String>，尾表达式 map_err 返回 &str。核心 #81、Runner #170 通过；后续真实服务测试/安装包均未执行，失败证据 https://github.com/trade3403/localtunnel/actions/runs/45555726060/artifacts/14995353279 。
 - 本次仅将尾表达式错误转换为 String，保留全部测试、安全校验和计量行为，不跳过验收。重新触发 CI，待真实后台计量通过后再做历史累计。未改 main 分支。
+
+
+## 2026-11-25：后台流量验收、桌面历史流量持久化
+- HEAD 34debd43b55eca358565f3ffd4a74d054cb8bbf0，CI #77 https://github.com/trade3403/localtunnel/actions/runs/45560354544 全部通过；24/24 单测、1/1 实际桌面 TCP（0.93s 测试耗时）、真实 SCM 流量/恢复/停止、锁定构建、安装卸载成功，EXE 3.27 MiB。核心 #82、Runner #172 通过。安装包 https://github.com/trade3403/localtunnel/actions/runs/45560354544/artifacts/14998141224 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45560354544/artifacts/14998041614 。
+- 本轮新增桌面本机用户目录 traffic-history.json 与 OS 排他文件锁，历史存储只含上传/下载数值和保存时间，限制4KiB、拒绝异常路径/损坏数据；基于启动时基线+当前实际会话计数，避免周期保存重复累加。独立线程每5秒检查并原子替换已同步文件，停止时先结束转发再最终保存；失败可显示，启动遇损坏历史不覆盖，其他桌面实例不能并发写同一历史。GUI 分开显示会话实时数据和已保存跨重启累计。新增重开/重复保存/并发锁/损坏保留测试及真实32768/65536字节转发停止保存、重开不重复。使用已验收 CI Rust 1.100 支持的 std File::try_lock；未新增依赖。新代码待 CI，后台服务历史另做，文件为用户本地非计费证据、信任用户目录、断电/强退可能丢失未保存增量及遗留临时文件，尚未测实际断电/性能。未改 main。

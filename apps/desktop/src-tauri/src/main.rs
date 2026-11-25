@@ -5,6 +5,7 @@ mod credentials;
 mod engine_integrity;
 mod transport;
 mod traffic;
+mod history;
 #[cfg(windows)]
 mod engine_job;
 #[cfg(windows)]
@@ -115,6 +116,10 @@ impl Supervisor {
     }
 
     fn start_in(&mut self, request: StartRequest, runtime_root: Option<&Path>) -> Result<Status, String> {
+        self.start_in_with_history(request, runtime_root, None)
+    }
+
+    fn start_in_with_history(&mut self, request: StartRequest, runtime_root: Option<&Path>, history_dir: Option<&Path>) -> Result<Status, String> {
         self.status()?;
         if self.running.is_some() { return Err("请先停止现有隧道".into()); }
         let engine = Path::new(&request.engine);
@@ -136,7 +141,7 @@ impl Supervisor {
         let staged_engine = engine_integrity::stage(engine, directory.path())?;
         let relay_port = request.remote.rsplit_once(':').and_then(|(_,p)| p.parse::<u16>().ok())
             .ok_or("invalid relay port")?;
-        let meter = traffic::Meter::start(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port)?;
+        let meter = traffic::Meter::start_with_history(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port, history_dir)?;
         let mappings = request.mappings.iter().zip(meter.ports()).map(|(m, &port)| ClientMapping {
             name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
         }).collect::<Vec<_>>();
@@ -215,7 +220,11 @@ impl Supervisor {
             }
             running.child.wait().map_err(|_| "无法等待隧道退出")?;
         }
-        if let Some(running) = self.running.take() {
+        let mut history_failure = false;
+        if let Some(mut running) = self.running.take() {
+            if let Some(mut meter) = running.meter.take() {
+                history_failure = meter.finish().is_err();
+            }
             // Report cleanup failures rather than silently discarding a plaintext config.
             let config_path = running._directory.path().join("client.toml");
             if let Err(error) = std::fs::remove_file(&config_path) {
@@ -226,6 +235,10 @@ impl Supervisor {
                 }
             }
             drop(running);
+        }
+        if history_failure {
+            self.last_error = Some("隧道已停止，但历史流量保存失败".into());
+            return Err(self.last_error.clone().unwrap());
         }
         self.last_error = None;
         self.status()
@@ -256,7 +269,8 @@ fn start_tunnel(app: tauri::AppHandle, mut request: StartRequest, supervisor: ta
         let resource = app.path().resource_dir().map_err(|_| "无法定位应用资源目录")?;
         request.engine = bundled_engine(&resource)?.to_str().ok_or("引擎路径编码无效")?.to_owned();
     }
-    supervisor.lock().map_err(|_| "进程状态不可用")?.start(request)
+    let history_dir = app.path().app_config_dir().map_err(|_| "无法定位用户统计目录")?;
+    supervisor.lock().map_err(|_| "进程状态不可用")?.start_in_with_history(request, None, Some(&history_dir))
 }
 
 #[tauri::command]
@@ -281,6 +295,24 @@ async fn transport_status(app: tauri::AppHandle) -> Result<transport::Observatio
 #[tauri::command]
 fn traffic_status(supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<traffic::Snapshot, String> {
     supervisor.lock().map_err(|_| "进程状态不可用")?.traffic_status()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryStatus {
+    saved: Option<history::Totals>,
+    write_failed: bool,
+}
+
+#[tauri::command]
+async fn traffic_history(app: tauri::AppHandle) -> Result<HistoryStatus, String> {
+    let dir = app.path().app_config_dir().map_err(|_| "无法定位用户统计目录")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<Mutex<Supervisor>>();
+        let write_failed = state.lock().map_err(|_| "进程状态不可用")?.running.as_ref()
+            .and_then(|r| r.meter.as_ref()).is_some_and(|m| m.history_failed());
+        Ok(HistoryStatus { saved: history::read(&dir)?, write_failed })
+    }).await.map_err(|_| "历史流量读取失败")?
 }
 
 #[cfg(windows)]
@@ -375,7 +407,7 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, service_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
