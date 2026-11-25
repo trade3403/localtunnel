@@ -112,7 +112,7 @@ fn check(path: &Path, directory: bool, service: &str, limit: u32) -> Result<(), 
 
 // Only SCM-owned startup uses this cleanup. The root is validated first.
 // No recursive deletion: inspect the complete candidate before unlinking
-// only the two files created by Supervisor::start_in.
+// only the known files created by Supervisor::start_in.
 fn runtime_name(name: &str) -> bool {
     name.strip_prefix("localtunnel-client-").is_some_and(|suffix|
         suffix.len() == 6 && suffix.bytes().all(|b| b.is_ascii_alphanumeric()))
@@ -133,6 +133,7 @@ pub fn clear_stale_runtime(dir: &Path, name: &str) -> Result<(), String> {
     check_entry(&stale, true, &service, MODIFY, true)?;
     let mut engine = None;
     let mut config = None;
+    let mut telemetry = None;
     for item in std::fs::read_dir(&stale).map_err(|_| "stale runtime unavailable")? {
         let item = item.map_err(|_| "stale entry unavailable")?;
         let path = item.path();
@@ -140,20 +141,49 @@ pub fn clear_stale_runtime(dir: &Path, name: &str) -> Result<(), String> {
         match item.file_name().to_str() {
             Some("rathole.exe") if engine.is_none() => engine = Some(path),
             Some("client.toml") if config.is_none() => config = Some(path),
+            Some("traffic.json") if telemetry.is_none() => telemetry = Some(path),
             _ => return Err("unknown stale runtime file; manual inspection required".into()),
         }
     }
     // A surviving image or open file must block cleanup rather than
     // deleting live credentials. Never terminate arbitrary processes here.
     use std::os::windows::fs::OpenOptionsExt;
-    for path in engine.iter().chain(config.iter()) {
+    for path in engine.iter().chain(config.iter()).chain(telemetry.iter()) {
         std::fs::OpenOptions::new().read(true).share_mode(0).open(path)
             .map_err(|_| "stale runtime file still in use")?;
     }
     if let Some(path) = engine { std::fs::remove_file(path).map_err(|_| "stale engine removal failed")?; }
     if let Some(path) = config { std::fs::remove_file(path).map_err(|_| "stale credential removal failed")?; }
+    if let Some(path) = telemetry { std::fs::remove_file(path).map_err(|_| "stale telemetry removal failed")?; }
     std::fs::remove_dir(stale).map_err(|_| "stale runtime directory not empty or unavailable")?;
     Ok(())
+}
+
+// Only a bounded numeric snapshot from the exact ACL-checked runtime.
+// No profile or client.toml reads. Ordinary users without file access
+// still get SCM status; traffic is explicitly unavailable.
+pub fn read_traffic(dir: &Path, name: &str, host_pid: u32) -> Result<crate::traffic::ServiceSample, String> {
+    use std::io::Read;
+    let service = service_sid(name)?;
+    check(dir, true, &service, RX)?;
+    let root = dir.join("runtime");
+    check(&root, true, &service, MODIFY)?;
+    let mut entries = std::fs::read_dir(&root).map_err(|_| "runtime unavailable")?;
+    let entry = entries.next().ok_or("runtime absent")?.map_err(|_| "runtime entry unavailable")?;
+    if entries.next().is_some() || !entry.file_name().to_str().is_some_and(runtime_name) {
+        return Err("unexpected runtime entry".into());
+    }
+    let path = entry.path();
+    check_entry(&path, true, &service, MODIFY, true)?;
+    let sample = path.join("traffic.json");
+    check_entry(&sample, false, &service, MODIFY, true)?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(sample).map_err(|_| "sample unavailable")?.take(4097)
+        .read_to_end(&mut bytes).map_err(|_| "sample read failed")?;
+    if bytes.len() > 4096 { return Err("sample too large".into()); }
+    let record: crate::traffic::ServiceSample = serde_json::from_slice(&bytes).map_err(|_| "invalid sample")?;
+    if !record.fresh_for(host_pid) { return Err("sample stale or mismatched".into()); }
+    Ok(record)
 }
 
 #[cfg(test)]

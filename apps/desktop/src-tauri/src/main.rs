@@ -49,6 +49,9 @@ struct Running {
     child: Child,
     #[cfg(windows)]
     _job: engine_job::EngineJob,
+    // Close telemetry before TempDir removes its files.
+    #[cfg(windows)]
+    telemetry: Option<std::fs::File>,
     _directory: TempDir,
     count: usize,
     relay_target: Option<transport::Target>,
@@ -70,6 +73,8 @@ impl Running {
             child,
             #[cfg(windows)]
             _job: job,
+            #[cfg(windows)]
+            telemetry: None,
             _directory: directory,
             count,
             relay_target: None,
@@ -121,7 +126,7 @@ impl Supervisor {
             return Err("Windows 引擎必须为 EXE 文件".into());
         }
         // Validate original configuration before allocating any listeners.
-        let original_config = build_config(&request)?;
+        build_config(&request)?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("localtunnel-client-");
         let directory = match runtime_root {
@@ -129,18 +134,19 @@ impl Supervisor {
             None => builder.tempdir(),
         }.map_err(|_| "无法创建临时配置目录")?;
         let staged_engine = engine_integrity::stage(engine, directory.path())?;
-        // Desktop session metering only. SCM keeps its existing direct path.
-        let meter = if runtime_root.is_none() {
-            let relay_port = request.remote.rsplit_once(':').and_then(|(_,p)| p.parse::<u16>().ok())
-                .ok_or("invalid relay port")?;
-            Some(traffic::Meter::start(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port)?)
+        let relay_port = request.remote.rsplit_once(':').and_then(|(_,p)| p.parse::<u16>().ok())
+            .ok_or("invalid relay port")?;
+        let meter = traffic::Meter::start(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port)?;
+        let mappings = request.mappings.iter().zip(meter.ports()).map(|(m, &port)| ClientMapping {
+            name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
+        }).collect::<Vec<_>>();
+        let config = client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)?;
+        let target_ports = meter.ports().to_vec();
+        #[cfg(windows)]
+        let telemetry = if runtime_root.is_some() {
+            Some(std::fs::OpenOptions::new().write(true).create_new(true)
+                .open(directory.path().join("traffic.json")).map_err(|_| "service telemetry file unavailable")?)
         } else { None };
-        let (config, target_ports) = if let Some(meter) = &meter {
-            let mappings = request.mappings.iter().zip(meter.ports()).map(|(m, &port)| ClientMapping {
-                name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
-            }).collect::<Vec<_>>();
-            (client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)?, meter.ports().to_vec())
-        } else { (original_config, request.mappings.iter().map(|m| m.local_port).collect()) };
         let relay_target = transport::Target::new(&request.remote, target_ports)?;
         let config_path = directory.path().join("client.toml");
         let mut opts = std::fs::OpenOptions::new();
@@ -164,7 +170,9 @@ impl Supervisor {
         }
         let mut running = Running::spawn(&mut command, directory, request.mappings.len())?;
         running.relay_target = Some(relay_target);
-        running.meter = meter;
+        running.meter = Some(meter);
+        #[cfg(windows)]
+        { running.telemetry = telemetry; }
         self.running = Some(running);
         self.last_error = None;
         self.status()
@@ -183,6 +191,21 @@ impl Supervisor {
         if self.status()?.state != "running" { return Ok(traffic::Snapshot::inactive()); }
         Ok(self.running.as_mut().and_then(|r| r.meter.as_mut())
             .map(|m| m.snapshot()).unwrap_or_else(traffic::Snapshot::inactive))
+    }
+
+    #[cfg(windows)]
+    fn publish_service_traffic(&mut self) -> Result<(), String> {
+        use std::io::{Seek, SeekFrom};
+        let running = self.running.as_mut().ok_or("engine unavailable")?;
+        let meter = running.meter.as_mut().ok_or("meter unavailable")?;
+        let file = running.telemetry.as_mut().ok_or("telemetry unavailable")?;
+        let sample = traffic::ServiceSample::from_snapshot(meter.snapshot(), running.child.id())
+            .ok_or("sample unavailable")?;
+        let bytes = serde_json::to_vec(&sample).map_err(|_| "sample serialization failed")?;
+        // Fixed file and bounded record; no extra temp files to survive a
+        // host crash. Reader rejects partial or stale records.
+        file.seek(SeekFrom::Start(0)).and_then(|_| file.set_len(0))
+            .and_then(|_| file.write_all(&bytes)).map_err(|_| "sample write failed")
     }
 
     fn stop(&mut self) -> Result<Status, String> {

@@ -74,6 +74,7 @@ pub struct ServiceSnapshot {
     host_pid: Option<u32>,
     win32_exit_code: u32,
     service_exit_code: u32,
+    traffic: Option<crate::traffic::ServiceSample>,
 }
 
 fn state_label(state: u32) -> &'static str {
@@ -113,6 +114,9 @@ pub fn snapshot(name: &str) -> Result<ServiceSnapshot, String> {
         std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32, &mut needed) } == 0 {
         return Err(last_error());
     }
+    let traffic = if data.dwCurrentState == SERVICE_RUNNING && data.dwProcessId != 0 {
+        crate::service_acl::read_traffic(&dir, name, data.dwProcessId).ok()
+    } else { None };
     Ok(ServiceSnapshot {
         state: state_label(data.dwCurrentState),
         startup: startup_label(mode),
@@ -120,6 +124,7 @@ pub fn snapshot(name: &str) -> Result<ServiceSnapshot, String> {
             && data.dwProcessId != 0).then_some(data.dwProcessId),
         win32_exit_code: data.dwWin32ExitCode,
         service_exit_code: data.dwServiceSpecificExitCode,
+        traffic,
     })
 }
 

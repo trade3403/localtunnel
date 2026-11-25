@@ -116,3 +116,8 @@
 ## 2026-11-25：SCM 状态验收、桌面实际流量计量
 - HEAD ba23fab81e8a09d722050a9611abaf0dd70b1ce7，CI #71 https://github.com/trade3403/localtunnel/actions/runs/45549752861 全部通过，真实 SCM 只读状态/恢复 PID/停止/删除与安装卸载通过；核心 #79、Runner #166 通过。预览包 https://github.com/trade3403/localtunnel/actions/runs/45549752861/artifacts/14992819841 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45549752861/artifacts/14994130021 。
 - 新增桌面模式专用 IPv4 loopback 计量转发层，固定每映射目标，临时端口不与目标或中转端口相同；单线程 Tokio runtime、全局128并发上限、3秒本地连接超时、双向流式转发与半关闭、停止时取消所有任务；统计成功写入应用字节（含 HTTP 头，不含加密与 TCP 开销），按实际单调时间差计算速度，界面1.2秒刷新；未测/停止显示空而非虚构0。仅本次桌面会话，停止后不可见，不持久化，不计费；本机其他进程可直接访问回环计量端口，因此非认证流量证明，不能用于安全/结算。SCM 仍直接转发，不受该计量层影响。新增真实32768/65536字节/半关闭/停止单测及实际 Rathole 转发计量断言；使用已有锁定 Tokio 1.54.1，更新根依赖锁定项，全部新代码待 CI；性能及高并发未测。下一步服务计量/管理 UI，未改 main。
+
+
+## 2026-11-25：桌面流量验收、SCM 实际流量快照
+- HEAD 267dab3402dbc5921af242c4dc059a7722bde8c7，CI #73 https://github.com/trade3403/localtunnel/actions/runs/45553836046 全部通过，24/24 单测（包含32768/65536真实字节及半关闭）、1/1 实际桌面 TCP（0.73s 测试耗时）、真实 SCM 和锁定构建/安装卸载通过，EXE 3.26 MiB。核心 #80、Runner #168 通过。安装包 https://github.com/trade3403/localtunnel/actions/runs/45553836046/artifacts/14995121156 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45553836046/artifacts/14994926553 。
+- SCM 复用桌面真实字节计量层，128 并发、固定本地目标；每秒写入引擎临时目录内固定 traffic.json（只有数值、宿主/引擎 PID、采样时间，无凭据/载荷）。SCM 查询验证路径、ACL、单一 runtime、4KiB 上限、宿主 PID 和5秒新鲜度；未知或无权限返回空，不影响隧道。崩溃清理白名单增加 traffic.json，正常停止关闭文件句柄再删除目录。GUI 展示独立服务上传/下载速度和累计字节。CI 真实 HTTP 后验证服务计数、自动宿主恢复后新 PID 的实际计数及停止无流量快照。所有新增待 CI；当前计量为单次引擎会话，非历史累计/计费，普通非管理员若无法访问 ACL 保护目录仍只显示 SCM 状态；不放宽权限。固定文件非原子写入，读取遇半截 JSON 返回空，下次采样恢复；同 LocalService 身份和本地回环访问不构成防篡改计费证明。未修改 main。下一步安全历史累计与 GUI 服务管理。

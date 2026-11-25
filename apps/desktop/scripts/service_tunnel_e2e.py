@@ -80,7 +80,8 @@ def main(executable, evidence):
               "host_crash_restart": False, "host_crash_runtime_cleaned": False,
               "unknown_runtime_preserved": False, "unsafe_recovery_rejected": False,
               "automatic_host_recovered": False, "normal_stop_no_recovery": False,
-              "recovery_disabled": False, "readonly_scm_status": False}
+              "recovery_disabled": False, "readonly_scm_status": False, "service_traffic_measured": False,
+              "recovered_traffic_measured": False}
     created = False
     relay = None
     fixture = None
@@ -102,6 +103,15 @@ def main(executable, evidence):
         def snapshot():
             # Query using original desktop EXE, not the privileged service copy.
             return json.loads(run(str(executable), "--service-status", name).stdout)
+        def wait_traffic(host, engine_pid, minimum_up):
+            deadline = time.monotonic() + 12
+            while time.monotonic() < deadline:
+                record = snapshot().get("traffic")
+                if (record and record["hostPid"] == host and record["enginePid"] == engine_pid
+                        and record["uploadBytes"] >= minimum_up and record["downloadBytes"] > 0):
+                    return record
+                time.sleep(.3)
+            raise RuntimeError("real service traffic sample unavailable")
         if run(str(executable), "--service-status", "Spooler", check=False).returncode == 0:
             raise RuntimeError("status accepted unrelated system service")
         run("icacls.exe", str(root), "/grant:r", "*S-1-1-0:RX")
@@ -239,6 +249,8 @@ bind_addr = "127.0.0.1:{mapped}"
                 if old_child is None:
                     raise RuntimeError("service engine child missing")
                 old_pid, old_dir = old_child
+                wait_traffic(host_pid, old_pid, len(body))
+                report["service_traffic_measured"] = True
                 # Fault injection targets only the child just verified above.
                 run("taskkill.exe", "/PID", str(old_pid), "/F")
                 deadline = time.monotonic() + 20
@@ -313,6 +325,11 @@ bind_addr = "127.0.0.1:{mapped}"
                 e2e.wait_for(url, body, [relay], seconds=35)
                 if snapshot()["hostPid"] != recovered_host:
                     raise RuntimeError("read-only SCM snapshot retained old host PID")
+                recovered_child = engine_child(recovered_host, root)
+                if recovered_child is None:
+                    raise RuntimeError("recovered engine absent")
+                wait_traffic(recovered_host, recovered_child[0], len(body))
+                report["recovered_traffic_measured"] = True
                 report["automatic_host_recovered"] = True
                 report["automatic_host_recovery_seconds"] = round(time.monotonic() - started_at, 3)
                 if control("unregister", check=False).returncode == 0:
@@ -325,7 +342,8 @@ bind_addr = "127.0.0.1:{mapped}"
                 report["stopped"] = True
                 report["idempotent_stop"] = True
                 stopped_snapshot = snapshot()
-                if stopped_snapshot["state"] != "stopped" or stopped_snapshot["hostPid"] is not None:
+                if (stopped_snapshot["state"] != "stopped" or stopped_snapshot["hostPid"] is not None
+                        or stopped_snapshot["traffic"] is not None):
                     raise RuntimeError("read-only SCM snapshot retained stopped PID")
                 report["readonly_scm_status"] = True
                 if any((root / "runtime").iterdir()):

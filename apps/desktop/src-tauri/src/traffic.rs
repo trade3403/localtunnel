@@ -1,4 +1,4 @@
-//! Session-scoped application-byte metering for desktop-managed tunnels.
+//! Session-scoped application-byte metering for managed tunnels.
 //! Only loopback endpoints; no payload logging or packet capture.
 use serde::Serialize;
 use std::{
@@ -72,6 +72,44 @@ impl Snapshot {
     pub fn inactive() -> Self {
         Self { state: "inactive", upload_bytes: None, download_bytes: None,
             upload_bytes_per_second: None, download_bytes_per_second: None }
+    }
+}
+
+// The service publishes only numeric data, never credentials or payloads.
+// A partial or stale JSON record is treated as unavailable by the reader.
+#[cfg(windows)]
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServiceSample {
+    pub host_pid: u32,
+    pub engine_pid: u32,
+    pub sampled_at_ms: u64,
+    pub upload_bytes: u64,
+    pub download_bytes: u64,
+    pub upload_bytes_per_second: Option<f64>,
+    pub download_bytes_per_second: Option<f64>,
+}
+
+#[cfg(windows)]
+fn now_ms() -> Option<u64> {
+    u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis()).ok()
+}
+
+#[cfg(windows)]
+impl ServiceSample {
+    pub fn from_snapshot(snapshot: Snapshot, engine_pid: u32) -> Option<Self> {
+        if snapshot.state != "measured" { return None; }
+        Some(Self { host_pid: std::process::id(), engine_pid, sampled_at_ms: now_ms()?,
+            upload_bytes: snapshot.upload_bytes?, download_bytes: snapshot.download_bytes?,
+            upload_bytes_per_second: snapshot.upload_bytes_per_second,
+            download_bytes_per_second: snapshot.download_bytes_per_second })
+    }
+
+    pub fn fresh_for(&self, host_pid: u32) -> bool {
+        self.host_pid == host_pid && self.engine_pid != 0 &&
+            now_ms().is_some_and(|now| now.checked_sub(self.sampled_at_ms).is_some_and(|age| age <= 5000)) &&
+            [self.upload_bytes_per_second, self.download_bytes_per_second].into_iter().flatten()
+                .all(|rate| rate.is_finite() && rate >= 0.0)
     }
 }
 

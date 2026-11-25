@@ -111,6 +111,7 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
     // It is never evidence of an authenticated/connected tunnel.
     let mut failed = false;
     let mut recovery = RecoveryBudget::default();
+    let mut next_sample = std::time::Instant::now();
     while !STOP.load(Ordering::Acquire) {
         if tunnel && !supervisor.status().is_ok_and(|status| status.state == "running") {
             // Fully dispose of the old child and its runtime files before
@@ -130,6 +131,11 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
                 failed = !STOP.load(Ordering::Acquire);
                 break;
             }
+        }
+        if tunnel && std::time::Instant::now() >= next_sample {
+            // Telemetry failure must not stop a functioning tunnel.
+            let _ = supervisor.publish_service_traffic();
+            next_sample = std::time::Instant::now() + Duration::from_secs(1);
         }
         thread::sleep(Duration::from_millis(100));
     }

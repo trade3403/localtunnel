@@ -13,7 +13,8 @@ const transportLabel = computed(() => !ready.value || transport.value.state === 
   transport.value.state === 'not_observed' ? '未观察到' : String(transport.value.established))
 const transportHint = computed(() => transport.value.matchScope === 'port_only' ? '按中转端口匹配候选 TCP；未验证域名/认证' :
   transport.value.matchScope === 'ip_port' ? '按中转 IP 和端口匹配；未验证认证' : '非公网在线证明')
-type ServiceSnapshot = { state: string; startup: string; hostPid: number | null; win32ExitCode: number; serviceExitCode: number }
+type ServiceTraffic = { hostPid: number; enginePid: number; sampledAtMs: number; uploadBytes: number; downloadBytes: number; uploadBytesPerSecond: number | null; downloadBytesPerSecond: number | null }
+type ServiceSnapshot = { state: string; startup: string; hostPid: number | null; win32ExitCode: number; serviceExitCode: number; traffic: ServiceTraffic | null }
 const serviceName = ref('')
 const watchedService = ref('')
 const serviceSnapshot = ref<ServiceSnapshot | null>(null)
@@ -233,7 +234,7 @@ async function toggle() {
           <div><small>下载速度</small><strong class="protocol">{{ formatBytes(traffic?.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.downloadBytes) }}</span></div>
           <div><small>计量范围</small><strong class="protocol">本次会话</strong><span>不含加密/TCP 开销</span></div>
         </div>
-        <p class="hint">仅统计桌面模式转发到本地应用和中转引擎的成功写入字节，每次启动重新计数；后台服务未接入。不能用于计费。</p>
+        <p class="hint">仅统计桌面模式转发到本地应用和中转引擎的成功写入字节，每次启动重新计数；后台服务独立计量。不能用于计费。</p>
       </section>
       <section>
         <div class="section-title"><h2>Windows 后台服务</h2><span>只读 SCM 状态</span></div>
@@ -251,6 +252,12 @@ async function toggle() {
           <div><small>宿主 PID</small><strong>{{ serviceSnapshot.hostPid ?? '—' }}</strong><span>退出码 {{ serviceSnapshot.win32ExitCode }} / {{ serviceSnapshot.serviceExitCode }}</span></div>
         </div>
         <p v-else-if="watchedService && !serviceError" class="hint">读取服务状态中…</p>
+        <div v-if="serviceSnapshot?.traffic" class="summary">
+          <div><small>服务上传速度</small><strong class="protocol">{{ formatBytes(serviceSnapshot.traffic.uploadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(serviceSnapshot.traffic.uploadBytes) }}</span></div>
+          <div><small>服务下载速度</small><strong class="protocol">{{ formatBytes(serviceSnapshot.traffic.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(serviceSnapshot.traffic.downloadBytes) }}</span></div>
+          <div><small>计量引擎 PID</small><strong>{{ serviceSnapshot.traffic.enginePid }}</strong><span>本次引擎会话</span></div>
+        </div>
+        <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照暂不可用（权限不足、恢复中或尚未采样）。</p>
         <p v-if="serviceError" class="error" role="alert">{{ serviceError }}</p>
         <p class="hint">只读取明确指定的预览服务，不修改配置、不读取凭据；本地桌面隧道与后台服务独立管理。</p>
       </section>
