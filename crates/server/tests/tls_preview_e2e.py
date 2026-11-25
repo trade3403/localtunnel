@@ -193,7 +193,7 @@ try:
             keys=subprocess.check_output([str(engine),"--genkey"],text=True,timeout=15)
             private=re.search(r"Private Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
             public=re.search(r"Public Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
-            env=dict(os.environ,LOCALTUNNEL_CORE_CLI=str(core),LOCALTUNNEL_SERVER_PRIVATE_KEY=private,LOCALTUNNEL_SERVER_PUBLIC_KEY=public)
+            env=dict(os.environ,LOCALTUNNEL_CORE_CLI=str(core),LOCALTUNNEL_SERVER_PRIVATE_KEY=private,LOCALTUNNEL_SERVER_PUBLIC_KEY=public,LOCALTUNNEL_ENGINE=str(engine))
             def operator(*args):
                 return subprocess.run([exe,args[0],str(root),*map(str,args[1:])],env=env,capture_output=True,timeout=40)
             assert subprocess.run([exe,"--init-admin",str(root)],input=json.dumps({"username":"operator","password":password}).encode(),capture_output=True,timeout=20).returncode==0
@@ -303,6 +303,58 @@ try:
                 rows=db.execute("SELECT operation,outcome,count(*) FROM preview_attempts WHERE transport='https' GROUP BY operation,outcome ORDER BY operation,outcome").fetchall()
                 assert rows==[("apply","succeeded",1),("apply-checked","failed_or_unknown",2),("apply-checked","succeeded",2),("init","succeeded",1)]
             report["revoked_apply_denied_and_explicit_tls_clear"]=True
+            # Release manually owned children before starting the supervisor.
+            for proc in processes[:2]:
+                stop(proc)
+            processes=processes[2:]
+            p,base=launch(root)
+            supervisor=None
+            try:
+                expect(call(base,"mappings/"+mid+"?expected_revision=1","DELETE",admin),204)
+                device2=expect(enroll(base,issue(base,admin)),201)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                mapping2=expect(call(base,"mappings","POST",admin,{"device_id":device2["id"],"node_id":nid,"domain_id":domain["id"],"protocol":"https","local_port":fixture.server_port,"bind_port":bp}),201)
+                mid2=mapping2["id"]
+                assert operator("--supervise-preview",mid2,1,rp,"wrong_transport","tls_gateway",gp,"expected_body").returncode!=0
+                assert operator("--supervise-tls-preview",mid2,1,rp,"bad_port","tls_gateway",gp,"expected_body",rp,"cert_v2").returncode!=0
+                assert not (root/"wrong_transport").exists() and not (root/"bad_port").exists()
+                supervisor=subprocess.Popen([exe,"--supervise-tls-preview",str(root),mid2,"1",str(rp),"supervised_tls","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                deadline=time.monotonic()+45
+                while time.monotonic()<deadline:
+                    assert supervisor.poll() is None,"TLS supervisor exited during startup"
+                    try:
+                        if tls_request(gp,hostname,ca2)==(200,body):
+                            break
+                    except (OSError,http.client.HTTPException):
+                        pass
+                    time.sleep(.25)
+                else:
+                    raise AssertionError("supervised HTTPS did not converge")
+                rejects(gp,hostname,ca)
+                assert request(bp,hostname)==(200,body)
+                assert (root/"supervisor-tls_gateway.lock").exists()
+                assert operator("--supervise-tls-preview",mid2,1,rp,"competing_tls","tls_gateway",gp,"expected_body",probe,"cert_v2").returncode!=0
+                assert not (root/"competing_tls").exists()
+                expect(call(base,"devices/"+device2["id"]+"/revoke","POST",admin),204)
+                assert supervisor.wait(timeout=40)==0,"TLS supervisor failed cleanup"
+                rejects(gp,hostname,ca2)
+                assert request(probe,"localtunnel-probe.invalid")[0]==421
+                assert request(bp,hostname) is None
+                assert not (root/"supervisor-tls_gateway.lock").exists()
+                assert all(proc.poll() is None for proc in processes),"gateway must remain running"
+                with sqlite3.connect(db_path) as db:
+                    assert db.execute("SELECT outcome,transport FROM preview_attempts WHERE mapping_id=? AND operation='apply-checked'",(mid2,)).fetchall()==[("succeeded","https")]
+                    assert db.execute("SELECT enabled FROM devices WHERE id=?",(device2["id"],)).fetchone()==(0,)
+                    assert db.execute("SELECT enabled FROM mappings WHERE id=?",(mid2,)).fetchone()==(0,)
+                report["real_supervised_https_revocation_and_handshake_denial"]=True
+            finally:
+                if supervisor is not None and supervisor.poll() is None:
+                    try:
+                        call(base,"devices/"+device2["id"]+"/revoke","POST",admin)
+                        supervisor.wait(timeout=40)
+                    except (OSError,subprocess.TimeoutExpired):
+                        stop(supervisor)
+                stop(p)
         finally:
             for proc in reversed(processes):
                 stop(proc)

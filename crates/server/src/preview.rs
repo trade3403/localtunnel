@@ -192,13 +192,38 @@ fn relay_probe(m:&Mapping,expected:&[u8])->bool{
     out.is_ok_and(|o|o.status.success()&&o.stdout.len()==expected.len()+3&&o.stdout.ends_with(b"200")&&&o.stdout[..expected.len()]==expected)
 }
 
+#[derive(Clone,Copy)]
+pub enum PreviewTransport<'a> {
+    Http,
+    Https {probe:u16,cert_dir:&'a str},
+}
+impl PreviewTransport<'_>{
+    fn protocol(self)->&'static str{
+        match self{Self::Http=>"http",Self::Https{..}=>"https"}
+    }
+    async fn gateway(self,pool:&SqlitePool,root:&Path,id:&str,revision:i64,prefix:&str,listen:u16,mode:&str,expected_file:Option<&str>)->Result<()>{
+        match self{
+            Self::Http=>gateway(pool,root,id,revision,prefix,listen,mode,expected_file).await,
+            Self::Https{probe,cert_dir}=>tls_gateway(pool,root,id,revision,prefix,listen,probe,cert_dir,mode,expected_file).await,
+        }
+    }
+}
+
 /// Opt-in Linux foreground preview. The trusted operator must already have
-/// started an exclusive, empty managed HTTP gateway; never use a shared prefix.
-pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str)->Result<()>{
+/// started an exclusive managed gateway of the selected transport.
+pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(bundle)||!safe_name(prefix)||bundle==prefix{return Err("invalid supervisor request")}
-    let m=checked(pool,id,revision).await?;
+    let m=checked_protocol(pool,id,revision,transport.protocol()).await?;
     if relay_port==listen||i64::from(listen)==m.bind_port{return Err("conflicting preview port")}
     port(listen)?;
+    port(relay_port)?;
+    if let PreviewTransport::Https{probe,cert_dir}=transport{
+        port(probe)?;
+        if probe==listen||probe==relay_port||i64::from(probe)==m.bind_port||!safe_name(cert_dir)||cert_dir==bundle||cert_dir==prefix{
+            return Err("conflicting TLS preview parameters")
+        }
+        private_dir(&root.join(cert_dir))?;
+    }
     private_dir(&root.join(prefix))?;
     let expected=read_expected(root,expected_file)?;
     let engine=PathBuf::from(std::env::var_os("LOCALTUNNEL_ENGINE").ok_or("set trusted engine path")?);
@@ -214,7 +239,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     let _lock=PreviewLock(lock);
     // Reset the exclusive gateway to empty and verify the revision first.
     // This dedicated prefix must not serve other mappings.
-    gateway(pool,root,"clear",0,prefix,listen,"apply",None).await?;
+    transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await?;
     export(pool,root,id,revision,relay_port,bundle).await?;
     let mut children=TunnelChildren(Vec::new());
     let result=async {
@@ -222,24 +247,24 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
         children.start(&engine,&root.join(bundle).join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
         loop{
-            checked(pool,id,revision).await?;
+            checked_protocol(pool,id,revision,transport.protocol()).await?;
             if !children.healthy(){return Err("tunnel child exited")}
             if relay_probe(&m,&expected){break}
             if Instant::now()>=deadline{return Err("relay business probe timeout")}
             std::thread::sleep(Duration::from_millis(200));
         }
-        gateway(pool,root,id,revision,prefix,listen,"apply-checked",Some(expected_file)).await?;
+        transport.gateway(pool,root,id,revision,prefix,listen,"apply-checked",Some(expected_file)).await?;
         // Authorization is re-read after apply and every 500ms. Database
         // errors also fail closed. DNS age is checked, not continuous DNS.
         loop{
-            if checked(pool,id,revision).await.is_err(){return Ok(())}
+            if checked_protocol(pool,id,revision,transport.protocol()).await.is_err(){return Ok(())}
             if !children.healthy(){return Err("tunnel child exited")}
             std::thread::sleep(Duration::from_millis(500));
         }
     }.await;
     // Stop owned tunnel processes even if the gateway clear fails.
     let stopped=children.stop();
-    let cleared=gateway(pool,root,"clear",0,prefix,listen,"apply",None).await;
+    let cleared=transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await;
     stopped?;
     cleared?;
     result
