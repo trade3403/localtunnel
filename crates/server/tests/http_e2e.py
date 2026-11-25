@@ -67,6 +67,7 @@ try:
         db_path = root / "control.sqlite3"
         p, base = launch(root)
         try:
+            assert db_path.stat().st_mode & 0o777 == 0o600
             assert http(base, "/healthz") == (200, b"ok")
             assert http(base, "/readyz") == (200, b"ready")
             assert http(base, "/api/v1/mappings")[0] == 401
@@ -94,8 +95,12 @@ try:
                 report["migration_and_constraints"] = True
         finally:
             stop(p)
+        # Compatibility: old private-dir databases may have been created
+        # with 0644. Tighten the exact owned regular file on startup.
+        db_path.chmod(0o644)
         p, base = launch(root)
         try:
+            assert db_path.stat().st_mode & 0o777 == 0o600
             assert http(base, "/readyz") == (200, b"ready")
             with sqlite3.connect(db_path) as db:
                 assert db.execute("SELECT count(*) FROM mappings").fetchone() == (1,)
@@ -114,6 +119,20 @@ try:
             (Path(insecure) / "control.sqlite3").symlink_to(db_path)
             rejected_start(insecure)
         report["unsafe_path_rejected"] = True
+        # A hard link to the real DB must be rejected, without changing
+        # the underlying file permissions or opening the linked database.
+        with tempfile.TemporaryDirectory() as linked:
+            os.link(db_path, Path(linked) / "control.sqlite3")
+            rejected_start(linked)
+            assert db_path.stat().st_nlink == 2
+        assert db_path.stat().st_nlink == 1
+        with tempfile.TemporaryDirectory() as sidecar:
+            outside = Path(sidecar) / "outside"
+            outside.write_bytes(b"do not touch")
+            os.link(outside, Path(sidecar) / "control.sqlite3-wal")
+            rejected_start(sidecar)
+            assert outside.read_bytes() == b"do not touch"
+        report["linux_private_sqlite_modes_and_hardlinks"] = True
 finally:
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.write_text(json.dumps(report, indent=2), encoding="utf-8")

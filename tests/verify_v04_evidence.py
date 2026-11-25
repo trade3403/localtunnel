@@ -186,9 +186,14 @@ REQUIRED = {
 # V0.5 retains the entire V0.4 management gate and adds its own report.
 REQUIRED["management-v05"] = {
     **REQUIRED["management"],
+    "http.json": [
+        *REQUIRED["management"]["http.json"],
+        "linux_private_sqlite_modes_and_hardlinks",
+    ],
     "auth.json": [
         *REQUIRED["management"]["auth.json"],
         "unsupported_stored_argon2_parameters_rejected",
+        "foreign_origin_valid_login_no_session",
     ],
     "devices.json": [
         *REQUIRED["management"]["devices.json"],
@@ -200,6 +205,7 @@ REQUIRED["management-v05"] = {
         "real_concurrent_requests_rejected_without_queue",
         "real_partial_body_deadline_and_capacity_recovery",
         "real_global_rate_limit_and_refill",
+        "real_local_host_origin_and_fetch_site_guard",
     ],
     "transport.json": [
         "real_incomplete_header_absolute_deadline",
@@ -264,7 +270,7 @@ class EvidenceGateTests(unittest.TestCase):
                 (root / filename).write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
             self.assertFalse(validate("management", root)[1])
             self.assertTrue(validate("management-v05", root)[1])
-            for name in ("auth.json", "devices.json", "protection.json", "transport.json"):
+            for name in ("http.json", "auth.json", "devices.json", "protection.json", "transport.json"):
                 filename = root / name
                 keys = REQUIRED["management-v05"][name]
                 filename.write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")

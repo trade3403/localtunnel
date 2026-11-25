@@ -31,6 +31,24 @@ async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn secure_sqlite_file(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    // The parent is private and trusted. Open without following links, then
+    // inspect and tighten the exact descriptor rather than chmod a pathname.
+    let file = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let m = file.metadata()?;
+    if !m.is_file() || m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe SQLite ownership or link count"));
+    }
+    if m.permissions().mode() & 0o7777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn data_path(dir: &Path) -> io::Result<PathBuf> {
     let metadata = std::fs::symlink_metadata(dir)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -43,6 +61,13 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "data directory must be private (0700)"));
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "data directory must belong to runtime user"));
+        }
+    }
     let dir = dir.canonicalize()?;
     let path = dir.join("control.sqlite3");
     // Reject non-regular files and symlinks including SQLite sidecars.
@@ -51,7 +76,10 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
             Ok(m) if !m.is_file() || m.file_type().is_symlink() => {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe SQLite file"));
             }
-            Ok(_) => {}
+            Ok(_) => {
+                #[cfg(target_os = "linux")]
+                secure_sqlite_file(&dir.join(name))?;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -166,8 +194,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn main() {
+    // Set the process mask before creating runtime threads or SQLite files.
+    #[cfg(target_os = "linux")]
+    unsafe { libc::umask(0o077); }
+    entry();
+}
+
 #[tokio::main]
-async fn main() {
+async fn entry() {
     if run().await.is_err() {
         // Do not print SQL, filesystem paths, or future credentials.
         eprintln!("LocalTunnel management server failed to initialize or serve");

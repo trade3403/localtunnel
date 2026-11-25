@@ -73,6 +73,31 @@ try:
             assert request(port, "/api/v1/auth/login", {"Content-Type":"application/json"}, "POST", b"x"*4097)[0] == 413
             assert request(port, "/readyz")[:2] == (200, b"ready")
             report["real_request_bounds_and_response_headers"] = True
+            for headers in (
+                {"Host": "external.example.test"},
+                {"Host": "127.0.0.1.example.test"},
+                {"Host": "localhost:65536"},
+                {"Origin": "https://external.example.test"},
+                {"Origin": "null"},
+                {"Origin": "http://127.0.0.1:1432"},
+                {"Sec-Fetch-Site": "cross-site"},
+                {"Sec-Fetch-Site": "same-site"},
+            ):
+                denied = request(port, headers=headers)
+                assert denied[:2] == (403,b"invalid local request origin")
+                assert security(denied)
+                assert not any(k.lower().startswith("access-control-allow") for k in denied[2])
+            allowed = request(port,headers={"Host":"127.0.0.1:1430","Origin":"http://127.0.0.1:1430","Sec-Fetch-Site":"same-origin"})
+            assert allowed[:2] == (200,b"ok")
+            # Duplicate Origin is never accepted, even if both are allowed.
+            with closing(http.client.HTTPConnection("127.0.0.1",port,timeout=5)) as conn:
+                conn.putrequest("GET","/healthz")
+                conn.putheader("Origin","http://127.0.0.1:1430")
+                conn.putheader("Origin","http://127.0.0.1:1430")
+                conn.endheaders()
+                r=conn.getresponse()
+                assert r.status==403 and r.read()==b"invalid local request origin"
+            report["real_local_host_origin_and_fetch_site_guard"] = True
 
             # All bodies deliberately incomplete, so they hold application
             # permits rather than executing authentication or mutating SQL.
