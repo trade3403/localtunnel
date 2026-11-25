@@ -1,6 +1,8 @@
 mod auth;
 mod devices;
 mod mappings;
+mod nodes;
+mod domains;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -53,12 +55,16 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() != 2 {
-        return Err("usage: localtunnel-server <private-data-directory> <port> | --init-admin <private-data-directory>".into());
+    let init = args.first().is_some_and(|a| a=="--init-admin");
+    let add_node = args.first().is_some_and(|a| a=="--add-node");
+    let set_node = args.first().is_some_and(|a| a=="--set-node-enabled");
+    let expected = if add_node {3} else if set_node {4} else {2};
+    if args.len()!=expected {
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false>".into());
     }
-    let init = args[0] == "--init-admin";
-    let database = data_path(Path::new(if init { &args[1] } else { &args[0] }))?;
-    let port: u16 = if init { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
+    let operator = init || add_node || set_node;
+    let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
+    let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_secs(3))
@@ -73,6 +79,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
         auth::init_admin(&pool).await.map_err(|_| "administrator initialization refused")?;
         return Ok(());
     }
+    if add_node {
+        let id=nodes::add(&pool,args[2].to_str().ok_or("invalid node name")?).await.map_err(|_|"node creation refused")?;
+        println!("{id}");
+        return Ok(());
+    }
+    if set_node {
+        let enabled=args[3].to_str().ok_or("invalid node state")?.parse::<bool>()?;
+        nodes::set_enabled(&pool,args[2].to_str().ok_or("invalid node id")?,enabled).await.map_err(|_|"node state change refused")?;
+        return Ok(());
+    }
     let auth = auth::AuthState::new(pool.clone()).map_err(|_| "authentication initialization failed")?;
     let app = Router::new()
         .route("/healthz", get(health))
@@ -80,7 +96,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .with_state(pool.clone())
         .merge(auth::routes(auth))
         .merge(devices::routes(pool.clone()))
-        .merge(mappings::routes(pool));
+        .merge(mappings::routes(pool.clone()))
+        .merge(nodes::routes(pool.clone()))
+        .merge(domains::routes(pool).map_err(|_|"invalid DNS resolver configuration")?);
     // No configurable public bind or unauthenticated data API in this increment.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("LISTENING {}", listener.local_addr()?);
