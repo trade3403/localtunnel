@@ -83,7 +83,7 @@ def main(executable, evidence):
               "recovery_disabled": False, "readonly_scm_status": False, "service_traffic_measured": False,
               "recovered_traffic_measured": False, "history_checkpoint": False,
               "history_after_host_recovery": False, "history_after_stop": False,
-              "history_preserved_unregister": False, "unsafe_history_rejected": False}
+              "history_preserved_unregister": False, "unsafe_history_rejected": False, "desktop_service_controls": False}
     created = False
     relay = None
     fixture = None
@@ -103,6 +103,9 @@ def main(executable, evidence):
         run("icacls.exe", str(root), "/setowner", "*S-1-5-32-544", "/T")
         def control(action, check=True):
             return run(str(exe), "--service-control", name, action, check=check)
+        def manage(action, check=True, target=name):
+            # Same function as GUI IPC, from the ordinary desktop executable.
+            return run(str(executable), "--service-manage", target, action, check=check)
         def snapshot():
             # Query using original desktop EXE, not the privileged service copy.
             return json.loads(run(str(executable), "--service-status", name).stdout)
@@ -139,6 +142,10 @@ def main(executable, evidence):
             raise RuntimeError("incorrect initial read-only SCM snapshot")
         if control("register", check=False).returncode == 0:
             raise RuntimeError("duplicate service registration accepted")
+        if manage("unregister", check=False).returncode == 0:
+            raise RuntimeError("desktop management allowed unregister")
+        if manage("check", check=False, target="Spooler").returncode == 0:
+            raise RuntimeError("desktop management accepted unrelated service")
         report["duplicate_registration_rejected"] = True
         # Per-service SID, rather than every process running as LocalService.
         service = "NT SERVICE\\" + name
@@ -216,7 +223,7 @@ bind_addr = "127.0.0.1:{mapped}"
                     raise RuntimeError("plaintext token in sealed profile")
                 report["sealed_profile"] = True
                 run("icacls.exe", str(root / "history"), "/grant:r", "*S-1-1-0:RX")
-                if control("start", check=False).returncode == 0:
+                if manage("start", check=False).returncode == 0:
                     raise RuntimeError("unsafe service history directory accepted")
                 wait_state(name, 1)
                 report["unsafe_history_rejected"] = True
@@ -241,20 +248,20 @@ bind_addr = "127.0.0.1:{mapped}"
                     raise RuntimeError("unsafe profile started an engine")
                 report["unsafe_profile_acl_rejected"] = True
                 run("icacls.exe", str(root / "service-profile.bin"), "/remove:g", "*S-1-1-0")
-                control("check")
+                manage("check")
                 if not re.search(r"START_TYPE\s*:\s*3\b", sc("qc", name).stdout):
                     raise RuntimeError("service did not default to manual")
-                control("autostart-on")
+                manage("autostart-on")
                 if not re.search(r"START_TYPE\s*:\s*2\b", sc("qc", name).stdout):
                     raise RuntimeError("SCM auto start not configured")
                 report["autostart_enabled"] = True
                 if snapshot()["startup"] != "automatic":
                     raise RuntimeError("SCM snapshot did not reflect automatic startup")
-                control("autostart-off")
+                manage("autostart-off")
                 if not re.search(r"START_TYPE\s*:\s*3\b", sc("qc", name).stdout):
                     raise RuntimeError("SCM manual start not restored")
                 report["autostart_disabled"] = True
-                control("start")
+                manage("start")
                 wait_state(name, 4)
                 url = f"http://127.0.0.1:{mapped}/"
                 e2e.wait_for(url, body, [relay], seconds=35)
@@ -322,7 +329,9 @@ bind_addr = "127.0.0.1:{mapped}"
                 report["host_crash_restart"] = True
                 # Recovery is explicitly enabled only after the manual-crash
                 # tests. This is a disposable test service with a unique name.
-                control("recovery-on")
+                manage("recovery-on")
+                if snapshot()["recovery"] != "enabled":
+                    raise RuntimeError("desktop recovery enable not verified")
                 previous_host = service_pid(name)
                 previous_child = engine_child(previous_host, root)
                 if previous_child is None:
@@ -363,9 +372,9 @@ bind_addr = "127.0.0.1:{mapped}"
                     raise RuntimeError("running service unregistered")
                 report["running_unregister_rejected"] = True
                 e2e.wait_for(url, body, [relay], seconds=10)
-                control("stop")
+                manage("stop")
                 wait_state(name, 1)
-                control("stop")  # idempotent once SCM confirms stopped
+                manage("stop")  # idempotent once SCM confirms stopped
                 report["stopped"] = True
                 report["idempotent_stop"] = True
                 stopped_snapshot = snapshot()
@@ -394,8 +403,11 @@ bind_addr = "127.0.0.1:{mapped}"
                         raise RuntimeError("normal stop unexpectedly triggered SCM recovery")
                     time.sleep(.5)
                 report["normal_stop_no_recovery"] = True
-                control("recovery-off")
+                manage("recovery-off")
+                if snapshot()["recovery"] != "disabled":
+                    raise RuntimeError("desktop recovery disable not verified")
                 report["recovery_disabled"] = True
+                report["desktop_service_controls"] = True
             finally:
                 if relay is not None:
                     e2e.terminate(relay)

@@ -14,18 +14,40 @@ const transportLabel = computed(() => !ready.value || transport.value.state === 
 const transportHint = computed(() => transport.value.matchScope === 'port_only' ? '按中转端口匹配候选 TCP；未验证域名/认证' :
   transport.value.matchScope === 'ip_port' ? '按中转 IP 和端口匹配；未验证认证' : '非公网在线证明')
 type ServiceTraffic = { hostPid: number; enginePid: number; sampledAtMs: number; uploadBytes: number; downloadBytes: number; uploadBytesPerSecond: number | null; downloadBytesPerSecond: number | null }
-type ServiceSnapshot = { state: string; startup: string; hostPid: number | null; win32ExitCode: number; serviceExitCode: number; traffic: ServiceTraffic | null; history: { uploadBytes: number; downloadBytes: number; savedAtMs: number } | null }
+type ServiceSnapshot = { state: string; startup: string; recovery: 'enabled' | 'disabled' | 'unverified'; hostPid: number | null; win32ExitCode: number; serviceExitCode: number; traffic: ServiceTraffic | null; history: { uploadBytes: number; downloadBytes: number; savedAtMs: number } | null }
 const serviceName = ref('')
 const watchedService = ref('')
 const serviceSnapshot = ref<ServiceSnapshot | null>(null)
 const serviceError = ref('')
+const serviceActionError = ref('')
+const serviceActionNotice = ref('')
+const serviceBusy = ref(false)
+type ServiceAction = 'check' | 'start' | 'stop' | 'autostart-on' | 'autostart-off' | 'recovery-on' | 'recovery-off'
+async function serviceAction(action: ServiceAction) {
+  const name = watchedService.value
+  if (!name || !serviceSnapshot.value || serviceBusy.value || serviceName.value.trim() !== name) return
+  serviceBusy.value = true
+  serviceGeneration++
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
+  try {
+    await invoke('manage_service', { name, action })
+    serviceActionNotice.value = '操作成功，正在读取 SCM 最新状态'
+  } catch (e) {
+    serviceActionError.value = '操作失败（请检查管理员权限、服务配置及状态）：' + String(e)
+  } finally {
+    serviceSnapshot.value = null
+    serviceBusy.value = false
+    void refreshService()
+  }
+}
 let servicePolling = false
 let serviceGeneration = 0
 const serviceStateLabels: Record<string, string> = { stopped: '已停止', starting: '启动中', stopping: '停止中', running: '宿主运行中', paused: '已暂停', transitioning: '切换中', unknown: '未知' }
 const startupLabels: Record<string, string> = { automatic: '自动', manual: '手动', disabled: '禁用', unknown: '未知' }
 async function refreshService() {
   const name = watchedService.value
-  if (!name || servicePolling) return
+  if (!name || servicePolling || serviceBusy.value) return
   servicePolling = true
   const generation = serviceGeneration
   try {
@@ -42,6 +64,9 @@ async function refreshService() {
   } finally { servicePolling = false }
 }
 function watchService() {
+  if (serviceBusy.value) return
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
   serviceGeneration++
   serviceSnapshot.value = null
   serviceError.value = ''
@@ -55,6 +80,9 @@ function watchService() {
   void refreshService()
 }
 function unwatchService() {
+  if (serviceBusy.value) return
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
   serviceGeneration++
   watchedService.value = ''
   serviceSnapshot.value = null
@@ -253,13 +281,13 @@ async function toggle() {
         <p class="hint">历史包含已保存的本次会话流量，不能重复相加；异常断电可能丢失最后一段未保存数据。不包含协议开销、后台服务或计费数据。</p>
       </section>
       <section>
-        <div class="section-title"><h2>Windows 后台服务</h2><span>只读 SCM 状态</span></div>
+        <div class="section-title"><h2>Windows 后台服务</h2><span>SCM 服务管理</span></div>
         <div class="fields">
-          <label class="wide">已注册服务名称<input v-model="serviceName" maxlength="51" placeholder="LocalTunnelPreview-…" /></label>
+          <label class="wide">已注册服务名称<input v-model="serviceName" :disabled="serviceBusy" maxlength="51" placeholder="LocalTunnelPreview-…" /></label>
         </div>
         <div class="profile-actions">
-          <button type="button" class="secondary" @click="watchService">监测服务</button>
-          <button type="button" class="secondary" :disabled="!watchedService" @click="unwatchService">停止监测</button>
+          <button type="button" class="secondary" :disabled="serviceBusy" @click="watchService">监测服务</button>
+          <button type="button" class="secondary" :disabled="!watchedService || serviceBusy" @click="unwatchService">停止监测</button>
         </div>
         <p v-if="watchedService" class="hint">监测：{{ watchedService }}</p>
         <div v-if="serviceSnapshot" class="summary" aria-live="polite">
@@ -281,8 +309,21 @@ async function toggle() {
         </div>
         <p v-else-if="serviceSnapshot" class="hint">服务历史暂无可读记录（未配置、未保存或权限不足）。</p>
         <p v-if="serviceSnapshot?.history" class="hint">已保存历史含本次已保存增量，不与会话流量重复相加；强制结束可能丢失未保存增量。</p>
+        <div v-if="serviceSnapshot" class="profile-actions">
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService" @click="serviceAction('check')">检查服务配置</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.state !== 'stopped' || serviceSnapshot.startup === 'disabled'" @click="serviceAction('start')">启动服务</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.state !== 'running'" @click="serviceAction('stop')">停止服务</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.startup === 'automatic'" @click="serviceAction('autostart-on')">开启开机自启</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.startup === 'manual'" @click="serviceAction('autostart-off')">设为手动启动</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.recovery === 'enabled'" @click="serviceAction('recovery-on')">开启故障恢复</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.recovery === 'disabled'" @click="serviceAction('recovery-off')">关闭故障恢复</button>
+          <span>故障恢复：{{ serviceSnapshot.recovery === 'enabled' ? '已启用' : serviceSnapshot.recovery === 'disabled' ? '已关闭' : '默认 / 未验证' }}</span>
+        </div>
+        <p v-if="serviceBusy" class="hint" role="status">正在执行服务操作…</p>
+        <p v-if="serviceActionNotice" class="hint" role="status">{{ serviceActionNotice }}</p>
+        <p v-if="serviceActionError" class="error" role="alert">{{ serviceActionError }}</p>
         <p v-if="serviceError" class="error" role="alert">{{ serviceError }}</p>
-        <p class="hint">只读取明确指定的预览服务，不修改配置、不读取凭据；本地桌面隧道与后台服务独立管理。</p>
+        <p class="hint">仅管理已注册且已授权的预览服务。操作使用当前 Windows 权限，不自动提权；需管理员时请以管理员身份运行客户端。关闭客户端不停止独立后台服务。已排队的 SCM 恢复可能仍会执行。</p>
       </section>
       <form @submit.prevent="toggle">
         <section>

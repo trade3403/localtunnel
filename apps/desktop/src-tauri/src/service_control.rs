@@ -76,6 +76,7 @@ pub struct ServiceSnapshot {
     service_exit_code: u32,
     traffic: Option<crate::traffic::ServiceSample>,
     history: Option<crate::history::Totals>,
+    recovery: &'static str,
 }
 
 fn state_label(state: u32) -> &'static str {
@@ -127,6 +128,14 @@ pub fn snapshot(name: &str) -> Result<ServiceSnapshot, String> {
         service_exit_code: data.dwServiceSpecificExitCode,
         traffic,
         history: crate::service_acl::read_history(&dir, name).ok().flatten(),
+        recovery: if verify_recovery(&service, &recovery_actions(true)).is_ok() {
+            "enabled"
+        } else if verify_recovery(&service, &recovery_actions(false)).is_ok() {
+            "disabled"
+        } else {
+            // Includes default SCM policy, custom policy, or unavailable query.
+            "unverified"
+        },
     })
 }
 
@@ -297,6 +306,27 @@ pub fn execute(name: &str, action: &str) -> Result<(), String> {
     let exe = dir.join("localtunnel-desktop.exe");
     let exe = exe.to_str().ok_or("invalid executable path")?;
     if action == "register" { return register(name, &dir, exe); }
+    execute_existing(name, action, &dir, exe)
+}
+
+// Desktop actions are a closed allowlist. No registration, deletion,
+// arbitrary file path, profile mutation, shell execution, or elevation.
+fn desktop_action_allowed(action: &str) -> bool {
+    matches!(action, "check" | "start" | "stop" | "autostart-on" |
+        "autostart-off" | "recovery-on" | "recovery-off")
+}
+
+pub fn manage_existing(name: &str, action: &str) -> Result<(), String> {
+    if !crate::service_host::valid_name(name) || !desktop_action_allowed(action) {
+        return Err("invalid desktop service action or name".into());
+    }
+    let dir = std::env::var_os("ProgramData").map(std::path::PathBuf::from)
+        .ok_or("ProgramData unavailable")?.join(name);
+    let exe = dir.join("localtunnel-desktop.exe");
+    execute_existing(name, action, &dir, exe.to_str().ok_or("invalid executable path")?)
+}
+
+fn execute_existing(name: &str, action: &str, dir: &std::path::Path, exe: &str) -> Result<(), String> {
     let rights = access(action)?;
     let service = open(name, rights)?;
     config(&service, name, exe)?;
@@ -400,6 +430,14 @@ mod tests {
 
     #[test]
     fn action_access_is_minimal_and_closed() {
+        for action in ["check", "start", "stop", "autostart-on", "autostart-off", "recovery-on", "recovery-off"] {
+            assert!(desktop_action_allowed(action));
+        }
+        for action in ["register", "unregister", "delete", "start; calc", ""] {
+            assert!(!desktop_action_allowed(action));
+        }
+        assert!(manage_existing("Spooler", "stop").is_err());
+        assert!(manage_existing("LocalTunnelPreview-0123456789abcdef0123456789abcdef", "unregister").is_err());
         assert!(access("start").unwrap() & SERVICE_START != 0);
         assert_eq!(access("check").unwrap() & SERVICE_CHANGE_CONFIG, 0);
         assert_eq!(access("stop").unwrap() & SERVICE_START, 0);
