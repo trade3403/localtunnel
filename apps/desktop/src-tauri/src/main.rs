@@ -3,6 +3,7 @@
 mod profile;
 mod credentials;
 mod engine_integrity;
+mod transport;
 #[cfg(windows)]
 mod engine_job;
 #[cfg(windows)]
@@ -49,6 +50,7 @@ struct Running {
     _job: engine_job::EngineJob,
     _directory: TempDir,
     count: usize,
+    relay_target: Option<transport::Target>,
 }
 
 impl Running {
@@ -68,6 +70,7 @@ impl Running {
             _job: job,
             _directory: directory,
             count,
+            relay_target: None,
         })
     }
 }
@@ -115,6 +118,7 @@ impl Supervisor {
             return Err("Windows 引擎必须为 EXE 文件".into());
         }
         let config = build_config(&request)?;
+        let relay_target = transport::Target::new(&request.remote, request.mappings.iter().map(|m| m.local_port).collect())?;
         let mut builder = tempfile::Builder::new();
         builder.prefix("localtunnel-client-");
         let directory = match runtime_root {
@@ -142,9 +146,20 @@ impl Supervisor {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        self.running = Some(Running::spawn(&mut command, directory, request.mappings.len())?);
+        let mut running = Running::spawn(&mut command, directory, request.mappings.len())?;
+        running.relay_target = Some(relay_target);
+        self.running = Some(running);
         self.last_error = None;
         self.status()
+    }
+
+    fn transport_status(&mut self) -> Result<transport::Observation, String> {
+        if self.status()?.state != "running" {
+            return Ok(transport::Observation::inactive());
+        }
+        let running = self.running.as_ref().ok_or("engine unavailable")?;
+        let Some(target) = &running.relay_target else { return Ok(transport::Observation::unknown()); };
+        Ok(transport::observe(running.child.id(), target))
     }
 
     fn stop(&mut self) -> Result<Status, String> {
@@ -206,6 +221,15 @@ fn stop_tunnel(supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Status
 #[tauri::command]
 fn tunnel_status(supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Status, String> {
     supervisor.lock().map_err(|_| "进程状态不可用")?.status()
+}
+
+#[tauri::command]
+async fn transport_status(app: tauri::AppHandle) -> Result<transport::Observation, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let supervisor = app.state::<Mutex<Supervisor>>();
+        let result = supervisor.lock().map_err(|_| "进程状态不可用")?.transport_status();
+        result
+    }).await.map_err(|_| "TCP 状态读取失败")?
 }
 
 #[tauri::command]
@@ -277,7 +301,7 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
@@ -452,12 +476,20 @@ mod tests {
         }
         assert!(forwarded, "desktop supervisor failed to forward real bytes");
         fixture.join().unwrap();
+        #[cfg(windows)]
+        {
+            let observed = supervisor.transport_status().unwrap();
+            assert_eq!(observed.state, "established", "real engine relay TCP connection missing");
+            assert!(observed.established.unwrap() > 0);
+            assert_eq!(observed.match_scope, "ip_port");
+        }
         let client_dir = supervisor.running.as_ref().unwrap()._directory.path().to_owned();
         assert!(client_dir.join("client.toml").is_file());
         assert_eq!(supervisor.stop().unwrap().state, "stopped");
         assert!(!client_dir.join("client.toml").exists(), "plaintext config survived stop");
         assert!(!client_dir.exists(), "temporary directory survived stop");
         assert!(supervisor.running.is_none());
+        assert_eq!(supervisor.transport_status().unwrap().state, "inactive");
     }
 
     #[test]

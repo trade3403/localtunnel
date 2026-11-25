@@ -101,3 +101,8 @@
 ## 2026-11-25：宿主残留清理验收、显式 SCM 崩溃恢复
 - HEAD 24ed7d8cd4278190bf33722f3b8232f4c184a588，CI #65 https://github.com/trade3403/localtunnel/actions/runs/45540249685 全部通过；19/19 单测、1/1 真实桌面 TCP（0.73s 测试耗时）、实际宿主强制结束/未知文件保留/手动重启清理后真实 HTTP、安装卸载通过，EXE 3.16 MiB。预览包 https://github.com/trade3403/localtunnel/actions/runs/45540249685/artifacts/14988883924 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45540249685/artifacts/14989625413 。核心 #76、Runner #160 通过。
 - 新增显式 --service-control <preview-name> recovery-on|recovery-off，默认不配置恢复；启用前复核既有服务身份、ACL、凭据、引擎指纹。原生 ChangeServiceConfig2W 设置 SCM 崩溃恢复为3/6/12秒重启、末尾 NONE（后续不再重启），86400秒无故障重置计数，非崩溃失败不触发，禁止外部命令/重启电脑，QueryServiceConfig2W 读回核验动作及 flag。关闭恢复不依赖健康凭据；已排队的 SCM 重启可能仍执行，必要时管理员禁用服务。真实 CI 先保留既有手动崩溃清理测试，再主动启用恢复、强制结束唯一测试 SCM 宿主，验证新宿主 PID、旧 runtime 清理、HTTP 实际恢复及耗时；正常停止观察14秒不重启，关闭恢复，删除测试服务。所有新增功能待 CI；非实际重启电脑测试、不修改用户设备、不修改 main。下一步实时状态、流量计量与 GUI 服务管理。 
+
+
+## 2026-11-25：SCM 恢复验收、桌面 TCP 实时观察
+- HEAD 3890f3b7807d633e06f15e331f8a15ae1d5fcafe，CI #67 https://github.com/trade3403/localtunnel/actions/runs/45544426725 全部通过，20/20 单测、1/1 实际桌面 TCP（0.94s 测试耗时）、真实 SCM 宿主自动恢复和正常停止观察、安装卸载通过。EXE 3.16 MiB；预览包 https://github.com/trade3403/localtunnel/actions/runs/45544426725/artifacts/14990902587 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45544426725/artifacts/14991621009 。核心 #77、Runner #162 通过。
+- 新增 transport.rs Windows GetExtendedTcpTable OWNER_PID IPv4/IPv6 只读有界快照，按实际引擎 PID、ESTABLISHED、配置 IP/端口筛选；域名仅端口候选且排除本地映射同端口回环，不执行 DNS 或主动探测。IPC transport_status 与既有 1.2s GUI 轮询整合；失败为未知，停机为未启动，无 TCP 为未观察到，明确不能证明 Noise 认证/公网在线。新增真实本地 socket 单测与实际 Rathole TCP 测试断言。仅 GUI 管理的引擎，尚未读服务模式状态，不包含流量计数、每映射认证或公网探测。Windows TCP 表调用在阻塞线程执行，不增加依赖包（windows-sys 增特性）；锁定构建及新测试待 CI。后续继续服务状态、准确应用字节计量及界面，未修改 main。

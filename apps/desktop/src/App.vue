@@ -6,6 +6,13 @@ type Mapping = { id: number; name: string; localPort: number | null; token: stri
 type Profile = { engine: string; remote: string; serverKey: string; mappings: { name: string; localPort: number }[] }
 type StartRequest = Omit<Profile, 'mappings'> & { mappings: { name: string; localPort: number; token: string }[] }
 type Status = { state: 'stopped' | 'running' | 'error'; detail: string; mappingCount: number }
+type Transport = { state: 'inactive' | 'unknown' | 'established' | 'not_observed'; established: number | null; matchScope: 'none' | 'ip_port' | 'port_only' }
+const transport = ref<Transport>({ state: 'inactive', established: null, matchScope: 'none' })
+const transportLabel = computed(() => !ready.value || transport.value.state === 'unknown' ? '未知' :
+  transport.value.state === 'inactive' ? '未启动' :
+  transport.value.state === 'not_observed' ? '未观察到' : String(transport.value.established))
+const transportHint = computed(() => transport.value.matchScope === 'port_only' ? '按中转端口匹配候选 TCP；未验证域名/认证' :
+  transport.value.matchScope === 'ip_port' ? '按中转 IP 和端口匹配；未验证认证' : '非公网在线证明')
 const engine = ref('')
 const remote = ref('')
 const serverKey = ref('')
@@ -28,6 +35,11 @@ async function refresh() {
   try {
     status.value = await invoke<Status>('tunnel_status')
     ready.value = true
+    try {
+      transport.value = await invoke<Transport>('transport_status')
+    } catch {
+      transport.value = { state: 'unknown', established: null, matchScope: 'none' }
+    }
   } catch {
     ready.value = false
     error.value = '无法读取本地 Rust 服务状态。请使用桌面应用打开。'
@@ -151,11 +163,11 @@ async function toggle() {
       <div class="side-note">V0.3 开发预览<br>Rust · Noise 加密隧道</div>
     </aside>
     <main>
-      <header><div><p class="eyebrow">工作台 / 连接与映射</p><h1>内网穿透</h1><p class="muted">将本地服务连接到已授权的中转节点</p></div><span class="status" :class="{ online: ready && running }"><i></i>{{ label }}</span></header>
+      <header><div><p class="eyebrow">工作台 / 连接与映射</p><h1>内网穿透</h1><p class="muted">将本地服务连接到已授权的中转节点 · Noise 加密</p></div><span class="status" :class="{ online: ready && running }"><i></i>{{ label }}</span></header>
       <div class="summary">
         <div><small>映射配置</small><strong>{{ mappings.length }}</strong><span>最多 64 个映射</span></div>
         <div><small>已启动映射</small><strong>{{ ready ? status.mappingCount : '—' }}</strong><span>进程状态，非公网在线数</span></div>
-        <div><small>隧道协议</small><strong class="protocol">Noise</strong><span>服务端公钥验证</span></div>
+        <div><small>中转 TCP 连接</small><strong class="protocol">{{ transportLabel }}</strong><span>{{ transportHint }}</span></div>
       </div>
       <form @submit.prevent="toggle">
         <section>
