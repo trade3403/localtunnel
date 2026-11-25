@@ -12,7 +12,8 @@ permissions:
   contents: read
 jobs:
   management:
-    runs-on: ubuntu-latest
+    # Playwright 1.56.1 supports Ubuntu 24.04, not the current 26.04 latest image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -46,20 +47,13 @@ jobs:
         run: python3 crates/server/tests/preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/preview.json
       - name: Real HTTPS management preview, certificate rotation and rollback
         run: python3 crates/server/tests/tls_preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/tls-preview.json
-      # Bootstrap only for the first admin dependency resolution. The next
-      # increment must commit the real generated lock and use npm ci only.
-      - name: Resolve admin lock and install exact dependency graph
+      - name: Install committed admin dependency graph
         working-directory: apps/admin
         run: |
           node --version
           npm --version
-          npm install --package-lock-only --ignore-scripts --no-audit --no-fund
-          echo BEGIN_ADMIN_PACKAGE_LOCK
-          cat package-lock.json
-          echo END_ADMIN_PACKAGE_LOCK
-          cp package-lock.json "${RUNNER_TEMP}/admin-package-lock.json"
           npm ci --no-audit --no-fund
-          cmp package-lock.json "${RUNNER_TEMP}/admin-package-lock.json"
+          git diff --exit-code -- package-lock.json
       - name: Build Vue admin and install Chromium
         working-directory: apps/admin
         run: |
@@ -75,7 +69,7 @@ jobs:
           if test -f apps/admin/package-lock.json; then cp apps/admin/package-lock.json management-evidence/admin-package-lock.json; fi
           if test -d apps/admin/dist; then cp -r apps/admin/dist management-evidence/admin-dist; fi
       - name: Verify committed dependency lock unchanged
-        run: git diff --exit-code -- crates/server/Cargo.lock
+        run: git diff --exit-code -- crates/server/Cargo.lock apps/admin/package-lock.json
       - name: Collect committed lock
         if: always()
         run: |
