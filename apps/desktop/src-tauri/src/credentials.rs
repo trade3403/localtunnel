@@ -79,6 +79,36 @@ mod windows {
         Ok(Some(request))
     }
 
+    // Separate current-user DPAPI management credential; never return it to
+    // WebView and never overwrite an existing enrollment.
+    pub fn save_management(dir:&Path,data:&[u8])->Result<(),String>{
+        let encrypted=transform(data,true)?;
+        fs::create_dir_all(dir).map_err(|_|"无法创建管理凭据目录")?;
+        let mut file=NamedTempFile::new_in(dir).map_err(|_|"无法创建管理凭据文件")?;
+        file.write_all(&encrypted).and_then(|_|file.as_file().sync_all()).map_err(|_|"管理凭据写入失败")?;
+        file.persist_noclobber(dir.join("management-device.bin")).map_err(|_|"管理凭据已存在或无法保存")?;
+        Ok(())
+    }
+    pub fn load_management(dir:&Path)->Result<Option<Zeroizing<Vec<u8>>>,String>{
+        let path=dir.join("management-device.bin");
+        match fs::symlink_metadata(&path){
+            Ok(m) if m.file_type().is_file()=>{},
+            Ok(_)=>return Err("管理凭据文件不安全".into()),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Ok(None),
+            Err(_)=>return Err("管理凭据不可读".into()),
+        }
+        let mut encrypted=Vec::new();
+        fs::File::open(path).map_err(|_|"管理凭据不可读")?.take((LIMIT+1) as u64).read_to_end(&mut encrypted).map_err(|_|"管理凭据读取失败")?;
+        Ok(Some(transform(&encrypted,false)?))
+    }
+    pub fn forget_management(dir:&Path)->Result<(),String>{
+        match fs::remove_file(dir.join("management-device.bin")){
+            Ok(())=>Ok(()),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(()),
+            Err(_)=>Err("无法移除本地管理凭据".into()),
+        }
+    }
+
     // Service credentials live in an administrator-provisioned, service-SID
     // restricted directory. The blob is separately sealed with machine DPAPI.
     // Machine protection alone is NOT account isolation; the ACL is mandatory.
@@ -202,7 +232,7 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use windows::{save, load, forget, load_service, seal_service, replace_service};
+pub use windows::{save, load, forget, load_service, seal_service, replace_service,save_management,load_management,forget_management};
 #[cfg(not(windows))]
 pub fn save(_: &std::path::Path, _: &crate::StartRequest) -> Result<(), String> { Err("仅 Windows 支持凭据保护".into()) }
 #[cfg(not(windows))]

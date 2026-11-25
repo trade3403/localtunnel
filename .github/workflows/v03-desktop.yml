@@ -61,9 +61,15 @@ jobs:
           & apps/desktop/scripts/service_smoke.ps1 -Executable apps/desktop/src-tauri/target/release/localtunnel-desktop.exe -Evidence (Join-Path (Get-Location) "desktop-evidence/service-smoke.json")
       - name: Real Windows service encrypted tunnel
         run: python apps/desktop/scripts/service_tunnel_e2e.py apps/desktop/src-tauri/target/release/localtunnel-desktop.exe desktop-evidence/service-tunnel.json
+      - name: Build real management API for installed Windows device pairing
+        run: |
+          cargo build --locked --manifest-path crates/server/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $management = (Resolve-Path crates/server/target/debug/localtunnel-server.exe).Path
+          "LOCALTUNNEL_TEST_MANAGEMENT=$management" >> $env:GITHUB_ENV
       - name: Verify dependency locks unchanged
         run: |
-          git diff --exit-code -- apps/desktop/package-lock.json apps/desktop/src-tauri/Cargo.lock
+          git diff --exit-code -- apps/desktop/package-lock.json apps/desktop/src-tauri/Cargo.lock crates/server/Cargo.lock
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Silent installer, real installed GUI E2E and native window smoke
         run: |

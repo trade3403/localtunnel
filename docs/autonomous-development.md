@@ -272,3 +272,7 @@
 ## 2026-11-25：流量观测验收、操作审计与历史维护
 - HEAD 48992420bc099325fbabd7a75ed8438340a3aa81 六个CI全绿：Management #43 https://github.com/trade3403/localtunnel/actions/runs/45638825561 、#44 https://github.com/trade3403/localtunnel/actions/runs/45638840885 、Windows #121、Gateway #115、Runner #238/#239。#44 job 139291533460 实际HTTP流量/权限隔离、Chromium展示、全部旧回归及双锁门禁成功，报告 https://github.com/trade3403/localtunnel/actions/runs/45638840885/artifacts/15034348146 。
 - 新增迁移10同事务资源状态审计触发器、所属管理员递减游标API、中文后台操作审计、可信本地显式90日历史清理（保留当前请求流量），实际CRUD/隔离/保留/游标及浏览器运行状态转换用例。非完整请求/操作者/失败登录审计，无敏感凭据、无自动调度/防篡改/文件轮转。新功能待CI，无新依赖。下一步Windows客户端管理联动及未完成TLS专项/最终验收。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-25：操作审计验收、Windows 管理设备联动第一批
+- HEAD b92d2a13261f84436dc4496b3c8dc7103a716d3a 六个CI全绿：Management #45 https://github.com/trade3403/localtunnel/actions/runs/45640945788 、#46 https://github.com/trade3403/localtunnel/actions/runs/45640959700 、Windows #122、Gateway #116、Runner #240/#241。#46 job 139299149527 实际审计/权限/历史清理/Chromium及所有旧回归和双锁门禁成功，报告 https://github.com/trade3403/localtunnel/actions/runs/45640959700/artifacts/15034989184 。
+- Windows 客户端新增实际本机管理配对、独立当前用户DPAPI设备token、身份/配置元数据/手动心跳同步、吊销拒绝及本地移除；token不回WebView、固定回环高位端口、禁代理跳转、响应限制。不自动应用远程草稿或影响原隧道。reqwest 0.13.5 已锁定，新增直接引用及根锁引用，不新引入TLS。Windows CI 增加同commit真实控制面构建及安装版GUI配对/实际后台心跳/吊销/DPAPI验证。新功能待CI，仍无远程TLS/自动同步/管理隧道配置下发、服务模式管理设备、真实公网/普通用户验收。未改main、未部署公网、未开启定时任务。

@@ -5,7 +5,7 @@ import { spawn, execFileSync } from 'node:child_process'
 import { createServer as tcpServer } from 'node:net'
 import { createServer as httpServer } from 'node:http'
 import { randomBytes } from 'node:crypto'
-import { mkdtemp, writeFile, rm, readFile, readdir } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, rm, readFile, readdir } from 'node:fs/promises'
 import { dirname, join, resolve, basename } from 'node:path'
 import { tmpdir } from 'node:os'
 import { fileURLToPath } from 'node:url'
@@ -24,7 +24,8 @@ const report = { scope: 'installed WebView2 desktop and SCM DOM controls + real 
   start_clicked: false, encrypted_http: false, traffic_visible: false,
   native_close_hides: false, hidden_tunnel_works: false, native_restore: false,
   stop_clicked: false, forwarding_stopped: false, history_visible: false }
-let app, relay, socket, fixture, policy, alternate
+let app, relay, socket, fixture, policy, alternate, management
+let managementFile, managementCreated=false
 let serviceName
 report.service_provisioned = false
 report.service_startup_controls = false
@@ -273,6 +274,62 @@ try {
   await connectCdp(debugPort)
   await until('ready enabled input', () => evaluate('!!document.querySelector("input[placeholder=\\"relay.example.com:2333\\"]:not(:disabled)")'))
   report.ui_ready = true
+  // Real management API built from this exact commit, never a mock.
+  if (!process.env.LOCALTUNNEL_TEST_MANAGEMENT) throw Error('management test executable unavailable')
+  const control=resolve(process.env.LOCALTUNNEL_TEST_MANAGEMENT)
+  const data=join(work,'management')
+  await mkdir(data)
+  const password=randomBytes(24).toString('hex')
+  execFileSync(control,['--init-admin',data],{input:JSON.stringify({username:'operator',password}),stdio:['pipe','ignore','ignore'],timeout:30000,windowsHide:true})
+  const tempPort=tcpServer()
+  const managementPort=await listen(tempPort);await close(tempPort)
+  management=launch(control,[data,String(managementPort)])
+  const base='http://127.0.0.1:'+managementPort
+  await until('real management API ready',async()=>{try{return (await fetch(base+'/readyz',{signal:AbortSignal.timeout(1500)})).ok}catch{return false}},30000)
+  async function manage(path,method='GET',bearer,body){
+    const headers={}
+    if(bearer)headers.Authorization='Bearer '+bearer
+    if(body)headers['Content-Type']='application/json'
+    return fetch(base+'/api/v1/'+path,{method,headers,body:body?JSON.stringify(body):undefined,signal:AbortSignal.timeout(8000)})
+  }
+  const login=await manage('auth/login','POST',null,{username:'operator',password})
+  if(login.status!==200)throw Error('management login failed')
+  const admin=(await login.json()).access_token
+  const pair=await manage('devices/pairing-code','POST',admin)
+  if(pair.status!==200)throw Error('management pairing issue failed')
+  const code=(await pair.json()).pairing_code
+  managementFile=join(process.env.APPDATA,'com.localtunnel.desktop','management-device.bin')
+  try{await readFile(managementFile);throw Error('existing management credentials: refusing to overwrite')}
+  catch(e){if(e.code!=='ENOENT')throw e}
+  managementCreated=true
+  await field('input[aria-label="本机管理端口"]',managementPort)
+  await field('input[aria-label="管理设备名称"]','Installed Windows fixture')
+  await field('input[aria-label="管理配对码"]',code)
+  await click('配对管理设备')
+  await waitText('设备已配对，凭据已加密保存')
+  const blob=await readFile(managementFile)
+  if(!blob.length||blob.includes(Buffer.from('ltdev_'))||blob.includes(Buffer.from(code)))throw Error('management credential not protected')
+  const listed=await manage('devices','GET',admin)
+  const devices=await listed.json()
+  if(listed.status!==200||devices.length!==1||devices[0].name!=='Installed Windows fixture')throw Error('real device enrollment missing')
+  const device=devices[0]
+  await click('同步管理状态')
+  await waitText('配置元数据及管理心跳同步成功')
+  const observed=await manage('devices/'+device.id+'/status','GET',admin)
+  const heartbeat=await observed.json()
+  if(observed.status!==200||!heartbeat.management_online||!heartbeat.configuration_current||heartbeat.reported_state!=='idle')throw Error('real desktop heartbeat missing')
+  if((await manage('devices/'+device.id+'/revoke','POST',admin)).status!==204)throw Error('management revoke failed')
+  await click('同步管理状态')
+  await waitText('管理凭据无效或已吊销')
+  if(await has('配置元数据及管理心跳同步成功'))throw Error('stale management status survived revoke')
+  await evaluate('document.querySelector("input[aria-label=\\\"确认移除管理凭据\\\"]").click()')
+  await click('移除管理凭据')
+  await waitText('本地管理凭据已移除')
+  try{await readFile(managementFile);throw Error('management credential was not removed')}
+  catch(e){if(e.code!=='ENOENT')throw e}
+  report.real_management_pairing_dpapi_heartbeat_and_revocation=true
+  await terminate(management)
+  management=null
   await click('＋ 添加映射')
   await until('two mappings', () => evaluate('document.querySelectorAll(".mapping").length===2'))
   await evaluate('document.querySelectorAll("button[aria-label=\\"删除映射\\"]")[1].click()')
@@ -461,6 +518,8 @@ try {
   try {
     if (socket) socket.close()
     await terminate(app)
+    await terminate(management)
+    if(managementCreated&&managementFile)await rm(managementFile,{force:true})
     if (serviceName) {
       cleanupTestService(serviceName)
       if (scAbsent(serviceName)) {

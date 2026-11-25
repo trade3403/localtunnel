@@ -2,6 +2,49 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 
+type ManagedDevice={port:number;id:string}
+type ManagedSync={id:string;name:string;revision:number;mappings:{id:string;protocol:string;local_port:number;bind_port:number;enabled:boolean}[];last_seen_at:number;heartbeat_interval_seconds:number}
+const managementPort=ref<number|null>(1431)
+const managementName=ref('Windows 客户端')
+const pairingCode=ref('')
+const managedDevice=ref<ManagedDevice|null>(null)
+const managedSync=ref<ManagedSync|null>(null)
+const managementBusy=ref(false)
+const managementReady=ref(false)
+const managementMessage=ref('')
+const managementError=ref('')
+const forgetConfirm=ref(false)
+async function loadManagement(){
+  managementBusy.value=true
+  try{
+    managedDevice.value=await invoke<ManagedDevice|null>('management_saved')
+    if(managedDevice.value)managementPort.value=managedDevice.value.port
+  }catch(e){managementError.value=String(e)}
+  finally{managementBusy.value=false;managementReady.value=true}
+}
+async function managementAction(action:'pair'|'sync'|'forget'){
+  if(managementBusy.value||!managementReady.value)return
+  managementBusy.value=true;managementError.value='';managementMessage.value=''
+  try{
+    if(action==='pair'){
+      if(!Number.isInteger(managementPort.value)||Number(managementPort.value)<1024||Number(managementPort.value)>65535)throw Error('请输入 1024–65535 的管理端口')
+      const code=pairingCode.value.trim();pairingCode.value=''
+      managedDevice.value=await invoke<ManagedDevice>('management_enroll',{port:Number(managementPort.value),name:managementName.value.trim(),pairingCode:code})
+      managementMessage.value='设备已配对，凭据已加密保存'
+    }else if(action==='sync'){
+      managedSync.value=null
+      managedSync.value=await invoke<ManagedSync>('management_sync')
+      managementMessage.value='配置元数据及管理心跳同步成功'
+    }else{
+      if(!forgetConfirm.value)return
+      await invoke('management_forget')
+      managedDevice.value=null;managedSync.value=null;forgetConfirm.value=false;pairingCode.value=''
+      managementMessage.value='本地管理凭据已移除；请在后台吊销旧设备'
+    }
+  }catch(e){managementError.value=String(e);managedSync.value=null}
+  finally{managementBusy.value=false}
+}
+
 type Mapping = { id: number; name: string; localPort: number | null; token: string }
 type Profile = { engine: string; remote: string; serverKey: string; mappings: { name: string; localPort: number }[] }
 type StartRequest = Omit<Profile, 'mappings'> & { mappings: { name: string; localPort: number; token: string }[] }
@@ -205,7 +248,7 @@ async function refresh() {
     error.value = '无法读取本地 Rust 服务状态。请使用桌面应用打开。'
   } finally { polling = false }
 }
-onMounted(() => { void refresh(); timer = setInterval(() => { void refresh(); void refreshService() }, 1200) })
+onMounted(() => { void refresh(); void loadManagement(); timer = setInterval(() => { void refresh(); void refreshService() }, 1200) })
 onUnmounted(() => { if (timer) clearInterval(timer) })
 function add() {
   if (locked.value || mappings.value.length >= 64) return
@@ -329,6 +372,29 @@ async function toggle() {
         <div><small>已启动映射</small><strong>{{ ready ? status.mappingCount : '—' }}</strong><span>进程状态，非公网在线数</span></div>
         <div><small>中转 TCP 连接</small><strong class="protocol">{{ transportLabel }}</strong><span>{{ transportHint }}</span></div>
       </div>
+      <section>
+        <div class="section-title"><h2>管理设备配对</h2><span>V0.4 本机控制面预览</span></div>
+        <p class="hint">仅 HTTP 127.0.0.1 本机管理服务；不会自动启动或修改现有隧道。手动同步管理心跳与期望配置元数据。</p>
+        <div v-if="!managedDevice" class="fields">
+          <label>本机管理端口<input aria-label="本机管理端口" type="number" min="1024" max="65535" v-model.number="managementPort" :disabled="managementBusy||!managementReady"/></label>
+          <label>设备名称<input aria-label="管理设备名称" v-model="managementName" maxlength="128" :disabled="managementBusy||!managementReady"/></label>
+          <label class="wide">一次性配对码<input aria-label="管理配对码" type="password" autocomplete="off" v-model="pairingCode" :disabled="managementBusy||!managementReady"/></label>
+        </div>
+        <div class="profile-actions">
+          <button v-if="!managedDevice" type="button" class="secondary" :disabled="managementBusy||!managementReady||!pairingCode" @click="managementAction('pair')">配对管理设备</button>
+          <button v-if="managedDevice" type="button" class="secondary" :disabled="managementBusy" @click="managementAction('sync')">同步管理状态</button>
+          <label><input type="checkbox" aria-label="确认移除管理凭据" v-model="forgetConfirm" :disabled="managementBusy"/> 仅移除本机管理凭据，不代表服务器吊销</label>
+          <button type="button" class="secondary" :disabled="managementBusy||!managementReady||!forgetConfirm" @click="managementAction('forget')">移除管理凭据</button>
+        </div>
+        <p v-if="managedDevice" class="hint">已配对 ID：{{ managedDevice.id }} · 127.0.0.1:{{ managedDevice.port }}</p>
+        <div v-if="managedSync" aria-live="polite">
+          <p>管理配置版本：{{managedSync.revision}} · 期望映射：{{managedSync.mappings.length}} · 管理模式：idle（未应用隧道配置）</p>
+          <p class="hint">最近心跳：{{new Date(managedSync.last_seen_at*1000).toLocaleString()}}；建议每30秒同步。不是实际隧道在线证明。</p>
+          <p v-for="item in managedSync.mappings" :key="item.id" class="hint">{{item.protocol.toUpperCase()}} · 本地 {{item.local_port}} → 中转 {{item.bind_port}} · {{item.enabled?'期望启用':'草稿禁用'}}</p>
+        </div>
+        <p v-if="managementMessage" class="hint" role="status">{{managementMessage}}</p>
+        <p v-if="managementError" class="error" role="alert">{{managementError}}</p>
+      </section>
       <section>
         <div class="section-title"><h2>桌面隧道流量</h2><span>{{ traffic?.state === 'measured' ? '实际 TCP 数据' : '未计量 / 未启动' }}</span></div>
         <div class="summary">
