@@ -5,6 +5,8 @@ mod credentials;
 mod engine_integrity;
 #[cfg(windows)]
 mod engine_job;
+#[cfg(windows)]
+mod service_host;
 
 use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};
@@ -237,6 +239,15 @@ async fn check_local_port(port: u16) -> Result<bool, String> {
 }
 
 fn main() {
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.get(1).is_some_and(|arg| arg == "--service-host") {
+            // Explicit SCM-only entry; ordinary desktop startup never registers a service.
+            let ok = args.len() == 3 && service_host::dispatch(&args[2]).is_ok();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
+    }
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))

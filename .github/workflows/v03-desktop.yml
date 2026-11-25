@@ -55,6 +55,10 @@ jobs:
       - name: Build Windows NSIS preview installer
         working-directory: apps/desktop
         run: npm run tauri -- build --bundles nsis -- --locked
+      - name: Real Windows SCM service lifecycle
+        run: |
+          New-Item -ItemType Directory -Force desktop-evidence | Out-Null
+          & apps/desktop/scripts/service_smoke.ps1 -Executable apps/desktop/src-tauri/target/release/localtunnel-desktop.exe -Evidence (Join-Path (Get-Location) "desktop-evidence/service-smoke.json")
       - name: Verify dependency locks unchanged
         run: |
           git diff --exit-code -- apps/desktop/package-lock.json apps/desktop/src-tauri/Cargo.lock
