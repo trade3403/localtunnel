@@ -106,3 +106,8 @@
 ## 2026-11-25：SCM 恢复验收、桌面 TCP 实时观察
 - HEAD 3890f3b7807d633e06f15e331f8a15ae1d5fcafe，CI #67 https://github.com/trade3403/localtunnel/actions/runs/45544426725 全部通过，20/20 单测、1/1 实际桌面 TCP（0.94s 测试耗时）、真实 SCM 宿主自动恢复和正常停止观察、安装卸载通过。EXE 3.16 MiB；预览包 https://github.com/trade3403/localtunnel/actions/runs/45544426725/artifacts/14990902587 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45544426725/artifacts/14991621009 。核心 #77、Runner #162 通过。
 - 新增 transport.rs Windows GetExtendedTcpTable OWNER_PID IPv4/IPv6 只读有界快照，按实际引擎 PID、ESTABLISHED、配置 IP/端口筛选；域名仅端口候选且排除本地映射同端口回环，不执行 DNS 或主动探测。IPC transport_status 与既有 1.2s GUI 轮询整合；失败为未知，停机为未启动，无 TCP 为未观察到，明确不能证明 Noise 认证/公网在线。新增真实本地 socket 单测与实际 Rathole TCP 测试断言。仅 GUI 管理的引擎，尚未读服务模式状态，不包含流量计数、每映射认证或公网探测。Windows TCP 表调用在阻塞线程执行，不增加依赖包（windows-sys 增特性）；锁定构建及新测试待 CI。后续继续服务状态、准确应用字节计量及界面，未修改 main。
+
+
+## 2026-11-25：桌面 TCP 监测验收、SCM 实时只读状态
+- HEAD 7422c15662fd3232bf34b9d60fe096773d3a17e2，CI #69 https://github.com/trade3403/localtunnel/actions/runs/45546429554 全部通过，Windows 原生 TCP 表、真实引擎 TCP、SCM 恢复、安装卸载及锁定构建通过；核心 #78、Runner #164 通过。预览包 https://github.com/trade3403/localtunnel/actions/runs/45546429554/artifacts/14992440025 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45546429554/artifacts/14992011167 。
+- 新增只读 SCM QueryServiceStatusEx 状态快照（校验预览服务名称、完整固定 ImagePath、LocalService/own-process、QUERY_CONFIG/QUERY_STATUS 最小权限），返回宿主状态、启动模式、有效宿主 PID、退出码；普通安装 EXE 可通过 --service-status <name> JSON 查询，不读密文或更改服务。GUI 增加手动指定服务并1.2秒轮询，停止监测、错误清空、代际检查避免旧查询覆盖新目标。CI 从非部署 EXE 真实读取注册后停止/自启/运行 PID/宿主恢复新 PID/停止/删除后的不可用状态，拒绝不相关服务。新增代码待 CI，不代表认证/公网在线，不含服务引擎 TCP 计数或流量字节统计，权限不足会明确报错；GUI 服务注册/修改仍待开发。未修改 main。下一步准确流量计量与服务管理界面。

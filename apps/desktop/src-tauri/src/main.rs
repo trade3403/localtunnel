@@ -232,6 +232,19 @@ async fn transport_status(app: tauri::AppHandle) -> Result<transport::Observatio
     }).await.map_err(|_| "TCP 状态读取失败")?
 }
 
+#[cfg(windows)]
+#[tauri::command]
+async fn service_status(name: String) -> Result<service_control::ServiceSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(move || service_control::snapshot(&name))
+        .await.map_err(|_| "service query failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn service_status(_name: String) -> Result<serde_json::Value, String> {
+    Err("Windows SCM unavailable".into())
+}
+
 #[tauri::command]
 fn save_profile(app: tauri::AppHandle, profile: profile::Profile) -> Result<(), String> {
     let path = app.path().app_config_dir().map_err(|_| "无法定位用户配置目录")?;
@@ -278,6 +291,16 @@ fn main() {
     #[cfg(windows)]
     {
         let args: Vec<String> = std::env::args().collect();
+        if args.get(1).is_some_and(|arg| arg == "--service-status") {
+            let result = if args.len() == 3 {
+                service_control::snapshot(&args[2]).and_then(|s|
+                    serde_json::to_writer(std::io::stdout().lock(), &s).map_err(|_| "status output failed".into()))
+            } else { Err("invalid service status arguments".into()) };
+            if let Err(error) = &result {
+                let _ = writeln!(std::io::stderr(), "service status failed: {error}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        }
         if args.get(1).is_some_and(|arg| arg == "--service-control") {
             let result = if args.len() == 4 {
                 service_control::execute(&args[2], &args[3])
@@ -301,7 +324,7 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, service_status, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;

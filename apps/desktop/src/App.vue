@@ -13,6 +13,52 @@ const transportLabel = computed(() => !ready.value || transport.value.state === 
   transport.value.state === 'not_observed' ? '未观察到' : String(transport.value.established))
 const transportHint = computed(() => transport.value.matchScope === 'port_only' ? '按中转端口匹配候选 TCP；未验证域名/认证' :
   transport.value.matchScope === 'ip_port' ? '按中转 IP 和端口匹配；未验证认证' : '非公网在线证明')
+type ServiceSnapshot = { state: string; startup: string; hostPid: number | null; win32ExitCode: number; serviceExitCode: number }
+const serviceName = ref('')
+const watchedService = ref('')
+const serviceSnapshot = ref<ServiceSnapshot | null>(null)
+const serviceError = ref('')
+let servicePolling = false
+let serviceGeneration = 0
+const serviceStateLabels: Record<string, string> = { stopped: '已停止', starting: '启动中', stopping: '停止中', running: '宿主运行中', paused: '已暂停', transitioning: '切换中', unknown: '未知' }
+const startupLabels: Record<string, string> = { automatic: '自动', manual: '手动', disabled: '禁用', unknown: '未知' }
+async function refreshService() {
+  const name = watchedService.value
+  if (!name || servicePolling) return
+  servicePolling = true
+  const generation = serviceGeneration
+  try {
+    const result = await invoke<ServiceSnapshot>('service_status', { name })
+    if (serviceGeneration === generation) {
+      serviceSnapshot.value = result
+      serviceError.value = ''
+    }
+  } catch {
+    if (serviceGeneration === generation) {
+      serviceSnapshot.value = null
+      serviceError.value = '无法读取服务：未注册、身份不符或查询权限不足'
+    }
+  } finally { servicePolling = false }
+}
+function watchService() {
+  serviceGeneration++
+  serviceSnapshot.value = null
+  serviceError.value = ''
+  const name = serviceName.value.trim()
+  watchedService.value = ''
+  if (!/^LocalTunnelPreview-[0-9a-fA-F]{32}$/.test(name)) {
+    serviceError.value = '请输入完整的 LocalTunnelPreview 服务名称'
+    return
+  }
+  watchedService.value = name
+  void refreshService()
+}
+function unwatchService() {
+  serviceGeneration++
+  watchedService.value = ''
+  serviceSnapshot.value = null
+  serviceError.value = ''
+}
 const engine = ref('')
 const remote = ref('')
 const serverKey = ref('')
@@ -45,7 +91,7 @@ async function refresh() {
     error.value = '无法读取本地 Rust 服务状态。请使用桌面应用打开。'
   } finally { polling = false }
 }
-onMounted(() => { void refresh(); timer = setInterval(refresh, 1200) })
+onMounted(() => { void refresh(); timer = setInterval(() => { void refresh(); void refreshService() }, 1200) })
 onUnmounted(() => { if (timer) clearInterval(timer) })
 function add() {
   if (locked.value || mappings.value.length >= 64) return
@@ -169,6 +215,25 @@ async function toggle() {
         <div><small>已启动映射</small><strong>{{ ready ? status.mappingCount : '—' }}</strong><span>进程状态，非公网在线数</span></div>
         <div><small>中转 TCP 连接</small><strong class="protocol">{{ transportLabel }}</strong><span>{{ transportHint }}</span></div>
       </div>
+      <section>
+        <div class="section-title"><h2>Windows 后台服务</h2><span>只读 SCM 状态</span></div>
+        <div class="fields">
+          <label class="wide">已注册服务名称<input v-model="serviceName" maxlength="51" placeholder="LocalTunnelPreview-…" /></label>
+        </div>
+        <div class="profile-actions">
+          <button type="button" class="secondary" @click="watchService">监测服务</button>
+          <button type="button" class="secondary" :disabled="!watchedService" @click="unwatchService">停止监测</button>
+        </div>
+        <p v-if="watchedService" class="hint">监测：{{ watchedService }}</p>
+        <div v-if="serviceSnapshot" class="summary" aria-live="polite">
+          <div><small>服务状态</small><strong class="protocol">{{ serviceStateLabels[serviceSnapshot.state] || '未知' }}</strong><span>非公网在线证明</span></div>
+          <div><small>启动方式</small><strong class="protocol">{{ startupLabels[serviceSnapshot.startup] || '未知' }}</strong><span>SCM 实际配置</span></div>
+          <div><small>宿主 PID</small><strong>{{ serviceSnapshot.hostPid ?? '—' }}</strong><span>退出码 {{ serviceSnapshot.win32ExitCode }} / {{ serviceSnapshot.serviceExitCode }}</span></div>
+        </div>
+        <p v-else-if="watchedService && !serviceError" class="hint">读取服务状态中…</p>
+        <p v-if="serviceError" class="error" role="alert">{{ serviceError }}</p>
+        <p class="hint">只读取明确指定的预览服务，不修改配置、不读取凭据；本地桌面隧道与后台服务独立管理。</p>
+      </section>
       <form @submit.prevent="toggle">
         <section>
           <div class="section-title"><h2>中转节点</h2><span>服务端需提前配置同名映射</span></div>

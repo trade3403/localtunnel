@@ -66,6 +66,63 @@ fn status(service: &Handle) -> Result<u32, String> {
     Ok(status.dwCurrentState)
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceSnapshot {
+    state: &'static str,
+    startup: &'static str,
+    host_pid: Option<u32>,
+    win32_exit_code: u32,
+    service_exit_code: u32,
+}
+
+fn state_label(state: u32) -> &'static str {
+    match state {
+        SERVICE_STOPPED => "stopped",
+        SERVICE_START_PENDING => "starting",
+        SERVICE_STOP_PENDING => "stopping",
+        SERVICE_RUNNING => "running",
+        SERVICE_PAUSED => "paused",
+        SERVICE_PAUSE_PENDING | SERVICE_CONTINUE_PENDING => "transitioning",
+        _ => "unknown",
+    }
+}
+
+fn startup_label(mode: u32) -> &'static str {
+    match mode {
+        SERVICE_AUTO_START => "automatic",
+        SERVICE_DEMAND_START => "manual",
+        SERVICE_DISABLED => "disabled",
+        _ => "unknown",
+    }
+}
+
+// Unlike mutating commands, status can be queried from the ordinary
+// desktop installation. Do not open profile files or require elevation.
+pub fn snapshot(name: &str) -> Result<ServiceSnapshot, String> {
+    if !crate::service_host::valid_name(name) { return Err("invalid preview service name".into()); }
+    let dir = std::env::var_os("ProgramData").map(std::path::PathBuf::from)
+        .ok_or("ProgramData unavailable")?.join(name);
+    let exe = dir.join("localtunnel-desktop.exe");
+    let service = open(name, SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS)?;
+    let mode = config(&service, name, exe.to_str().ok_or("invalid executable path")?)?;
+    let mut data: SERVICE_STATUS_PROCESS = unsafe { std::mem::zeroed() };
+    let mut needed = 0;
+    if unsafe { QueryServiceStatusEx(service.0, SC_STATUS_PROCESS_INFO,
+        (&mut data as *mut SERVICE_STATUS_PROCESS).cast(),
+        std::mem::size_of::<SERVICE_STATUS_PROCESS>() as u32, &mut needed) } == 0 {
+        return Err(last_error());
+    }
+    Ok(ServiceSnapshot {
+        state: state_label(data.dwCurrentState),
+        startup: startup_label(mode),
+        host_pid: (matches!(data.dwCurrentState, SERVICE_RUNNING | SERVICE_PAUSED)
+            && data.dwProcessId != 0).then_some(data.dwProcessId),
+        win32_exit_code: data.dwWin32ExitCode,
+        service_exit_code: data.dwServiceSpecificExitCode,
+    })
+}
+
 fn transition_allowed(state: u32, target: u32, pending: u32) -> bool {
     // ControlService can return before our service loop publishes STOP_PENDING.
     // Its handler sets an atomic stop flag, then the worker performs cleanup.
@@ -297,6 +354,18 @@ pub fn execute(name: &str, action: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn labels_do_not_claim_connectivity() {
+        assert_eq!(state_label(SERVICE_RUNNING), "running");
+        assert_eq!(state_label(SERVICE_STOPPED), "stopped");
+        assert_eq!(state_label(SERVICE_START_PENDING), "starting");
+        assert_eq!(state_label(u32::MAX), "unknown");
+        assert_eq!(startup_label(SERVICE_DEMAND_START), "manual");
+        assert_eq!(startup_label(SERVICE_AUTO_START), "automatic");
+        assert_eq!(startup_label(SERVICE_DISABLED), "disabled");
+        assert!(snapshot("Spooler").is_err());
+    }
+
     #[test]
     fn recovery_policy_has_a_terminal_no_action() {
         let enabled = recovery_actions(true);

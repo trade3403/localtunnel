@@ -80,7 +80,7 @@ def main(executable, evidence):
               "host_crash_restart": False, "host_crash_runtime_cleaned": False,
               "unknown_runtime_preserved": False, "unsafe_recovery_rejected": False,
               "automatic_host_recovered": False, "normal_stop_no_recovery": False,
-              "recovery_disabled": False}
+              "recovery_disabled": False, "readonly_scm_status": False}
     created = False
     relay = None
     fixture = None
@@ -99,6 +99,11 @@ def main(executable, evidence):
         run("icacls.exe", str(root), "/setowner", "*S-1-5-32-544", "/T")
         def control(action, check=True):
             return run(str(exe), "--service-control", name, action, check=check)
+        def snapshot():
+            # Query using original desktop EXE, not the privileged service copy.
+            return json.loads(run(str(executable), "--service-status", name).stdout)
+        if run(str(executable), "--service-status", "Spooler", check=False).returncode == 0:
+            raise RuntimeError("status accepted unrelated system service")
         run("icacls.exe", str(root), "/grant:r", "*S-1-1-0:RX")
         if control("register", check=False).returncode == 0:
             created = True
@@ -107,6 +112,9 @@ def main(executable, evidence):
         run("icacls.exe", str(root), "/remove:g", "*S-1-1-0")
         control("register")
         created = True
+        initial = snapshot()
+        if initial["state"] != "stopped" or initial["startup"] != "manual" or initial["hostPid"] is not None:
+            raise RuntimeError("incorrect initial read-only SCM snapshot")
         if control("register", check=False).returncode == 0:
             raise RuntimeError("duplicate service registration accepted")
         report["duplicate_registration_rejected"] = True
@@ -211,6 +219,8 @@ bind_addr = "127.0.0.1:{mapped}"
                 if not re.search(r"START_TYPE\s*:\s*2\b", sc("qc", name).stdout):
                     raise RuntimeError("SCM auto start not configured")
                 report["autostart_enabled"] = True
+                if snapshot()["startup"] != "automatic":
+                    raise RuntimeError("SCM snapshot did not reflect automatic startup")
                 control("autostart-off")
                 if not re.search(r"START_TYPE\s*:\s*3\b", sc("qc", name).stdout):
                     raise RuntimeError("SCM manual start not restored")
@@ -221,6 +231,10 @@ bind_addr = "127.0.0.1:{mapped}"
                 e2e.wait_for(url, body, [relay], seconds=35)
                 report["forwarded"] = True
                 host_pid = service_pid(name)
+                running_snapshot = snapshot()
+                if (running_snapshot["state"] != "running" or running_snapshot["hostPid"] != host_pid
+                        or running_snapshot["startup"] != "manual"):
+                    raise RuntimeError("read-only SCM running snapshot mismatch")
                 old_child = engine_child(host_pid, root)
                 if old_child is None:
                     raise RuntimeError("service engine child missing")
@@ -297,6 +311,8 @@ bind_addr = "127.0.0.1:{mapped}"
                 if previous_child[1].exists():
                     raise RuntimeError("automatic recovery left old runtime")
                 e2e.wait_for(url, body, [relay], seconds=35)
+                if snapshot()["hostPid"] != recovered_host:
+                    raise RuntimeError("read-only SCM snapshot retained old host PID")
                 report["automatic_host_recovered"] = True
                 report["automatic_host_recovery_seconds"] = round(time.monotonic() - started_at, 3)
                 if control("unregister", check=False).returncode == 0:
@@ -308,6 +324,10 @@ bind_addr = "127.0.0.1:{mapped}"
                 control("stop")  # idempotent once SCM confirms stopped
                 report["stopped"] = True
                 report["idempotent_stop"] = True
+                stopped_snapshot = snapshot()
+                if stopped_snapshot["state"] != "stopped" or stopped_snapshot["hostPid"] is not None:
+                    raise RuntimeError("read-only SCM snapshot retained stopped PID")
+                report["readonly_scm_status"] = True
                 if any((root / "runtime").iterdir()):
                     raise RuntimeError("service runtime files survived stop")
                 report["runtime_cleaned"] = True
@@ -344,6 +364,8 @@ bind_addr = "127.0.0.1:{mapped}"
             time.sleep(.25)
         if not report["deleted"]:
             raise RuntimeError("service remains after deletion")
+        if run(str(executable), "--service-status", name, check=False).returncode == 0:
+            raise RuntimeError("deleted service reported available")
     finally:
         if created:
             # Disable startup before emergency cleanup, including a queued retry.

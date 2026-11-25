@@ -39,7 +39,7 @@ fn backoff(delay: Duration) -> bool {
 }
 
 
-fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     let prefix = "LocalTunnelPreview-";
     name.strip_prefix(prefix).is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
