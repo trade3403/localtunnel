@@ -101,7 +101,7 @@ async fn change(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Head
     if c.enabled==Some(true){return Err(ACTIVATION)}
     // Existing enabled rows may only be explicitly disabled, not edited in
     // place. All mutations use optimistic concurrency and current authority.
-    let query=format!("UPDATE mappings SET local_port=COALESCE(?,local_port),bind_port=COALESCE(?,bind_port),enabled=COALESCE(?,enabled),revision=revision+1 WHERE id=? AND owner_id=? AND revision=? AND (enabled=0 OR (?=0 AND ? IS NULL AND ? IS NULL)) AND owner_id IN (SELECT u.id FROM users u JOIN admin_sessions a ON a.user_id=u.id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin') RETURNING {FIELDS}");
+    let query=format!("UPDATE mappings SET local_port=COALESCE(?,local_port),bind_port=COALESCE(?,bind_port),enabled=COALESCE(?,enabled),revision=revision+1 WHERE id=? AND owner_id=? AND revision=? AND NOT EXISTS(SELECT 1 FROM runtime_requests r WHERE r.mapping_id=mappings.id AND r.state<>'stopped') AND (enabled=0 OR (?=0 AND ? IS NULL AND ? IS NULL)) AND owner_id IN (SELECT u.id FROM users u JOIN admin_sessions a ON a.user_id=u.id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin') RETURNING {FIELDS}");
     let row=sqlx::query_as::<_,Mapping>(&query).bind(c.local_port).bind(c.bind_port).bind(c.enabled)
         .bind(&id).bind(&owner).bind(c.expected_revision).bind(c.enabled).bind(c.local_port).bind(c.bind_port).bind(token)
         .fetch_optional(&pool).await.map_err(db_error)?;
@@ -120,7 +120,7 @@ async fn remove(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Head
     let owner=auth::identify(&pool,&token).await?.id;
     if !valid_id(&id){return Err(MISSING)}
     if q.expected_revision<1{return Err(BAD)}
-    let r=sqlx::query("DELETE FROM mappings WHERE id=? AND owner_id=? AND revision=? AND enabled=0 AND owner_id IN (SELECT u.id FROM users u JOIN admin_sessions a ON a.user_id=u.id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin')")
+    let r=sqlx::query("DELETE FROM mappings WHERE id=? AND owner_id=? AND revision=? AND enabled=0 AND NOT EXISTS(SELECT 1 FROM runtime_requests r WHERE r.mapping_id=mappings.id AND r.state<>'stopped') AND owner_id IN (SELECT u.id FROM users u JOIN admin_sessions a ON a.user_id=u.id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin')")
         .bind(&id).bind(&owner).bind(q.expected_revision).bind(token).execute(&pool).await.map_err(db_error)?;
     if r.rows_affected()!=1{return Err(mutation_failure(&pool,&owner,&id).await?)}
     Ok(auth::uncached(StatusCode::NO_CONTENT))

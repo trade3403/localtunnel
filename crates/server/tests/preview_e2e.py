@@ -42,7 +42,7 @@ def call(base,path,method="GET",token=None,data=None):
 
 def expect(r,status):
     assert r[0]==status, f"expected {status}, got {r[0]}"
-    if status in (200,201):
+    if status in (200,201,202):
         assert r[2].get("Cache-Control")=="no-store"
         return json.loads(r[1])
 
@@ -328,12 +328,60 @@ try:
                     assert db.execute("SELECT enabled FROM devices WHERE id=?",(device2["id"],)).fetchone()==(0,)
                     assert db.execute("SELECT enabled FROM mappings WHERE id=?",(mid2,)).fetchone()==(0,)
                 report["actual_supervised_tunnel_revocation_and_gateway_clear"]=True
+                # Start/stop via API, with a fixed one-shot local worker.
+                expect(call(base,"mappings/"+mid2+"?expected_revision=1","DELETE",admin),204)
+                device3=expect(enroll(base,issue(base,admin)),201)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                mapping3=expect(call(base,"mappings","POST",admin,{"device_id":device3["id"],"node_id":nid,"domain_id":domain["id"],"protocol":"http","local_port":fixture.server_port,"bind_port":bp}),201)
+                mid3=mapping3["id"]
+                runtime_path="mappings/"+mid3
+                with sqlite3.connect(db_path) as db:
+                    phc=db.execute("SELECT password_hash FROM users WHERE username='operator'").fetchone()[0]
+                    db.execute("INSERT INTO users(id,username,password_hash,role) VALUES ('other','otheradmin',?,'admin')",(phc,))
+                other=login(base,"otheradmin")
+                expect(call(base,runtime_path+"/runtime"),401)
+                expect(call(base,runtime_path+"/runtime",token=other),404)
+                expect(call(base,runtime_path+"/start","POST",other,{"expected_revision":1}),404)
+                expect(call(base,runtime_path+"/start","POST",device3["device_token"],{"expected_revision":1}),401)
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":2}),409)
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1,"command":"forbidden"}),422)
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"] is None
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                # No worker: request does not start any actual process.
+                assert queued["state"]=="queued" and request(gp,"preview.example.test")[0]==421
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),409)
+                expect(call(base,runtime_path+"?expected_revision=1","DELETE",admin),409)
+                expect(call(base,runtime_path,"PATCH",admin,{"expected_revision":1,"local_port":12345}),409)
+                cancelled=expect(call(base,runtime_path+"/stop","POST",admin,{"request_id":queued["request_id"]}),202)
+                assert cancelled["state"]=="stopped"
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                assert queued["request_id"]!=cancelled["request_id"]
+                expect(call(base,runtime_path+"/stop","POST",admin,{"request_id":cancelled["request_id"]}),409)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"runtime_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    state=expect(call(base,runtime_path+"/runtime",token=admin),200)
+                    if state["request"]["state"]=="running" and state["worker_recent"]:
+                        break
+                    time.sleep(.2)
+                else:
+                    raise AssertionError("worker did not report running")
+                expect(call(base,runtime_path+"/stop","POST",other,{"request_id":queued["request_id"]}),404)
+                stopped=expect(call(base,runtime_path+"/stop","POST",admin,{"request_id":queued["request_id"]}),202)
+                assert stopped["state"]=="stopping"
+                assert supervisor.wait(timeout=40)==0
+                final=expect(call(base,runtime_path+"/runtime",token=admin),200)
+                assert final["request"]["state"]=="stopped" and not final["worker_recent"]
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                expect(call(base,runtime_path+"?expected_revision=1","DELETE",admin),204)
+                report["api_start_stop_scoped_request_real_worker"]=True
             finally:
                 # Test failure cleanup: revoke before waiting so that the
                 # supervisor gets the opportunity to stop its own children.
                 if supervisor is not None and supervisor.poll() is None:
                     try:
-                        call(base,"devices/"+device2["id"]+"/revoke","POST",admin)
+                        call(base,"devices/"+(device3 if "device3" in locals() else device2)["id"]+"/revoke","POST",admin)
                         supervisor.wait(timeout=40)
                     except (OSError,subprocess.TimeoutExpired):
                         stop(supervisor)

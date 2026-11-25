@@ -211,7 +211,7 @@ impl PreviewTransport<'_>{
 
 /// Opt-in Linux foreground preview. The trusted operator must already have
 /// started an exclusive managed gateway of the selected transport.
-pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>)->Result<()>{
+pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>,request:Option<&str>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(bundle)||!safe_name(prefix)||bundle==prefix{return Err("invalid supervisor request")}
     let m=checked_protocol(pool,id,revision,transport.protocol()).await?;
     if relay_port==listen||i64::from(listen)==m.bind_port{return Err("conflicting preview port")}
@@ -243,15 +243,24 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     export(pool,root,id,revision,relay_port,bundle).await?;
     let mut children=TunnelChildren(Vec::new());
     let result=async {
+        if let Some(rid)=request{
+            if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
+        }
         children.start(&engine,&root.join(bundle).join("server.toml"))?;
         children.start(&engine,&root.join(bundle).join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
         loop{
+            if let Some(rid)=request{
+                if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
+            }
             checked_protocol(pool,id,revision,transport.protocol()).await?;
             if !children.healthy(){return Err("tunnel child exited")}
             if relay_probe(&m,&expected){break}
             if Instant::now()>=deadline{return Err("relay business probe timeout")}
             std::thread::sleep(Duration::from_millis(200));
+        }
+        if let Some(rid)=request{
+            if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
         transport.gateway(pool,root,id,revision,prefix,listen,"apply-checked",Some(expected_file)).await?;
         // Authorization is re-read after apply and every 500ms. Database
@@ -259,6 +268,9 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
         loop{
             if checked_protocol(pool,id,revision,transport.protocol()).await.is_err(){return Ok(())}
             if !children.healthy(){return Err("tunnel child exited")}
+            if let Some(rid)=request{
+                if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
     }.await;
@@ -307,4 +319,21 @@ pub async fn tls_gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&
         args.push(root.join(file).into_os_string());
     }
     record_attempt(pool,id,revision,name,listen,mode,"https",&args).await
+}
+
+
+/// One-shot opt-in worker for a fixed mapping and fixed local parameters.
+/// Waits at most 60 seconds for a fresh request; then owns exactly one run.
+/// No automatic retry of unknown outcomes or remote execution parameters.
+pub async fn worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>)->Result<()>{
+    checked_protocol(pool,id,revision,transport.protocol()).await?;
+    let deadline=Instant::now()+Duration::from_secs(60);
+    let rid=loop{
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{break rid}
+        if Instant::now()>=deadline{return Err("no fresh start request")}
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let result=supervise(pool,root,id,revision,relay_port,bundle,prefix,listen,expected_file,transport,Some(&rid)).await;
+    crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+    result
 }
