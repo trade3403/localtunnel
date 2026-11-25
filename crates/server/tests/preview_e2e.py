@@ -158,8 +158,10 @@ try:
             root=Path(directory)
             db_path=root/"control.sqlite3"
             body=secrets.token_hex(24).encode()
+            probe_requests=[]
             class Web(http.server.BaseHTTPRequestHandler):
                 def do_GET(self):
+                    probe_requests.append(self.headers.get("Host"))
                     self.send_response(200)
                     self.send_header("Content-Length",str(len(body)))
                     self.end_headers()
@@ -245,7 +247,22 @@ try:
                 time.sleep(.2)
             else:
                 raise AssertionError("empty gateway unavailable")
-            assert operator("--preview-gateway",mid,1,"gateway",gp,"apply").returncode==0
+            expected=root/"expected_body"
+            expected.write_bytes(b"intentionally wrong expected body")
+            expected.chmod(0o600)
+            initial=(prefix/"nginx.conf").read_bytes()
+            prior=len(probe_requests)
+            # Candidate really becomes live before the HTTP body check fails.
+            assert operator("--preview-gateway",mid,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
+            assert "preview.example.test" in probe_requests[prior:], "candidate was not actually probed"
+            assert (prefix/"nginx.conf").read_bytes()==initial
+            assert request(gp,"preview.example.test")[0]==421
+            assert not (prefix/"nginx.previous.conf").exists()
+            with sqlite3.connect(db_path) as db:
+                assert db.execute("SELECT outcome FROM preview_attempts WHERE mapping_id=? AND operation='apply-checked'",(mid,)).fetchall()==[("failed_or_unknown",)]
+            report["real_post_reload_business_probe_failure_and_rollback"]=True
+            expected.write_bytes(body)
+            assert operator("--preview-gateway",mid,1,"gateway",gp,"apply-checked","expected_body").returncode==0
             await_body(gp,"preview.example.test",(200,body),processes)
             assert request(gp,"wrong.example.test")[0]==421
             old=(prefix/"nginx.conf").read_bytes()
@@ -259,6 +276,13 @@ try:
             await_body(gp,"preview.example.test",(200,body),processes)
             backup.unlink()
             report["actual_gateway_apply_and_failed_apply_preserves_live_route"]=True
+            p,base=launch(root)
+            try:
+                expect(call(base,"devices/"+device["id"]+"/revoke","POST",admin),204)
+            finally:
+                stop(p)
+            assert operator("--preview-gateway",mid,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
+            # Explicit cleanup remains possible after revocation.
             assert operator("--preview-gateway","clear",0,"gateway",gp,"apply").returncode==0
             deadline=time.monotonic()+10
             while time.monotonic()<deadline:
@@ -270,7 +294,11 @@ try:
                 raise AssertionError("cleared gateway still exposed route")
             with sqlite3.connect(db_path) as db:
                 assert db.execute("SELECT enabled,revision FROM mappings WHERE id=?",(mid,)).fetchone()==(0,1)
+                rows=db.execute("SELECT operation,outcome,count(*) FROM preview_attempts GROUP BY operation,outcome ORDER BY operation,outcome").fetchall()
+                assert rows==[("apply","failed_or_unknown",1),("apply","succeeded",1),("apply-checked","failed_or_unknown",1),("apply-checked","succeeded",1),("init","succeeded",1)]
+                assert db.execute("SELECT count(*) FROM preview_attempts WHERE finished_at IS NULL").fetchone()==(0,)
             report["actual_route_removal_no_false_activation"]=True
+            report["persistent_attempt_outcomes_and_revoked_apply_denied"]=True
         finally:
             for proc in reversed(processes):
                 stop(proc)

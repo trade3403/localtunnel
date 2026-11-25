@@ -36,7 +36,7 @@ jobs:
       - name: Install DNS query utility
         run: |
           sudo apt-get update
-          sudo apt-get install -y dnsutils nginx
+          sudo apt-get install -y dnsutils nginx curl
       - name: Real node inventory and DNS TXT proof lifecycle
         run: python3 crates/server/tests/domains_e2e.py crates/server/target/release/localtunnel-server management-evidence/domains.json
       - name: Build existing core CLI for preview integration

@@ -134,7 +134,7 @@ mod linux {
         Ok(())
     }
 
-    fn apply_mode(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>) -> Result<(), String> {
+    fn apply_mode(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>, business_check: impl FnOnce() -> bool) -> Result<(), String> {
         let prefix = directory(prefix)?;
         let (config, revision) = generate(bind, routes, tls)?;
         let lock = prefix.join("localtunnel.lock");
@@ -164,7 +164,7 @@ mod linux {
             let _ = fs::remove_file(&backup);
             return Err(err(e));
         }
-        if nginx(&prefix, &active, &["-s", "reload"]).is_ok() && wait_active(probe, &revision) && tls.is_none_or(|t| routes.iter().all(|r| verify_tls(bind, r, t, &revision))) {
+        if nginx(&prefix, &active, &["-s", "reload"]).is_ok() && wait_active(probe, &revision) && tls.is_none_or(|t| routes.iter().all(|r| verify_tls(bind, r, t, &revision))) && business_check() {
             fs::remove_file(&backup).map_err(err)?;
             return Ok(());
         }
@@ -181,15 +181,31 @@ mod linux {
         init_mode(prefix, bind, routes, None)
     }
     pub fn apply(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>]) -> Result<(), String> {
-        apply_mode(prefix, bind, routes, None)
+        apply_mode(prefix, bind, routes, None, || true)
+    }
+    /// Operator-provided expected body is checked only after the candidate
+    /// revision is observed. A mismatch uses the same real rollback path.
+    pub fn apply_checked_http(prefix: &Path, bind: SocketAddr, route: Route<'_>, expected: &[u8]) -> Result<(), String> {
+        if expected.is_empty() || expected.len() > 65536 {
+            return Err("expected body must be 1-65536 bytes".into());
+        }
+        let host=route.domain;
+        apply_mode(prefix, bind, &[route], None, || {
+            // Fixed loopback destination, validated Host, no redirects,
+            // disabled user curl configuration, bounded time and response.
+            let url=format!("http://{bind}/");
+            let header=format!("Host: {host}");
+            let out=Command::new("/usr/bin/curl").args(["--disable","--silent","--fail","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--header",&header,"--write-out","%{http_code}",&url]).output();
+            out.is_ok_and(|o| o.status.success() && o.stdout.len()==expected.len()+3 && o.stdout.ends_with(b"200") && &o.stdout[..expected.len()]==expected)
+        })
     }
     pub fn init_tls(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: &TlsSettings<'_>) -> Result<(), String> {
         init_mode(prefix, bind, routes, Some(tls))
     }
     pub fn apply_tls(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: &TlsSettings<'_>) -> Result<(), String> {
-        apply_mode(prefix, bind, routes, Some(tls))
+        apply_mode(prefix, bind, routes, Some(tls), || true)
     }
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{apply, init, apply_tls, init_tls, TlsSettings};
+pub use linux::{apply, init, apply_tls, init_tls, apply_checked_http, TlsSettings};

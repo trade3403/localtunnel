@@ -86,19 +86,39 @@ pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:
     result
 }
 
-pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,mode:&str)->Result<()>{
-    if !cfg!(target_os="linux")||!safe_name(name)||!matches!(mode,"init"|"apply"){return Err("invalid preview request")}
+pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,mode:&str,expected_file:Option<&str>)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(name)||!matches!(mode,"init"|"apply"|"apply-checked")||(mode=="apply-checked")!=expected_file.is_some(){return Err("invalid preview request")}
     let dir=root.join(name);
     private_dir(&dir)?;
     let mut args:Vec<OsString>=vec![format!("gateway-{mode}").into(),dir.into_os_string(),port(listen)?.into()];
     // Clearing a dedicated gateway remains possible after revoke or DNS expiry.
     if id=="clear"{
-        if revision!=0{return Err("invalid clear revision")}
+        if revision!=0||expected_file.is_some(){return Err("invalid clear revision")}
     }else{
         let m=checked(pool,id,revision).await?;
         if i64::from(listen)==m.bind_port{return Err("conflicting gateway port")}
         args.push(m.hostname.into());
         args.push(m.bind_port.to_string().into());
     }
-    invoke(&core()?,&args,&[])
+    if let Some(file)=expected_file{
+        if !safe_name(file){return Err("invalid expected body filename")}
+        let path=root.join(file);
+        let m=fs::symlink_metadata(&path).map_err(|_|"expected body unavailable")?;
+        if !m.file_type().is_file()||!(1..=65536).contains(&m.len()){return Err("invalid expected body file")}
+        #[cfg(unix)]{
+            use std::os::unix::fs::PermissionsExt;
+            if m.permissions().mode()&0o077!=0{return Err("expected body must be private")}
+        }
+        args.push(path.into_os_string());
+    }
+    let cli=core()?;
+    let attempt=hex::encode(auth::random::<16>().map_err(|_|"random generation failed")?);
+    sqlx::query("INSERT INTO preview_attempts(id,mapping_id,mapping_revision,prefix_name,listen_port,operation) VALUES (?,?,?,?,?,?)")
+        .bind(&attempt).bind(if id=="clear"{None}else{Some(id)}).bind(revision).bind(name).bind(i64::from(listen)).bind(mode)
+        .execute(pool).await.map_err(|_|"cannot record pending preview operation")?;
+    let result=invoke(&cli,&args,&[]);
+    let outcome=if result.is_ok(){"succeeded"}else{"failed_or_unknown"};
+    sqlx::query("UPDATE preview_attempts SET outcome=?,finished_at=unixepoch() WHERE id=? AND outcome='pending'")
+        .bind(outcome).bind(attempt).execute(pool).await.map_err(|_|"preview outcome unknown; inspect runtime and pending record")?;
+    result
 }

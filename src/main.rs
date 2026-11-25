@@ -84,6 +84,19 @@ fn run() -> Result<(), String> {
             }
         }
         #[cfg(target_os = "linux")]
+        [command, prefix, bind, domain, port, expected_file] if command == "gateway-apply-checked" => {
+            use std::io::Read;
+            let mut expected=Vec::new();
+            let metadata=std::fs::symlink_metadata(expected_file).map_err(|_|"expected body file unavailable")?;
+            if !metadata.file_type().is_file() || !(1..=65536).contains(&metadata.len()) {
+                return Err("invalid expected body file".into());
+            }
+            std::fs::File::open(expected_file).map_err(|_|"expected body file unavailable")?
+                .take(65537).read_to_end(&mut expected).map_err(|_|"expected body read failed")?;
+            let route=Route{domain,port:port.parse().map_err(|_|"invalid upstream port")?};
+            localtunnel::managed_gateway::apply_checked_http(Path::new(prefix),bind.parse().map_err(|_|"invalid gateway listener")?,route,&expected)?;
+        }
+        #[cfg(target_os = "linux")]
         [command, prefix, bind, probe, chain, key, ca, days, pairs @ ..]
             if command == "gateway-tls-init" || command == "gateway-tls-apply" => {
             if pairs.is_empty() || pairs.len() % 2 != 0 || pairs.len() > 128 {
@@ -119,7 +132,7 @@ fn run() -> Result<(), String> {
             if !status.success() { return Err(format!("engine exited: {status}")); }
         }
         [command] if command == "--version" => println!("localtunnel {}", env!("CARGO_PKG_VERSION")),
-        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | gateway-tls-init/gateway-tls-apply <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> [...] (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | run <config-file> | --version".into()),
+        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | gateway-apply-checked <prefix> <bind> <domain> <relay-port> <expected-body-file> (Linux) | gateway-tls-init/gateway-tls-apply <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> [...] (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | run <config-file> | --version".into()),
     }
     Ok(())
 }
