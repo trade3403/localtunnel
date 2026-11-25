@@ -8,6 +8,7 @@ mod runtime;
 mod traffic;
 mod audit;
 mod protection;
+mod transport;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -161,7 +162,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("LISTENING {}", listener.local_addr()?);
     io::stdout().flush()?;
-    axum::serve(listener, app).await?;
+    transport::serve(listener, app).await?;
     Ok(())
 }
 

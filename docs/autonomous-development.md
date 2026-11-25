@@ -309,3 +309,7 @@
 ## 2026-11-26：V0.5 资源保护测试修复
 - HEAD 80bc16c6533cb4534a0fa1cb35ee911d250b7939 正式分支 push 两项结束：Runner #257 https://github.com/trade3403/localtunnel/actions/runs/45667046953 成功，Management #61 https://github.com/trade3403/localtunnel/actions/runs/45667046956 失败。job 139391901278 实际 Rust 编译/单测和基础 HTTP/SQLite 成功；protection_e2e.py:17 TypeError HTTPConnection object does not support context manager protocol，业务断言尚未执行。
 - 修复两处 HTTPConnection 生命周期为 contextlib.closing，逐个保存慢连接确保失败清理；管理证据门禁在旧54项基础上新增4项及负例测试。产品限制、依赖及原验收断言不改。恢复全量 CI，建立叠加草稿PR；新版本待CI，不提前开发连接级保护。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 应用层资源保护全绿、连接层保护
+- HEAD 70572a88b201fe902f47c6065501cdd779e7bbeb 六CI全绿：Management #62 https://github.com/trade3403/localtunnel/actions/runs/45668971892 、#63 https://github.com/trade3403/localtunnel/actions/runs/45668997835 ，Windows #130 https://github.com/trade3403/localtunnel/actions/runs/45668997849 ，Gateway #124、Runner #258/#259。#63 job 139398818597 实际资源保护/期限/突发限流及58项管理证据通过，报告 https://github.com/trade3403/localtunnel/actions/runs/45668997835/artifacts/15047694882 ；Windows报告 https://github.com/trade3403/localtunnel/actions/runs/45668997849/artifacts/15048449875 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45668997849/artifacts/15049586499 。草稿PR #7 叠加在V0.4。
+- 用Hyper HTTP/1显式连接驱动保留Axum路由，64已接纳socket任务、超额立即关闭、5秒完整头期限、32KiB读缓冲、120秒连接总寿命，原业务保护不变。复用锁中hyper/hyper-util直接引用，无新版本。真实头部滴流、空闲keepalive、超额/已接纳真实HTTP/恢复专项，四项证据门禁新增至62。未单独测120秒总寿命及慢响应，非公网/内核DoS保障；待CI再做认证/设备配额。未改main、未部署公网、未开启定时任务。

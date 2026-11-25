@@ -29,6 +29,8 @@ jobs:
         run: python3 crates/server/tests/http_e2e.py crates/server/target/release/localtunnel-server management-evidence/http.json
       - name: Real management resource admission and deadline
         run: python3 crates/server/tests/protection_e2e.py crates/server/target/release/localtunnel-server management-evidence/protection.json
+      - name: Real HTTP transport connection and header limits
+        run: python3 crates/server/tests/transport_e2e.py crates/server/target/release/localtunnel-server management-evidence/transport.json
       - name: Real administrator authentication lifecycle
         run: python3 crates/server/tests/auth_e2e.py crates/server/target/release/localtunnel-server management-evidence/auth.json
       - name: Real device enrollment and authorization lifecycle

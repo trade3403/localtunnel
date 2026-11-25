@@ -192,6 +192,12 @@ REQUIRED["management-v05"] = {
         "real_partial_body_deadline_and_capacity_recovery",
         "real_global_rate_limit_and_refill",
     ],
+    "transport.json": [
+        "real_incomplete_header_absolute_deadline",
+        "real_keepalive_idle_connection_released",
+        "real_connection_cap_and_admitted_request",
+        "real_transport_capacity_recovery",
+    ],
 }
 
 def unique_object(pairs):
@@ -249,9 +255,10 @@ class EvidenceGateTests(unittest.TestCase):
                 (root / filename).write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
             self.assertFalse(validate("management", root)[1])
             self.assertTrue(validate("management-v05", root)[1])
-            filename = root / "protection.json"
-            keys = REQUIRED["management-v05"][filename.name]
-            filename.write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
+            for name in ("protection.json", "transport.json"):
+                filename = root / name
+                keys = REQUIRED["management-v05"][name]
+                filename.write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
             total, errors = validate("management-v05", root)
             self.assertEqual(total, sum(map(len, REQUIRED["management-v05"].values())))
             self.assertFalse(errors)
