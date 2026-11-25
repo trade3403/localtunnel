@@ -64,6 +64,8 @@ pub fn routes(pool:SqlitePool)->Router{
         .route("/api/v1/devices/enroll",post(enroll))
         .route("/api/v1/devices",get(list))
         .route("/api/v1/devices/{id}/identity",get(identity))
+        .route("/api/v1/devices/{id}/config",get(config))
+        .route("/api/v1/devices/{id}/status",get(status).post(heartbeat))
         .route("/api/v1/devices/{id}/revoke",post(revoke))
         .layer(DefaultBodyLimit::max(4096)).with_state(state)
 }
@@ -119,4 +121,74 @@ async fn revoke(State(s):State<DeviceState>,Path(id):Path<String>,headers:Header
         .bind(auth::random::<32>()?.to_vec()).bind(id).bind(admin_digest).execute(&s.pool).await.map_err(|_|INTERNAL)?;
     if r.rows_affected()!=1{return Err(MISSING)}
     Ok(auth::uncached(StatusCode::NO_CONTENT))
+}
+
+const HEARTBEAT_SECONDS:i64=30;
+const ONLINE_SECONDS:i64=90;
+const CONFLICT:Failure=(StatusCode::CONFLICT,"configuration revision mismatch");
+
+#[derive(Serialize)]
+struct DesiredMapping {
+    id:String,node_id:String,domain_id:Option<String>,protocol:String,
+    local_host:String,local_port:i64,bind_port:i64,enabled:bool,revision:i64,
+}
+#[derive(Serialize)]
+struct DesiredConfig {
+    device_id:String,revision:i64,scope:&'static str,mappings:Vec<DesiredMapping>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Heartbeat {reported_revision:i64,reported_state:String}
+#[derive(Serialize)]
+struct HeartbeatReceipt {last_seen_at:i64,heartbeat_interval_seconds:i64}
+#[derive(Serialize)]
+struct StatusView {
+    device_id:String,enabled:bool,desired_revision:i64,last_seen_at:Option<i64>,
+    reported_revision:Option<i64>,reported_state:Option<String>,management_online:bool,
+    configuration_current:bool,
+}
+async fn config(State(s):State<DeviceState>,Path(id):Path<String>,headers:HeaderMap)->Result<Response,Failure>{
+    if !valid_id(&id){return Err(DENIED)}
+    let token=device_bearer(&headers)?;
+    // The revision and mapping rows must come from the same DB snapshot.
+    let mut tx=s.pool.begin().await.map_err(|_|INTERNAL)?;
+    let (owner,revision)=sqlx::query_as::<_,(String,i64)>("SELECT d.owner_id,d.revision FROM devices d JOIN users u ON u.id=d.owner_id WHERE d.id=? AND d.credential_digest=? AND d.enabled=1 AND u.enabled=1 AND u.role='admin'")
+        .bind(&id).bind(token).fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
+    let rows=sqlx::query_as::<_,(String,String,Option<String>,String,String,i64,i64,bool,i64)>(
+        "SELECT id,node_id,domain_id,protocol,local_host,local_port,bind_port,enabled,revision FROM mappings WHERE device_id=? AND owner_id=? ORDER BY id LIMIT 65")
+        .bind(&id).bind(owner).fetch_all(&mut *tx).await.map_err(|_|INTERNAL)?;
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    // Never silently truncate a configuration.
+    if rows.len()>64{return Err((StatusCode::CONFLICT,"too many mappings"))}
+    let mappings=rows.into_iter().map(|(id,node_id,domain_id,protocol,local_host,local_port,bind_port,enabled,revision)|DesiredMapping{id,node_id,domain_id,protocol,local_host,local_port,bind_port,enabled,revision}).collect();
+    Ok(auth::uncached(Json(DesiredConfig{device_id:id,revision,scope:"desired_metadata_only",mappings})))
+}
+async fn heartbeat(State(s):State<DeviceState>,Path(id):Path<String>,headers:HeaderMap,Json(h):Json<Heartbeat>)->Result<Response,Failure>{
+    if !valid_id(&id){return Err(DENIED)}
+    let token=device_bearer(&headers)?;
+    if h.reported_revision<0||!matches!(h.reported_state.as_str(),"idle"|"starting"|"running"|"error"){return Err(BAD)}
+    // Check the credential, owner, enabled state and desired revision in the
+    // same write. A concurrent revocation cannot be bypassed by a stale read.
+    let last=sqlx::query_scalar::<_,i64>("INSERT INTO device_status(device_id,last_seen_at,reported_revision,reported_state) SELECT d.id,unixepoch(),?,? FROM devices d JOIN users u ON u.id=d.owner_id WHERE d.id=? AND d.credential_digest=? AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND d.revision>=? ON CONFLICT(device_id) DO UPDATE SET last_seen_at=excluded.last_seen_at,reported_revision=excluded.reported_revision,reported_state=excluded.reported_state RETURNING last_seen_at")
+        .bind(h.reported_revision).bind(h.reported_state).bind(&id).bind(&token).bind(h.reported_revision)
+        .fetch_optional(&s.pool).await.map_err(|_|INTERNAL)?;
+    let last_seen_at=match last{
+        Some(t)=>t,
+        None=>{
+            let revision=sqlx::query_scalar::<_,i64>("SELECT d.revision FROM devices d JOIN users u ON u.id=d.owner_id WHERE d.id=? AND d.credential_digest=? AND d.enabled=1 AND u.enabled=1 AND u.role='admin'")
+                .bind(&id).bind(token).fetch_optional(&s.pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
+            let _=revision;
+            return Err(CONFLICT);
+        }
+    };
+    Ok(auth::uncached(Json(HeartbeatReceipt{last_seen_at,heartbeat_interval_seconds:HEARTBEAT_SECONDS})))
+}
+async fn status(State(s):State<DeviceState>,Path(id):Path<String>,headers:HeaderMap)->Result<Response,Failure>{
+    let admin=auth::bearer(&headers)?;
+    auth::identify(&s.pool,&admin).await?;
+    if !valid_id(&id){return Err(MISSING)}
+    let (id,enabled,revision,last,reported,state,online)=sqlx::query_as::<_,(String,bool,i64,Option<i64>,Option<i64>,Option<String>,bool)>(
+        "SELECT d.id,d.enabled,d.revision,h.last_seen_at,h.reported_revision,h.reported_state,COALESCE(d.enabled=1 AND h.last_seen_at BETWEEN unixepoch()-? AND unixepoch(),0) FROM devices d JOIN users u ON u.id=d.owner_id JOIN admin_sessions a ON a.user_id=u.id LEFT JOIN device_status h ON h.device_id=d.id WHERE d.id=? AND a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
+        .bind(ONLINE_SECONDS).bind(id).bind(admin).fetch_optional(&s.pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
+    Ok(auth::uncached(Json(StatusView{device_id:id,enabled,desired_revision:revision,last_seen_at:last,reported_revision:reported,reported_state:state,management_online:online,configuration_current:online&&reported==Some(revision)})))
 }

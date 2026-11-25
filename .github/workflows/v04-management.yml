@@ -29,6 +29,8 @@ jobs:
         run: python3 crates/server/tests/auth_e2e.py crates/server/target/release/localtunnel-server management-evidence/auth.json
       - name: Real device enrollment and authorization lifecycle
         run: python3 crates/server/tests/devices_e2e.py crates/server/target/release/localtunnel-server management-evidence/devices.json
+      - name: Real device desired configuration and heartbeat lifecycle
+        run: python3 crates/server/tests/sync_e2e.py crates/server/target/release/localtunnel-server management-evidence/sync.json
       - name: Verify committed dependency lock unchanged
         run: git diff --exit-code -- crates/server/Cargo.lock
       - name: Collect committed lock
