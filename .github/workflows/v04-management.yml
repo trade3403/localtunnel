@@ -1,0 +1,46 @@
+name: V0.4 Management API CI
+on:
+  push:
+    branches: ['feat/v0.4-management-api']
+  pull_request:
+    paths:
+      - 'crates/server/**'
+      - '.github/workflows/v04-management.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  management:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Bootstrap dependency lock (one-time initial increment)
+        working-directory: crates/server
+        run: |
+          cargo generate-lockfile
+          echo 'BEGIN_MANAGEMENT_CARGO_LOCK'
+          cat Cargo.lock
+          echo 'END_MANAGEMENT_CARGO_LOCK'
+      - name: Rust build and tests
+        working-directory: crates/server
+        run: |
+          rustc --version
+          cargo test --locked
+          cargo build --release --locked
+      - name: Real management HTTP and SQLite lifecycle
+        run: python3 crates/server/tests/http_e2e.py crates/server/target/release/localtunnel-server management-evidence/http.json
+      - name: Collect generated lock
+        if: always()
+        run: |
+          mkdir -p management-evidence
+          if test -f crates/server/Cargo.lock; then cp crates/server/Cargo.lock management-evidence/Cargo.lock; fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v04-management-evidence
+          path: management-evidence/
+          retention-days: 7
+          if-no-files-found: error
