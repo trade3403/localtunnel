@@ -8,6 +8,7 @@ import { randomBytes } from 'node:crypto'
 import { mkdtemp, writeFile, rm, readFile, readdir } from 'node:fs/promises'
 import { dirname, join, resolve, basename } from 'node:path'
 import { tmpdir } from 'node:os'
+import { fileURLToPath } from 'node:url'
 
 const [exeArg, evidenceArg] = process.argv.slice(2)
 if (!exeArg || !evidenceArg || process.platform !== 'win32') throw Error('Windows installed GUI test arguments required')
@@ -18,7 +19,7 @@ const exe = resolve(exeArg)
 const evidence = resolve(evidenceArg)
 const engine = join(dirname(exe), 'engine', 'rathole.exe')
 const work = await mkdtemp(join(tmpdir(), 'localtunnel-gui-'))
-const report = { scope: 'installed WebView2 desktop and SCM DOM controls + real IPC + loopback encrypted HTTP + native WM_CLOSE; not physical tray menu click or public E2E',
+const report = { scope: 'installed WebView2 desktop and SCM DOM controls + real IPC + loopback encrypted HTTP + native WM_CLOSE + real shell-registered native tray popup menu input; not physical right-click on shell icon or public E2E',
   ui_ready: false, mapping_add_remove: false, port_probe: false,
   start_clicked: false, encrypted_http: false, traffic_visible: false,
   native_close_hides: false, hidden_tunnel_works: false, native_restore: false,
@@ -35,6 +36,11 @@ report.service_config_updated = false
 report.service_updated_http = false
 report.service_unregistered = false
 report.service_data_preserved = false
+report.tray_show_clicked = false
+report.tray_stop_clicked = false
+report.tray_quit_clicked = false
+report.tray_quit_clean_exit = false
+report.tray_quit_forwarding_stopped = false
 report.cdp_policy_created = false
 report.cdp_policy_removed = false
 report.cdp_http_reachable = false
@@ -225,6 +231,11 @@ function windowAction(handle, action) {
   ].join('\r\n')
   return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script,'utf16le').toString('base64')], { encoding: 'utf8', timeout: 10000 }).trim()
 }
+function trayMenu(action) {
+  const script = fileURLToPath(new URL('./native_tray_e2e.ps1',import.meta.url))
+  execFileSync('pwsh.exe',['-NoProfile','-NonInteractive','-File',script,'-ProcessId',String(app.pid),'-Executable',exe,'-Action',action],
+    {encoding:'utf8',timeout:40000,windowsHide:true,stdio:['ignore','pipe','pipe']})
+}
 function windowHandle() {
   const result = execFileSync('powershell.exe', ['-NoProfile','-NonInteractive','-Command',
     '(Get-Process -Id ' + app.pid + ').MainWindowHandle.ToInt64()'], { encoding:'utf8', timeout:10000 }).trim()
@@ -387,6 +398,43 @@ try {
   report.service_unregistered=true
   if(!(await readFile(profilePath)).equals(updatedProfile)||JSON.stringify(JSON.parse(await readFile(historyPath,'utf8')))!==JSON.stringify(savedAfter)) throw Error('unregister changed protected data')
   report.service_data_preserved=true
+
+  // Native tray gate, separate from WebView DOM controls and ShowWindowAsync.
+  // Reuse the alternate target now shown in the desktop form.
+  async function startDesktopAgain() {
+    await until('desktop starts for tray test',async()=>{
+      if(await has('进程运行中')) return true
+      if(await has('处理中…')) return false
+      await click('启动隧道')
+      await sleep(400)
+      return has('进程运行中')
+    })
+    await until('tray test HTTP response',async()=>await get(url)===changedBody,35000)
+  }
+  await startDesktopAgain()
+  const trayHwnd=await until('tray test native HWND',windowHandle)
+  windowAction(trayHwnd,'close')
+  await until('window hidden for tray restore',()=>windowAction(trayHwnd,'visible')==='False')
+  trayMenu('show')
+  await until('tray show restores window',()=>windowAction(trayHwnd,'visible')==='True')
+  report.tray_show_clicked=true
+  await until('tray restore keeps HTTP working',async()=>await get(url)===changedBody,10000)
+  trayMenu('stop')
+  await until('tray stops desktop tunnel',async()=>!await has('进程运行中')&&await has('已停止'))
+  await until('tray stop breaks forwarding',async()=>await get(url)!==changedBody,15000)
+  report.tray_stop_clicked=true
+  await startDesktopAgain()
+  // Quit while actual traffic is flowing, not an already-idle process.
+  trayMenu('quit')
+  report.tray_quit_clicked=true
+  const exitDeadline=Date.now()+20000
+  while(app.exitCode===null&&Date.now()<exitDeadline) await sleep(200)
+  if(app.exitCode!==0) throw Error('tray quit did not exit normally')
+  report.tray_quit_clean_exit=true
+  const stopDeadline=Date.now()+15000
+  while(await get(url)===changedBody&&Date.now()<stopDeadline) await sleep(250)
+  if(await get(url)===changedBody) throw Error('tunnel remained after tray quit')
+  report.tray_quit_forwarding_stopped=true
 } finally {
   try {
     if (socket) socket.close()
