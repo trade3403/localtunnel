@@ -223,7 +223,7 @@ function windowAction(handle, action) {
     '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h,out uint p);',
     '}',
     "'@",
-    '$h=[IntPtr]::new(' + handle + '); $owner=[uint32]0; [void][GuiNative]::GetWindowThreadProcessId($h,[ref]$owner);',
+    '$ProgressPreference="SilentlyContinue"; $h=[IntPtr]::new(' + handle + '); $owner=[uint32]0; [void][GuiNative]::GetWindowThreadProcessId($h,[ref]$owner);',
     'if($owner -ne ' + app.pid + '){throw "unexpected window owner"}',
     action === 'close' ? 'if(![GuiNative]::PostMessage($h,0x10,[IntPtr]::Zero,[IntPtr]::Zero)){throw "WM_CLOSE failed"}' :
       action === 'show' ? '[void][GuiNative]::ShowWindowAsync($h,9)' :
@@ -412,9 +412,16 @@ try {
     await until('tray test HTTP response',async()=>await get(url)===changedBody,35000)
   }
   await startDesktopAgain()
-  const trayHwnd=await until('tray test native HWND',windowHandle)
+  // Reuse the actual main window proven by the first WM_CLOSE / restore.
+  // Get-Process.MainWindowHandle can select another visible top-level window
+  // of the same PID after restoring or showing auxiliary WebView windows.
+  const trayHwnd=hwnd
+  report.tray_same_main_hwnd=windowHandle()===trayHwnd
+  report.tray_original_window_visible=windowAction(trayHwnd,'visible')==='True'
+  if(!report.tray_original_window_visible) throw Error('original main window is not visible before tray close')
   windowAction(trayHwnd,'close')
-  await until('window hidden for tray restore',()=>windowAction(trayHwnd,'visible')==='False')
+  await until('original main window hidden for tray restore',()=>windowAction(trayHwnd,'visible')==='False')
+  report.tray_original_window_hidden=true
   trayMenu('show')
   await until('tray show restores window',()=>windowAction(trayHwnd,'visible')==='True')
   report.tray_show_clicked=true
