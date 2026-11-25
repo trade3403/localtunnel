@@ -75,7 +75,7 @@ try:
             with sqlite3.connect(db_path) as db:
                 db.execute("PRAGMA foreign_keys=ON")
                 assert db.execute("PRAGMA foreign_keys").fetchone() == (1,)
-                assert db.execute("SELECT count(*) FROM _sqlx_migrations WHERE success=1").fetchone() == (8,)
+                assert db.execute("SELECT count(*) FROM _sqlx_migrations WHERE success=1").fetchone() == (9,)
                 db.executemany("INSERT INTO users(id,username,password_hash,role) VALUES (?,?,?,?)",
                                [("u1","fixture1","fixture-hash-not-a-login","admin"),
                                 ("u2","fixture2","fixture-hash-not-a-login","user")])
@@ -99,7 +99,7 @@ try:
             assert http(base, "/readyz") == (200, b"ready")
             with sqlite3.connect(db_path) as db:
                 assert db.execute("SELECT count(*) FROM mappings").fetchone() == (1,)
-                assert db.execute("SELECT count(*) FROM _sqlx_migrations").fetchone() == (8,)
+                assert db.execute("SELECT count(*) FROM _sqlx_migrations").fetchone() == (9,)
                 # Simulate lost table: readiness must fail, liveness still responds.
                 db.execute("DROP TABLE mappings")
             assert http(base, "/readyz") == (503, b"not ready")

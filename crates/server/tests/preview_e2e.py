@@ -367,6 +367,23 @@ try:
                     time.sleep(.2)
                 else:
                     raise AssertionError("worker did not report running")
+                expect(call(base,runtime_path+"/traffic"),401)
+                expect(call(base,runtime_path+"/traffic",token=other),404)
+                expect(call(base,runtime_path+"/traffic",token=device3["device_token"]),401)
+                for _ in range(3):
+                    assert request(gp,"preview.example.test")== (200,body)
+                deadline=time.monotonic()+12
+                while time.monotonic()<deadline:
+                    usage=expect(call(base,runtime_path+"/traffic",token=admin),200)
+                    rows=usage["observations"]
+                    if rows and rows[0]["requests"]>=3:
+                        break
+                    time.sleep(.3)
+                else:
+                    raise AssertionError("real gateway traffic was not observed")
+                assert usage["scope"]=="observed_http_gateway_bytes_not_billing"
+                assert rows[0]["request_id"]==queued["request_id"]
+                assert rows[0]["request_bytes"]>0 and rows[0]["response_bytes"]>=3*len(body)
                 expect(call(base,runtime_path+"/stop","POST",other,{"request_id":queued["request_id"]}),404)
                 stopped=expect(call(base,runtime_path+"/stop","POST",admin,{"request_id":queued["request_id"]}),202)
                 assert stopped["state"]=="stopping"
@@ -374,6 +391,9 @@ try:
                 final=expect(call(base,runtime_path+"/runtime",token=admin),200)
                 assert final["request"]["state"]=="stopped" and not final["worker_recent"]
                 assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                last=expect(call(base,runtime_path+"/traffic",token=admin),200)["observations"][0]
+                assert last["sampling_state"]=="partial" and last["requests"]>=rows[0]["requests"]
+                report["real_gateway_observed_bytes_and_owner_isolation"]=True
                 report["api_start_stop_scoped_request_real_worker"]=True
                 # Resident owns a single fixed mapping, but accepts multiple
                 # independently authorized requests without operator relaunch.

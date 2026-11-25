@@ -28,6 +28,11 @@ let pairTimer: ReturnType<typeof setTimeout>|undefined
 const domainName = ref('')
 const selectedMapping = ref<Mapping|null>(null)
 const runtime = ref<Runtime|null>(null)
+type TrafficObservation={request_id:string;mapping_revision:number;requests:number;request_bytes:number;response_bytes:number;sampled_at:number;sampling_state:string}
+const traffic=ref<TrafficObservation[]>([])
+async function readTraffic(id:string){
+  traffic.value=(await get<{observations:TrafficObservation[]}>('/mappings/'+id+'/traffic')).observations
+}
 const deviceStatus = ref<Record<string,unknown>|null>(null)
 const create = reactive({device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
 const nav = [{key:'dashboard',label:'仪表盘'},{key:'devices',label:'设备管理'},{key:'mappings',label:'映射管理'},{key:'domains',label:'域名管理'},{key:'nodes',label:'节点管理'}]
@@ -36,7 +41,7 @@ const labels:Record<string,string> = {queued:'等待执行器',starting:'启动�
 function clearPair(){pairing.value='';if(pairTimer) clearTimeout(pairTimer)}
 function reset(){
   token.value='';user.value='';password.value='';devices.value=[];nodes.value=[];domains.value=[];mappings.value=[];
-  selectedMapping.value=null;runtime.value=null;deviceStatus.value=null;clearPair();notice.value='';page.value='dashboard'
+  selectedMapping.value=null;runtime.value=null;traffic.value=[];deviceStatus.value=null;clearPair();notice.value='';page.value='dashboard'
   Object.assign(create,{device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
   domainName.value='';editDraft.value=null
   for(const k of Object.keys(more) as Resource[])more[k]=false
@@ -58,6 +63,7 @@ async function refresh(){
   if(selectedMapping.value){
     selectedMapping.value=m.find(x=>x.id===selectedMapping.value?.id)||null
     runtime.value=selectedMapping.value?await get<Runtime>('/mappings/'+selectedMapping.value.id+'/runtime'):null
+    if(selectedMapping.value)await readTraffic(selectedMapping.value.id);else traffic.value=[]
   }
 }
 async function loadMore(key:Resource){await run(async()=>{
@@ -78,7 +84,7 @@ async function login(){await run(async()=>{
   try{user.value=(await get<{username:string}>('/auth/me')).username;await refresh()}catch(e){reset();throw e}
 })}
 async function logout(){await run(async()=>{try{await send('/auth/logout','POST')}finally{reset()}})}
-function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;editDraft.value=null;error.value='';notice.value=''}
+function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value=''}
 async function issue(){await run(async()=>{clearPair();const p=await send<{pairing_code:string;expires_in:number}>('/devices/pairing-code','POST');pairing.value=p.pairing_code;pairTimer=setTimeout(clearPair,p.expires_in*1000)})}
 async function revoke(d:Device){await run(async()=>{await send('/devices/'+d.id+'/revoke','POST');await refresh();deviceStatus.value=null;notice.value='设备凭据已吊销'})}
 async function inspectDevice(d:Device){await run(async()=>{deviceStatus.value=await get('/devices/'+d.id+'/status')})}
@@ -105,7 +111,7 @@ async function addMapping(){await run(async()=>{
   await send('/mappings','POST',{...create,domain_id:create.protocol==='tcp'?null:create.domain_id})
   await refresh();notice.value='禁用映射草稿已创建'
 })}
-async function inspectMapping(m:Mapping){await run(async()=>{selectedMapping.value=m;runtime.value=null;runtime.value=await get('/mappings/'+m.id+'/runtime')})}
+async function inspectMapping(m:Mapping){await run(async()=>{selectedMapping.value=m;runtime.value=null;traffic.value=[];runtime.value=await get('/mappings/'+m.id+'/runtime');await readTraffic(m.id)})}
 async function startMapping(){await run(async()=>{
   const m=selectedMapping.value;if(!m)return
   await send('/mappings/'+m.id+'/start','POST',{expected_revision:m.revision});runtime.value=await get('/mappings/'+m.id+'/runtime');notice.value='启动请求已提交，等待本地执行器'
@@ -201,7 +207,19 @@ onBeforeUnmount(clearPair)
               <a-space><a-button type="primary" html-type="submit" :loading="busy">保存端口</a-button><a-button aria-label="取消编辑" :disabled="busy" @click="editDraft=null">取消</a-button></a-space>
             </form>
           </a-card>
-          <a-card v-if="selectedMapping" title="运行请求详情" size="small"><p>{{selectedMapping.id}}</p><p data-testid="runtime-state">{{runtime?labels[runtime.request?.state||'']||'尚无请求':'查询中'}}</p><p class="muted">执行器最近更新：{{runtime?.worker_recent?'是':'否'}}；不是实时业务探测。</p><a-space><a-button type="primary" :disabled="busy||!canStart" @click="startMapping">请求启动</a-button><a-button danger :disabled="busy||!canStop" @click="stopMapping">请求停止</a-button><a-button :disabled="busy" @click="inspectMapping(selectedMapping)">刷新状态</a-button></a-space></a-card></a-card>
+          <a-card v-if="selectedMapping" title="运行请求详情" size="small"><p>{{selectedMapping.id}}</p><p data-testid="runtime-state">{{runtime?labels[runtime.request?.state||'']||'尚无请求':'查询中'}}</p><p class="muted">执行器最近更新：{{runtime?.worker_recent?'是':'否'}}；不是实时业务探测。</p><a-space><a-button type="primary" :disabled="busy||!canStart" @click="startMapping">请求启动</a-button><a-button danger :disabled="busy||!canStop" @click="stopMapping">请求停止</a-button><a-button :disabled="busy" @click="inspectMapping(selectedMapping)">刷新状态</a-button></a-space>
+            <a-divider/>
+            <h3>网关流量观测</h3><p class="muted">已完成的 HTTP/HTTPS 请求长度与响应发送字节，含业务探测，非加密链路总量或计费；最多最近50次运行。</p>
+            <p v-if="!traffic.length" data-testid="traffic-empty">暂无流量观测</p>
+            <a-table v-else data-testid="traffic-table" :data-source="traffic" row-key="request_id" size="small" :pagination="{pageSize:5}" :scroll="{x:600}">
+              <a-table-column title="请求数" data-index="requests"/>
+              <a-table-column title="请求字节" data-index="request_bytes"/>
+              <a-table-column title="响应字节" data-index="response_bytes"/>
+              <a-table-column title="采样时间"><template #default="{record}">{{time(record.sampled_at)}}</template></a-table-column>
+              <a-table-column title="采样状态"><template #default="{record}">{{({sampled:'已采样',partial:'停止时部分观测',unavailable:'采样不可用'})[record.sampling_state]||record.sampling_state}}</template></a-table-column>
+            </a-table>
+            <p class="muted">异常退出可能只保留上次采样；刷新状态更新观测。</p>
+          </a-card></a-card>
         </template>
       </a-layout-content>
     </a-layout>

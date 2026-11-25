@@ -303,6 +303,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await?;
     export(pool,root,id,revision,relay_port,bundle).await?;
     let mut children=TunnelChildren(Vec::new());
+    let mut meter=None;
     let result=async {
         if stop_requested(stop_marker)?{return Ok(())}
         if let Some(rid)=request{
@@ -327,6 +328,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
         transport.gateway(pool,root,id,revision,prefix,listen,"apply-checked",Some(expected_file)).await?;
+        if request.is_some(){meter=Some(crate::traffic::Meter::new(&root.join(prefix)));}
         // Authorization is re-read after apply and every 500ms. Database
         // errors also fail closed. DNS age is checked, not continuous DNS.
         loop{
@@ -335,6 +337,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
             if !children.healthy(){return Err("tunnel child exited")}
             if let Some(rid)=request{
                 if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}
+                if let Some(meter)=meter.as_mut(){meter.sample(pool,id,revision,rid,false).await;}
             }
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -342,6 +345,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     // Stop owned tunnel processes even if the gateway clear fails.
     let stopped=children.stop();
     let cleared=transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await;
+    if let (Some(meter),Some(rid))=(meter.as_mut(),request){meter.sample(pool,id,revision,rid,true).await;}
     stopped?;
     cleared?;
     // Only resident-owned, freshly created bundle is removed after a known

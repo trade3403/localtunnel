@@ -51,7 +51,7 @@ mod linux {
         Ok(())
     }
 
-    fn generate(bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>) -> Result<(String, String), String> {
+    fn generate(bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>, meter: bool) -> Result<(String, String), String> {
         validate_bind(bind)?;
         if routes.iter().any(|r| r.domain == HOST) {
             return Err("reserved probe hostname".into());
@@ -73,6 +73,12 @@ mod linux {
         } else {
             gateway_config(bind, routes, None).map_err(err)?
         };
+        if meter {
+            // Only checked single-route previews. Numeric counters only;
+            // never log URLs, IP addresses, headers, cookies or bodies.
+            config = config.replace("    access_log off;", "    access_log off;\n    log_format lt_traffic '$request_length $bytes_sent $status';");
+            config = config.replace("        location / {", &format!("        location / {{\n            access_log traffic-{revision}.log lt_traffic;"));
+        }
         if let Some(tls) = tls {
             // A dedicated loopback listener checks activation even if a certificate changes.
             // The reserved HTTPS path additionally proves a verified TLS handshake.
@@ -129,7 +135,7 @@ mod linux {
         if fs::read_dir(&prefix).map_err(err)?.next().is_some() {
             return Err("managed initialization requires an empty directory".into());
         }
-        let (config, _) = generate(bind, routes, tls)?;
+        let (config, _) = generate(bind, routes, tls, false)?;
         let active = prefix.join("nginx.conf");
         write_new(&active, &config)?;
         if let Err(e) = nginx(&prefix, &active, &["-t"]) {
@@ -139,9 +145,9 @@ mod linux {
         Ok(())
     }
 
-    fn apply_mode(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>, business_check: impl FnOnce() -> bool) -> Result<(), String> {
+    fn apply_mode(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: Option<&TlsSettings<'_>>, meter: bool, business_check: impl FnOnce() -> bool) -> Result<(), String> {
         let prefix = directory(prefix)?;
-        let (config, revision) = generate(bind, routes, tls)?;
+        let (config, revision) = generate(bind, routes, tls, meter)?;
         let lock = prefix.join("localtunnel.lock");
         write_new(&lock, "")?;
         let _lock = Cleanup(lock);
@@ -186,7 +192,7 @@ mod linux {
         init_mode(prefix, bind, routes, None)
     }
     pub fn apply(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>]) -> Result<(), String> {
-        apply_mode(prefix, bind, routes, None, || true)
+        apply_mode(prefix, bind, routes, None, false, || true)
     }
     /// Operator-provided expected body is checked only after the candidate
     /// revision is observed. A mismatch uses the same real rollback path.
@@ -195,7 +201,7 @@ mod linux {
             return Err("expected body must be 1-65536 bytes".into());
         }
         let host=route.domain;
-        apply_mode(prefix, bind, &[route], None, || {
+        apply_mode(prefix, bind, &[route], None, true, || {
             // Fixed loopback destination, validated Host, no redirects,
             // disabled user curl configuration, bounded time and response.
             let url=format!("http://{bind}/");
@@ -209,7 +215,7 @@ mod linux {
             return Err("expected body must be 1-65536 bytes".into());
         }
         let host=route.domain;
-        apply_mode(prefix, bind, &[route], Some(tls), || {
+        apply_mode(prefix, bind, &[route], Some(tls), true, || {
             let resolve=format!("{host}:{}:127.0.0.1",bind.port());
             let url=format!("https://{host}:{}/",bind.port());
             let out=Command::new("/usr/bin/curl").args(["--disable","--silent","--fail","--noproxy","*","--connect-timeout","2","--max-time","4","--max-filesize","65536","--cacert",tls.ca,"--resolve",&resolve,"--write-out","%{http_code}",&url]).output();
@@ -220,7 +226,7 @@ mod linux {
         init_mode(prefix, bind, routes, Some(tls))
     }
     pub fn apply_tls(prefix: &Path, bind: SocketAddr, routes: &[Route<'_>], tls: &TlsSettings<'_>) -> Result<(), String> {
-        apply_mode(prefix, bind, routes, Some(tls), || true)
+        apply_mode(prefix, bind, routes, Some(tls), false, || true)
     }
 }
 

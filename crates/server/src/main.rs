@@ -5,6 +5,7 @@ mod nodes;
 mod domains;
 mod preview;
 mod runtime;
+mod traffic;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -19,10 +20,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(10) => (StatusCode::OK, "ready"),
+        Ok(11) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -145,6 +146,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .merge(mappings::routes(pool.clone()))
         .merge(nodes::routes(pool.clone()))
         .merge(runtime::routes(pool.clone()))
+        .merge(traffic::routes(pool.clone()))
         .merge(domains::routes(pool).map_err(|_|"invalid DNS resolver configuration")?);
     // No configurable public bind or unauthenticated data API in this increment.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;

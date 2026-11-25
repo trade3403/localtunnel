@@ -201,6 +201,16 @@ with sqlite3.connect(sys.argv[1]) as db:
     // Clicking refresh is real API traffic; wait for actual reported phase.
     try{await page.getByTestId('runtime-state').filter({hasText:'已应用（执行器报告）'}).waitFor({timeout:1000});return true}catch{return false}
   },'worker state never displayed')
+  for(let i=0;i<3;i++)assert.deepEqual(await probe(gatewayUrl),[200,fixtureInfo.body])
+  await until(async()=>{
+    const response=page.waitForResponse(r=>r.url().endsWith(runtimePath+'/traffic')&&r.status()===200)
+    await page.getByRole('button',{name:'刷新状态'}).click()
+    const usage=await (await response).json()
+    const observation=usage.observations.find(x=>x.request_id===requestId)
+    return observation&&observation.requests>=3&&observation.request_bytes>0&&observation.response_bytes>=3*fixtureInfo.body.length
+  },'real gateway traffic counters never reached browser')
+  await page.getByTestId('traffic-table').waitFor()
+  report.real_gateway_traffic_visible_in_browser=true
   await page.getByRole('button',{name:'请求停止'}).click()
   await until(async()=>worker.exitCode!==null,'browser requested stop did not complete')
   assert.equal(worker.exitCode,0)
