@@ -83,7 +83,7 @@ def main(executable, evidence):
               "recovery_disabled": False, "readonly_scm_status": False, "service_traffic_measured": False,
               "recovered_traffic_measured": False, "history_checkpoint": False,
               "history_after_host_recovery": False, "history_after_stop": False,
-              "history_preserved_unregister": False, "unsafe_history_rejected": False, "desktop_service_controls": False}
+              "history_preserved_unregister": False, "unsafe_history_rejected": False, "desktop_service_controls": False, "one_click_provision": False}
     created = False
     relay = None
     fixture = None
@@ -408,6 +408,44 @@ bind_addr = "127.0.0.1:{mapped}"
                     raise RuntimeError("desktop recovery disable not verified")
                 report["recovery_disabled"] = True
                 report["desktop_service_controls"] = True
+                # Exercise provisioning from the ordinary executable with
+                # the same fixed sibling engine layout as the installed app.
+                with tempfile.TemporaryDirectory(prefix="localtunnel-provision-source-") as source:
+                    source = Path(source)
+                    source_exe = source / "localtunnel-desktop.exe"
+                    shutil.copyfile(executable, source_exe)
+                    (source / "engine").mkdir()
+                    shutil.copyfile(engine, source / "engine" / "rathole.exe")
+                    result = subprocess.run([str(source_exe), "--service-provision"], input=profile,
+                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+                    if result.returncode:
+                        raise RuntimeError("one-click provisioning failed: " + result.stderr.decode(errors="replace"))
+                    fresh = result.stdout.decode().strip()
+                    if not re.fullmatch(r"LocalTunnelPreview-[0-9a-f]{32}", fresh) or fresh == name:
+                        raise RuntimeError("invalid new service name")
+                    fresh_root = Path(os.environ["ProgramData"]) / fresh
+                    fresh_exe = fresh_root / "localtunnel-desktop.exe"
+                    def fresh_control(action, check=True):
+                        return run(str(fresh_exe), "--service-control", fresh, action, check=check)
+                    try:
+                        state = json.loads(run(str(source_exe), "--service-status", fresh).stdout)
+                        if state["state"] != "stopped" or state["startup"] != "manual":
+                            raise RuntimeError("provisioning started or enabled new service")
+                        if token.encode() in (fresh_root / "service-profile.bin").read_bytes():
+                            raise RuntimeError("provisioning wrote plaintext credentials")
+                        run(str(source_exe), "--service-manage", fresh, "start")
+                        e2e.wait_for(url, body, [relay], seconds=35)
+                        run(str(source_exe), "--service-manage", fresh, "stop")
+                        wait_state(fresh, 1)
+                        if not (fresh_root / "history" / "traffic-history.json").is_file():
+                            raise RuntimeError("one-click service did not persist traffic")
+                        report["one_click_provision"] = True
+                    finally:
+                        fresh_control("recovery-off", check=False)
+                        fresh_control("stop", check=False)
+                        fresh_control("unregister", check=False)
+                        # Only remove the newly created disposable CI fixture.
+                        shutil.rmtree(fresh_root)
             finally:
                 if relay is not None:
                     e2e.terminate(relay)

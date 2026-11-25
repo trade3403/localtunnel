@@ -22,6 +22,34 @@ const serviceError = ref('')
 const serviceActionError = ref('')
 const serviceActionNotice = ref('')
 const serviceBusy = ref(false)
+const provisionConfirm = ref(false)
+async function provisionService() {
+  if (serviceBusy.value || busy.value || running.value || !ready.value || !provisionConfirm.value) return
+  if (engine.value.trim()) { serviceActionError.value = '后台服务只允许内置引擎，请清空自定义路径'; return }
+  if (mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535)) {
+    serviceActionError.value = '请填写有效本地端口'; return
+  }
+  serviceBusy.value = true
+  serviceGeneration++
+  serviceActionError.value = ''
+  serviceActionNotice.value = ''
+  try {
+    const name = await invoke<string>('provision_service', { request: {
+      engine: '', remote: remote.value.trim(), serverKey: serverKey.value.trim(),
+      mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+    } })
+    serviceName.value = name
+    watchedService.value = name
+    serviceSnapshot.value = null
+    serviceActionNotice.value = '新服务已部署，默认停止、手动启动'
+    provisionConfirm.value = false
+  } catch (e) {
+    serviceActionError.value = '部署失败：' + String(e)
+  } finally {
+    serviceBusy.value = false
+    void refreshService()
+  }
+}
 type ServiceAction = 'check' | 'start' | 'stop' | 'autostart-on' | 'autostart-off' | 'recovery-on' | 'recovery-off'
 async function serviceAction(action: ServiceAction) {
   const name = watchedService.value
@@ -112,7 +140,7 @@ const notice = ref('')
 const portNotice = ref<Record<number, string>>({})
 const ready = ref(false)
 const running = computed(() => status.value.state === 'running')
-const locked = computed(() => busy.value || running.value || !ready.value)
+const locked = computed(() => busy.value || running.value || !ready.value || serviceBusy.value)
 const label = computed(() => !ready.value ? '状态未知' : running.value ? '进程运行中' : status.value.state === 'error' ? '进程异常' : '已停止')
 let timer: ReturnType<typeof setInterval> | undefined
 let polling = false
@@ -229,7 +257,7 @@ async function probe(mapping: Mapping) {
   }
 }
 async function toggle() {
-  if (!ready.value || busy.value || polling) return
+  if (!ready.value || busy.value || polling || serviceBusy.value) return
   busy.value = true
   error.value = ''
   try {
@@ -289,6 +317,11 @@ async function toggle() {
           <button type="button" class="secondary" :disabled="serviceBusy" @click="watchService">监测服务</button>
           <button type="button" class="secondary" :disabled="!watchedService || serviceBusy" @click="unwatchService">停止监测</button>
         </div>
+        <div class="profile-actions">
+          <label><input type="checkbox" v-model="provisionConfirm" :disabled="serviceBusy" /> 使用下方映射配置创建新服务，允许系统级加密保存 Token</label>
+          <button type="button" class="secondary" :disabled="locked || !provisionConfirm" @click="provisionService">一键部署新服务</button>
+        </div>
+        <p class="hint">需要以管理员身份运行客户端；创建全新服务，不覆盖旧配置。默认停止且手动启动。失败时保留受保护目录供检查。</p>
         <p v-if="watchedService" class="hint">监测：{{ watchedService }}</p>
         <div v-if="serviceSnapshot" class="summary" aria-live="polite">
           <div><small>服务状态</small><strong class="protocol">{{ serviceStateLabels[serviceSnapshot.state] || '未知' }}</strong><span>非公网在线证明</span></div>

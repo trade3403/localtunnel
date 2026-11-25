@@ -38,7 +38,7 @@ fn sid_string(sid: PSID) -> Result<String, String> {
         .map_err(|_| "invalid SID string".into())
 }
 
-fn service_sid(name: &str) -> Result<String, String> {
+pub(crate) fn service_sid(name: &str) -> Result<String, String> {
     let account: Vec<u16> = format!("NT SERVICE\\{name}").encode_utf16().chain(Some(0)).collect();
     // Maximum binary SID size is 68 bytes; use aligned storage.
     let mut sid = [0u32; 17];

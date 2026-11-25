@@ -249,7 +249,7 @@ fn set_recovery(service: &Handle, enabled: bool) -> Result<(), String> {
 }
 
 
-fn register(name: &str, dir: &std::path::Path, exe: &str) -> Result<(), String> {
+pub(crate) fn register(name: &str, dir: &std::path::Path, exe: &str) -> Result<(), String> {
     crate::service_acl::validate_registration(dir)?;
     let scratch = tempfile::tempdir().map_err(|_| "engine check directory unavailable")?;
     crate::engine_integrity::stage(&crate::bundled_engine(dir)?, scratch.path())?;
@@ -326,7 +326,7 @@ pub fn manage_existing(name: &str, action: &str) -> Result<(), String> {
     execute_existing(name, action, &dir, exe.to_str().ok_or("invalid executable path")?)
 }
 
-fn execute_existing(name: &str, action: &str, dir: &std::path::Path, exe: &str) -> Result<(), String> {
+pub(crate) fn execute_existing(name: &str, action: &str, dir: &std::path::Path, exe: &str) -> Result<(), String> {
     let rights = access(action)?;
     let service = open(name, rights)?;
     config(&service, name, exe)?;

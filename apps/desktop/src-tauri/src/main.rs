@@ -14,6 +14,8 @@ mod service_host;
 mod service_acl;
 #[cfg(windows)]
 mod service_control;
+#[cfg(windows)]
+mod service_provision;
 
 use localtunnel::{client_configs, ClientMapping};
 use serde::{Deserialize, Serialize};
@@ -317,6 +319,24 @@ async fn traffic_history(app: tauri::AppHandle) -> Result<HistoryStatus, String>
 
 #[cfg(windows)]
 #[tauri::command]
+async fn provision_service(app: tauri::AppHandle, request: StartRequest) -> Result<String, String> {
+    let resource = app.path().resource_dir().map_err(|_| "application resource directory unavailable")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        static PROVISION: Mutex<()> = Mutex::new(());
+        let _guard = PROVISION.try_lock().map_err(|_| "another provisioning action is running")?;
+        service_provision::provision(request, &resource)
+    }).await.map_err(|_| "service provisioning failed")?
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+async fn provision_service(request: StartRequest) -> Result<String, String> {
+    let _ = request;
+    Err("Windows SCM unavailable".into())
+}
+
+#[cfg(windows)]
+#[tauri::command]
 async fn manage_service(name: String, action: String) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         // Only one desktop mutation per process; Windows SCM remains
@@ -403,6 +423,23 @@ fn main() {
             }
             std::process::exit(if result.is_ok() { 0 } else { 1 });
         }
+        if args.get(1).is_some_and(|arg| arg == "--service-provision") {
+            use std::io::Read;
+            let result = (|| -> Result<String, String> {
+                if args.len() != 2 { return Err("invalid provisioning arguments".into()); }
+                let mut data = zeroize::Zeroizing::new(Vec::new());
+                std::io::stdin().lock().take(256 * 1024 + 1).read_to_end(&mut data)
+                    .map_err(|_| "profile read failed")?;
+                if data.len() > 256 * 1024 { return Err("profile too large".into()); }
+                let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "invalid service profile")?;
+                let exe = std::env::current_exe().map_err(|_| "desktop executable unavailable")?;
+                service_provision::provision(request, exe.parent().ok_or("resource directory unavailable")?)
+            })();
+            match result {
+                Ok(name) => { let _ = writeln!(std::io::stdout(), "{name}"); std::process::exit(0); }
+                Err(error) => { let _ = writeln!(std::io::stderr(), "service provisioning failed: {error}"); std::process::exit(1); }
+            }
+        }
         if args.get(1).is_some_and(|arg| arg == "--service-manage") {
             // Exercise the same allowlisted native function as the desktop IPC.
             let result = if args.len() == 4 {
@@ -436,7 +473,7 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port])
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
