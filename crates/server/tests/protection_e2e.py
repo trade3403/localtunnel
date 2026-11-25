@@ -44,8 +44,20 @@ def stop(p):
 def slow(port):
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
     try:
+        # Hyper sends 100 Continue when the admitted handler starts polling
+        # the body. A successful TCP send alone does not prove admission.
+        s.settimeout(3)
+        s.sendall(b"POST /api/v1/auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n")
+        interim = bytearray()
+        while not interim.endswith(b"\r\n\r\n"):
+            chunk = s.recv(1)
+            if not chunk or len(interim) >= 1024:
+                raise AssertionError("connection closed or oversized response before admission")
+            interim.extend(chunk)
+        assert interim.split(b"\r\n", 1)[0] == b"HTTP/1.1 100 Continue", (
+            "expected admitted body read, received " + repr(interim.split(b"\r\n", 1)[0]))
+        s.sendall(b"{")
         s.settimeout(18)
-        s.sendall(b"POST /api/v1/auth/login HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{")
         return s
     except BaseException:
         s.close()
@@ -104,22 +116,22 @@ try:
             started = time.monotonic()
             for _ in range(32):
                 sockets.append(slow(port))
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                result = request(port, "/readyz")
-                if result[:2] == (503, b"request concurrency exceeded"):
-                    assert security(result)["retry-after"] == "1"
-                    break
-                time.sleep(.05)
-            else:
-                raise AssertionError("32 admitted partial bodies did not exhaust permits")
+            assert time.monotonic()-started < 6, "admitting all 32 requests took too long"
+            result = request(port, "/readyz")
+            assert result[:2] == (503, b"request concurrency exceeded"), (
+                "32 confirmed body readers did not exhaust permits: " + repr(result[:2]))
+            assert security(result)["retry-after"] == "1"
             report["real_concurrent_requests_rejected_without_queue"] = True
-            with http.client.HTTPResponse(sockets[0]) as response:
-                response.begin()
-                assert response.status == 503
-                assert response.read() == b"request deadline exceeded"
-            assert 9 <= time.monotonic()-started < 20, "unexpected deadline"
-            for s in sockets:
+            # Read every original response; none may have been silently
+            # refused, parsed as invalid JSON or released prematurely.
+            for index, s in enumerate(sockets):
+                with http.client.HTTPResponse(s) as response:
+                    response.begin()
+                    assert response.status == 503, f"unexpected slow response {index}: {response.status}"
+                    assert response.read() == b"request deadline exceeded"
+                    assert response.getheader("Retry-After") == "1"
+                if index == 0:
+                    assert 9 <= time.monotonic()-started < 20, "unexpected deadline"
                 s.close()
             sockets = []
             deadline = time.monotonic()+5

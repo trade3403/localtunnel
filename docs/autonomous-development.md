@@ -329,3 +329,7 @@
 ## 2026-11-26：V0.5 日志预算全绿、HTTPS 总量与代际边界专项
 - HEAD 00da3bbcc5ad6d57556aa888a6079dcd63b77b7a 六CI全绿：Management #70 https://github.com/trade3403/localtunnel/actions/runs/45681195755 、#71 https://github.com/trade3403/localtunnel/actions/runs/45681206479 ，Windows #134 https://github.com/trade3403/localtunnel/actions/runs/45681206422 ，Gateway #128、Runner #266/#267。#71 job 139441902379 真实HTTP日志预算/离线清理/HTTPS回归及70项证据通过，报告 https://github.com/trade3403/localtunnel/actions/runs/45681206479/artifacts/15053582821 ，Windows报告 https://github.com/trade3403/localtunnel/actions/runs/45681206422/artifacts/15055700737 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45681206422/artifacts/15055551106 。
 - 新增真实HTTPS运行专项：32文件/28MiB新代际预留拒绝、仅32MiB总量超限的真实停止及显式恢复、重新启动独立日志代际和旧文件保留。测试自造稀疏库存，不伪称真实大流量；4项门禁至74，无产品/依赖改动。待CI后进入数据库备份与恢复。仍非全盘硬配额/在线无损轮转。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 日志边界与并发测试修复
+- HEAD fd71ebe4090147d4ffabd6acbc160ee8d377b1df Runner #268/#269、Gateway #129、Windows #135 成功；Management #72 https://github.com/trade3403/localtunnel/actions/runs/45683124646 、#73 https://github.com/trade3403/localtunnel/actions/runs/45683140740 失败。#72 job 139448582714 在tls_preview_e2e.py:654 stop(p) AttributeError PosixPath无terminate，新增模块级循环路径覆盖API进程变量；#73 job 139448637693 在protection_e2e.py:115 未观察到32请求许可耗尽，原因未确定。两个Rust构建/单测及基础HTTP均成功。
+- 更名所有新增模块级日志路径避免覆盖API进程，保留原真实HTTPS断言与清理；慢请求使用Expect:100-continue确认实际body轮询、32个真实接纳后第33个必须503、全部32个最终期限响应及恢复。未改变产品限制、依赖、74项管理证据或原有断言。待新CI全部通过再进入备份恢复。未改main、未部署公网、未开启定时任务。

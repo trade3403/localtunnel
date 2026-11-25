@@ -575,7 +575,7 @@ try:
                 fill=fillers(32-len(baseline),0)
                 assert len(logs())==32
                 rejected_start("tls_count_quota")
-                for p in fill:p.unlink()
+                for fixture_log in fill:fixture_log.unlink()
                 assert logs()==baseline
                 report["real_https_log_count_reservation_rejected"]=True
 
@@ -585,7 +585,7 @@ try:
                 assert 28*mib<sum(logs().values())<32*mib
                 assert len(logs())<32
                 rejected_start("tls_size_quota")
-                for p in fill:p.unlink()
+                for fixture_log in fill:fixture_log.unlink()
                 assert logs()==baseline
                 report["real_https_log_byte_reservation_rejected"]=True
 
@@ -605,10 +605,10 @@ try:
                 assert all(first[k]==v for k,v in baseline.items())
                 added=[]
                 for i in range(3):
-                    p=prefix/("traffic-0-"+str(20000+i)+".log")
-                    with p.open("xb") as out:
+                    fixture_log=prefix/("traffic-0-"+str(20000+i)+".log")
+                    with fixture_log.open("xb") as out:
                         out.truncate(4*mib)
-                    added.append(p)
+                    added.append(fixture_log)
                 exceeded=logs()
                 assert sum(exceeded.values())>32*mib and max(exceeded.values())<=4*mib
                 assert len(exceeded)<=32
@@ -620,7 +620,7 @@ try:
                 assert set(exceeded)<=set(logs())
                 assert operator("--recover-runtime","tls_gateway",rid).returncode==0
                 wait_state("stopped",rid)
-                for p in fill+added:p.unlink()
+                for fixture_log in fill+added:fixture_log.unlink()
                 report["real_https_aggregate_log_quota_stops_and_recovers"]=True
 
                 # Re-admission after removing only test-created fixtures
