@@ -66,13 +66,22 @@ fn status(service: &Handle) -> Result<u32, String> {
     Ok(status.dwCurrentState)
 }
 
+fn transition_allowed(state: u32, target: u32, pending: u32) -> bool {
+    // ControlService can return before our service loop publishes STOP_PENDING.
+    // Its handler sets an atomic stop flag, then the worker performs cleanup.
+    state == pending || (target == SERVICE_STOPPED && state == SERVICE_RUNNING)
+}
+
 fn wait(service: &Handle, target: u32, pending: u32) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         let state = status(service)?;
         if state == target { return Ok(()); }
-        if state != pending || Instant::now() >= deadline {
-            return Err("service failed to reach requested state".into());
+        if !transition_allowed(state, target, pending) {
+            return Err(format!("unexpected SCM state {state}, expected {target}"));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("SCM transition timed out: state {state}, expected {target}"));
         }
         thread::sleep(Duration::from_millis(200));
     }
@@ -147,6 +156,15 @@ pub fn execute(name: &str, action: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stop_accepts_running_before_worker_reports_pending() {
+        assert!(transition_allowed(SERVICE_RUNNING, SERVICE_STOPPED, SERVICE_STOP_PENDING));
+        assert!(transition_allowed(SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_STOP_PENDING));
+        assert!(!transition_allowed(SERVICE_START_PENDING, SERVICE_STOPPED, SERVICE_STOP_PENDING));
+        assert!(!transition_allowed(SERVICE_STOPPED, SERVICE_RUNNING, SERVICE_START_PENDING));
+        assert!(transition_allowed(SERVICE_START_PENDING, SERVICE_RUNNING, SERVICE_START_PENDING));
+    }
+
     #[test]
     fn action_access_is_minimal_and_closed() {
         assert!(access("start").unwrap() & SERVICE_START != 0);

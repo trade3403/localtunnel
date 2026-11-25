@@ -76,3 +76,8 @@
 ## 2026-11-25：服务 ACL 验收、显式 SCM 控制及自启配置
 - HEAD 4df1a40aaf3409b28e9367df513771ec3e21194f，Windows CI #55 https://github.com/trade3403/localtunnel/actions/runs/45532163893 全部通过；15/15 单测、1/1 桌面真实生命周期、非法 Everyone ACL 拒绝、服务真实 HTTP 转发及清理、安装卸载通过，EXE 3.15 MiB。预览包 https://github.com/trade3403/localtunnel/actions/runs/45532163893/artifacts/14984394326 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45532163893/artifacts/14984124944 。核心 #71、Runner #150 通过。
 - 新增 service_control.rs 和显式 --service-control <preview-name> check|start|stop|autostart-on|autostart-off；原生 SCM 访问权限最小化、校验已部署服务的完整 ImagePath、LocalService 身份及 own-process 类型，开始/启用前复核 ACL、密封配置和引擎指纹，停止/关闭自启保留故障恢复路径；有界等待启动停止，修改自启后读回验证。默认手动，不创建服务、不自动提权、不修改用户计算机。新增真实 SCM 测试：不安全自启拒绝、手动默认、自启开启与关闭的 SCM 实际配置、通过产品 Rust 控制入口启动停止并验证真实隧道。仅配置级自启测试，不是重启后启动验收。全部新代码待 CI。后续完成显式安装删除工具、异常恢复/孤立配置清理、GUI 控制及真实状态计量。仍仅安全预览分支，未修改 main。
+
+
+## 2026-11-25：CI #57 停止服务失败修复
+- HEAD 05aee7228dbfad1f570bf87989a1a622d89fd770，Windows CI #57 https://github.com/trade3403/localtunnel/actions/runs/45534403274 失败：16/16 Rust 单测及桌面真实 TCP、3.15 MiB NSIS 构建、SCM 生命周期通过；service_tunnel_e2e.py 第179行 control("stop") 返回1，前序自启配置、启动及真实 HTTP 转发已执行成功；锁文件门禁、最终安装卸载及预览包上传跳过。核心 #72 和 Runner #152 成功。失败证据 https://github.com/trade3403/localtunnel/actions/runs/45534403274/artifacts/14986751483 。原控制命令吞掉错误文本，根因未直接证实。
+- 代码审查发现高概率竞态：控制处理函数只设置 STOP flag，服务循环100ms后才发布 STOP_PENDING，旧 wait 遇 RUNNING 立即返回失败。本轮停止等待在25s上限内接受 RUNNING 和 STOP_PENDING，仅真实 STOPPED 返回成功；启动等待仍严格拒绝 STOPPED。补充状态转换单测、真实 SCM 停止幂等回归及命令 stderr 脱敏诊断，不降低真实停止/断开/临时目录清理门禁。新 CI 尚待核验，不宣称修复成功。保留所有旧测试，不修改 main。若仍失败，读具体错误再修复，同根因最多3次。

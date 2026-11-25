@@ -255,8 +255,14 @@ fn main() {
     {
         let args: Vec<String> = std::env::args().collect();
         if args.get(1).is_some_and(|arg| arg == "--service-control") {
-            let ok = args.len() == 4 && service_control::execute(&args[2], &args[3]).is_ok();
-            std::process::exit(if ok { 0 } else { 1 });
+            let result = if args.len() == 4 {
+                service_control::execute(&args[2], &args[3])
+            } else { Err("invalid service control arguments".into()) };
+            if let Err(error) = &result {
+                // Only static diagnostics and SCM errors; never print credentials.
+                let _ = writeln!(std::io::stderr(), "service control failed: {error}");
+            }
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
         }
         if args.get(1).is_some_and(|arg| arg == "--service-seal-profile") {
             let ok = args.len() == 3 && service_host::seal_profile_from_stdin(&args[2]).is_ok();

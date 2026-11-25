@@ -178,7 +178,9 @@ bind_addr = "127.0.0.1:{mapped}"
                 report["forwarded"] = True
                 control("stop")
                 wait_state(name, 1)
+                control("stop")  # idempotent once SCM confirms stopped
                 report["stopped"] = True
+                report["idempotent_stop"] = True
                 if any((root / "runtime").iterdir()):
                     raise RuntimeError("service runtime files survived stop")
                 report["runtime_cleaned"] = True
