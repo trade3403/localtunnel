@@ -54,3 +54,9 @@
 - HEAD 3009ea807fbd2a354364c4f1835224552686ec17，CI #47 https://github.com/trade3403/localtunnel/actions/runs/45514680220 全通过；12/12 Rust 单测及 1/1 真隧道测试（1.00s 测试耗时，不是吞吐性能），内置引擎摘要/实际执行、锁定构建、安装启动卸载门禁通过；EXE 3.14 MiB。产物 https://github.com/trade3403/localtunnel/actions/runs/45514680220/artifacts/14975789769 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45514680220/artifacts/14975774682 。核心 #67、Runner #142 通过。
 - 本增量以现有 windows-sys 0.59 增加 Services feature，不增加新 crate；实现明确 --service-host LocalTunnelPreview-<32hex> SCM 入口，实际 RegisterServiceCtrlHandlerExW/SetServiceStatus/StartServiceCtrlDispatcherW、STOP/SHUTDOWN、无 GUI 运行。新增名称及控制单测、隔离免费 Windows Runner 以 LocalService/Manual 注册、启动、查询 PID、停止、删除及证据门禁。正常桌面/安装程序不注册服务，不设自启，不接触生产。
 - 本次只实现 SCM 生命周期，不提供服务模式穿透、不跨账户解密桌面用户 DPAPI、不把 SCM Running 当隧道在线。后续必须实现服务身份独立安全凭据配置、最小权限/ACL、受控 IPC、防止桌面与服务同时争用映射、真实服务隧道回归、显式安装和卸载、自启及恢复；先验证本次新 CI。当前所有服务新功能均待验收，仍未正式发布。
+
+
+## 2026-11-25：SCM 生命周期通过，真实服务隧道增量
+- HEAD 8550b392514ce30aa8ef5b76e1459a0f430e320d，CI #49 https://github.com/trade3403/localtunnel/actions/runs/45519226087 全通过；14/14 Rust 单测、1/1 真 TCP 生命周期（1.15s 测试耗时）、SCM LocalService 注册/启动/PID/停止/删除、锁定构建、NSIS 安装/卸载通过。EXE 3.14 MiB。预览包 https://github.com/trade3403/localtunnel/actions/runs/45519226087/artifacts/14979463637 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45519226087/artifacts/14979812026 。核心 #68、Runner #144 通过。
+- 新增明确 --service-tunnel 模式，复用 Supervisor、固定内置引擎 SHA256、Job Object、核心 Noise 配置；独立 service-profile.bin，DPAPI LocalMachine 封装由 CI 管理员提供，服务读取解密并验证映射，禁止外部引擎路径；临时明文配置位于部署目录 runtime/。隔离部署只支持 ProgramData/LocalTunnelPreview-<32hex>，SCM LocalService + 每服务 SID，管理员/系统完全控制、服务读执行、仅 runtime 子目录可写，需管理员先建立 ACL。机器级 DPAPI 本身不提供账户隔离，不能脱离 ACL；当前生产部署 ACL 自检、正式凭据配置工具、GUI 服务控制和防冲突仍未完成，不得用于真实生产。
+- 新增真实 SCM HTTP 加密转发测试：随机本地 fixture、独立 relay、临时 token、密封配置、每服务 SID、启动后真实业务响应、停止后无转发、临时目录清理及 SCM 删除，仍保留此前全部回归。新代码待 CI，不把运行状态当作认证在线；不涉及真实公网或生产服务。下一步验收，补齐安全 provisioning/自启/恢复与真实状态流量。

@@ -1,5 +1,5 @@
-//! First SCM increment: a noninteractive service host with real lifecycle.
-//! No credentials, network listener, or elevated tunnel execution in this increment.
+//! Explicit SCM preview host and optional provisioned tunnel mode.
+//! Service mode uses a separate ACL-restricted, machine-DPAPI sealed profile.
 #![cfg(windows)]
 use std::{ffi::c_void, io, ptr, sync::atomic::{AtomicBool, Ordering}, thread, time::Duration};
 use windows_sys::Win32::System::Services::{
@@ -11,6 +11,7 @@ use windows_sys::Win32::System::Services::{
 };
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static TUNNEL: AtomicBool = AtomicBool::new(false);
 const ERROR_CALL_NOT_IMPLEMENTED: u32 = 120;
 const ERROR_GEN_FAILURE: u32 = 31;
 
@@ -19,10 +20,11 @@ fn valid_name(name: &str) -> bool {
     name.strip_prefix(prefix).is_some_and(|id| id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-pub fn dispatch(name: &str) -> io::Result<()> {
+pub fn dispatch(name: &str, tunnel: bool) -> io::Result<()> {
     if !valid_name(name) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid preview service name"));
     }
+    TUNNEL.store(tunnel, Ordering::Release);
     // The SCM owns the callback invocation; the name and table stay alive until
     // StartServiceCtrlDispatcherW returns after the service has stopped.
     let mut wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
@@ -66,16 +68,52 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
     STOP.store(false, Ordering::Release);
     let handle = unsafe { RegisterServiceCtrlHandlerExW(name, Some(control), ptr::null()) };
     if handle.is_null() { return; }
-    if !report(handle, SERVICE_START_PENDING, 0) || !report(handle, SERVICE_RUNNING, 0) {
+    if !report(handle, SERVICE_START_PENDING, 0) {
         let _ = report(handle, SERVICE_STOPPED, ERROR_GEN_FAILURE);
         return;
     }
-    // SCM lifecycle only: a service identity is not proof of tunnel connectivity.
+    let mut supervisor = crate::Supervisor::default();
+    let tunnel = TUNNEL.load(Ordering::Acquire);
+    if tunnel && start_provisioned(&mut supervisor).is_err() {
+        let _ = report(handle, SERVICE_STOPPED, ERROR_GEN_FAILURE);
+        return;
+    }
+    if !report(handle, SERVICE_RUNNING, 0) {
+        let _ = supervisor.stop();
+        let _ = report(handle, SERVICE_STOPPED, ERROR_GEN_FAILURE);
+        return;
+    }
+    // Running means the process is active, never authenticated online.
+    let mut failed = false;
     while !STOP.load(Ordering::Acquire) {
+        if tunnel && !supervisor.status().is_ok_and(|status| status.state == "running") {
+            failed = true;
+            break;
+        }
         thread::sleep(Duration::from_millis(100));
     }
     let _ = report(handle, SERVICE_STOP_PENDING, 0);
-    let _ = report(handle, SERVICE_STOPPED, 0);
+    if supervisor.stop().is_err() { failed = true; }
+    let _ = report(handle, SERVICE_STOPPED, if failed { ERROR_GEN_FAILURE } else { 0 });
+}
+
+fn start_provisioned(supervisor: &mut crate::Supervisor) -> Result<(), String> {
+    let name = std::env::args().nth(2).ok_or("service name missing")?;
+    if !valid_name(&name) { return Err("invalid service name".into()); }
+    let exe = std::env::current_exe().map_err(|_| "service executable unavailable")?;
+    let dir = exe.parent().ok_or("service directory missing")?;
+    // Only accept the explicit per-service deployment directory. Provisioning
+    // must establish its ACL before starting SCM (no user-writable install).
+    let expected = std::env::var_os("ProgramData").map(std::path::PathBuf::from)
+        .ok_or("ProgramData missing")?.join(&name);
+    if dir != expected { return Err("unexpected service deployment directory".into()); }
+    let runtime = dir.join("runtime");
+    if !runtime.is_dir() { return Err("service runtime directory missing".into()); }
+    let mut request = crate::credentials::load_service(dir)?;
+    request.engine = crate::bundled_engine(dir)?.to_str().ok_or("invalid engine path")?.to_owned();
+    let status = supervisor.start_in(request, Some(&runtime))?;
+    if status.state != "running" { return Err("engine did not start".into()); }
+    Ok(())
 }
 
 #[cfg(test)]

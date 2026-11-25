@@ -75,6 +75,20 @@ mod windows {
         Ok(Some(request))
     }
 
+    // Service credentials live in an administrator-provisioned, service-SID
+    // restricted directory. The blob is separately sealed with machine DPAPI.
+    // Machine protection alone is NOT account isolation; the ACL is mandatory.
+    pub fn load_service(dir: &Path) -> Result<StartRequest, String> {
+        let file = fs::File::open(dir.join("service-profile.bin")).map_err(|_| "服务凭据缺失")?;
+        let mut encrypted = Vec::new();
+        file.take((LIMIT + 1) as u64).read_to_end(&mut encrypted).map_err(|_| "无法读取服务凭据")?;
+        let data = transform(&encrypted, false)?;
+        let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "服务凭据格式无效")?;
+        if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
+        validate(&request)?;
+        Ok(request)
+    }
+
     pub fn forget(dir: &Path) -> Result<(), String> {
         match fs::remove_file(dir.join("protected-profile.bin")) {
             Ok(()) => Ok(()),
@@ -116,7 +130,7 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use windows::{save, load, forget};
+pub use windows::{save, load, forget, load_service};
 #[cfg(not(windows))]
 pub fn save(_: &std::path::Path, _: &crate::StartRequest) -> Result<(), String> { Err("仅 Windows 支持凭据保护".into()) }
 #[cfg(not(windows))]

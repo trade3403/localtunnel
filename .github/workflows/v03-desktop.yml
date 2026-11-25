@@ -59,6 +59,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force desktop-evidence | Out-Null
           & apps/desktop/scripts/service_smoke.ps1 -Executable apps/desktop/src-tauri/target/release/localtunnel-desktop.exe -Evidence (Join-Path (Get-Location) "desktop-evidence/service-smoke.json")
+      - name: Real Windows service encrypted tunnel
+        run: python apps/desktop/scripts/service_tunnel_e2e.py apps/desktop/src-tauri/target/release/localtunnel-desktop.exe desktop-evidence/service-tunnel.json
       - name: Verify dependency locks unchanged
         run: |
           git diff --exit-code -- apps/desktop/package-lock.json apps/desktop/src-tauri/Cargo.lock

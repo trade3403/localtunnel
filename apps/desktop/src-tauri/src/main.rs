@@ -96,6 +96,10 @@ impl Supervisor {
     }
 
     fn start(&mut self, request: StartRequest) -> Result<Status, String> {
+        self.start_in(request, None)
+    }
+
+    fn start_in(&mut self, request: StartRequest, runtime_root: Option<&Path>) -> Result<Status, String> {
         self.status()?;
         if self.running.is_some() { return Err("请先停止现有隧道".into()); }
         let engine = Path::new(&request.engine);
@@ -107,8 +111,12 @@ impl Supervisor {
             return Err("Windows 引擎必须为 EXE 文件".into());
         }
         let config = build_config(&request)?;
-        let directory = tempfile::Builder::new().prefix("localtunnel-client-").tempdir()
-            .map_err(|_| "无法创建临时配置目录")?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("localtunnel-client-");
+        let directory = match runtime_root {
+            Some(root) => builder.tempdir_in(root),
+            None => builder.tempdir(),
+        }.map_err(|_| "无法创建临时配置目录")?;
         let staged_engine = engine_integrity::stage(engine, directory.path())?;
         let config_path = directory.path().join("client.toml");
         let mut opts = std::fs::OpenOptions::new();
@@ -242,9 +250,9 @@ fn main() {
     #[cfg(windows)]
     {
         let args: Vec<String> = std::env::args().collect();
-        if args.get(1).is_some_and(|arg| arg == "--service-host") {
+        if args.get(1).is_some_and(|arg| arg == "--service-host" || arg == "--service-tunnel") {
             // Explicit SCM-only entry; ordinary desktop startup never registers a service.
-            let ok = args.len() == 3 && service_host::dispatch(&args[2]).is_ok();
+            let ok = args.len() == 3 && service_host::dispatch(&args[2], args[1] == "--service-tunnel").is_ok();
             std::process::exit(if ok { 0 } else { 1 });
         }
     }
