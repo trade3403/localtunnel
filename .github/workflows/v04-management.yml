@@ -17,13 +17,6 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           persist-credentials: false
-      - name: Bootstrap dependency lock (one-time initial increment)
-        working-directory: crates/server
-        run: |
-          cargo generate-lockfile
-          echo 'BEGIN_MANAGEMENT_CARGO_LOCK'
-          cat Cargo.lock
-          echo 'END_MANAGEMENT_CARGO_LOCK'
       - name: Rust build and tests
         working-directory: crates/server
         run: |
@@ -32,7 +25,9 @@ jobs:
           cargo build --release --locked
       - name: Real management HTTP and SQLite lifecycle
         run: python3 crates/server/tests/http_e2e.py crates/server/target/release/localtunnel-server management-evidence/http.json
-      - name: Collect generated lock
+      - name: Verify committed dependency lock unchanged
+        run: git diff --exit-code -- crates/server/Cargo.lock
+      - name: Collect committed lock
         if: always()
         run: |
           mkdir -p management-evidence
