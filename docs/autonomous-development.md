@@ -252,3 +252,7 @@
 ## 2026-11-25：Web 管理后台第一批验收、编辑删除及游标分页
 - HEAD b8b4a6de99f6277563404792f835aefa6d1817cd 六个CI全绿：Management #33 https://github.com/trade3403/localtunnel/actions/runs/45629013762 、#34 https://github.com/trade3403/localtunnel/actions/runs/45629024157 、Windows #116、Gateway #110、Runner #228/#229。#34 job 139256895633 实际 Chromium 浏览器第一批功能及全部旧回归、npm/Rust严格锁门禁通过，报告/构建 https://github.com/trade3403/localtunnel/actions/runs/45629024157/artifacts/15030670448 。
 - 新增四类列表真实after游标加载更多、当前已加载数（非全局），刷新及变更重置首批；映射端口编辑保留打开时版本、映射版本删除及域名引用删除保护，确认操作。新增真实Chromium测试节点102条（1 CLI + 101 SQLite夹具）跨100边界、端口修改与revision、引用拒绝及实际删除。保留旧测试和严格锁，无新增依赖/后端修改。仍仅回环预览、非全量一致性快照、未完成浏览器真实worker启停、HTTPS worker专项、流量/审计/常驻执行器。新功能待CI。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-25：管理后台第二批验收、浏览器与真实隧道联动增量
+- HEAD 61e6a8c9fe0e4e2939c26adfdc68d68a3a6cde43 六个CI全绿：Management #35 https://github.com/trade3403/localtunnel/actions/runs/45630809953 、#36 https://github.com/trade3403/localtunnel/actions/runs/45630819862 、Windows #117、Gateway #111、Runner #230/#231。#36 job 139263202250 实际 Chromium 游标分页、映射修改及删除、域名引用保护与全部旧回归、双锁门禁成功，报告 https://github.com/trade3403/localtunnel/actions/runs/45630819862/artifacts/15030651745 。
+- 新增实际浏览器 UI DNS挑战/验证、映射创建、启动请求与真实本地 worker、Noise/Nginx 正文、运行状态刷新、停止请求/退出/网关421/relay不可达；复用固定上游引擎下载及真实TCP DNS夹具，不伪造API、DNS验证或业务。HTTPS专项追加实际 API/worker start/stop、可信TLS正文/状态及拒绝握手。无新依赖、无产品业务代码修改。新验收待CI；仍仅单机回环、需本地操作员预配执行器，生产常驻、流量审计、Windows联合、公网未完成。下一步常驻执行器及安全恢复。未改main、未部署公网、未开启定时任务。

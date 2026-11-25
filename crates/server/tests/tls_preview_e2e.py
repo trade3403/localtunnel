@@ -43,7 +43,7 @@ def call(base,path,method="GET",token=None,data=None):
 
 def expect(r,status):
     assert r[0]==status, f"expected {status}, got {r[0]}"
-    if status in (200,201):
+    if status in (200,201,202):
         assert r[2].get("Cache-Control")=="no-store"
         return json.loads(r[1])
 
@@ -347,10 +347,41 @@ try:
                     assert db.execute("SELECT enabled FROM devices WHERE id=?",(device2["id"],)).fetchone()==(0,)
                     assert db.execute("SELECT enabled FROM mappings WHERE id=?",(mid2,)).fetchone()==(0,)
                 report["real_supervised_https_revocation_and_handshake_denial"]=True
+                expect(call(base,"mappings/"+mid2+"?expected_revision=1","DELETE",admin),204)
+                device3=expect(enroll(base,issue(base,admin)),201)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                mapping3=expect(call(base,"mappings","POST",admin,{"device_id":device3["id"],"node_id":nid,"domain_id":domain["id"],"protocol":"https","local_port":fixture.server_port,"bind_port":bp}),201)
+                mid3=mapping3["id"]
+                path="mappings/"+mid3
+                queued=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)
+                assert queued["state"]=="queued"
+                rejects(gp,hostname,ca2)
+                supervisor=subprocess.Popen([exe,"--runtime-tls-worker",str(root),mid3,"1",str(rp),"runtime_tls","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                deadline=time.monotonic()+45
+                while time.monotonic()<deadline:
+                    assert supervisor.poll() is None,"TLS runtime worker exited"
+                    try:
+                        state=expect(call(base,path+"/runtime",token=admin),200)
+                        if state["request"]["state"]=="running" and state["worker_recent"] and tls_request(gp,hostname,ca2)==(200,body):
+                            break
+                    except (OSError,http.client.HTTPException):
+                        pass
+                    time.sleep(.25)
+                else:
+                    raise AssertionError("TLS worker never published actual traffic")
+                stopped=expect(call(base,path+"/stop","POST",admin,{"request_id":queued["request_id"]}),202)
+                assert stopped["state"]=="stopping"
+                assert supervisor.wait(timeout=40)==0
+                state=expect(call(base,path+"/runtime",token=admin),200)
+                assert state["request"]["state"]=="stopped" and not state["worker_recent"]
+                rejects(gp,hostname,ca2)
+                assert request(bp,hostname) is None
+                assert request(probe,"localtunnel-probe.invalid")[0]==421
+                report["real_https_runtime_api_start_stop"]=True
             finally:
                 if supervisor is not None and supervisor.poll() is None:
                     try:
-                        call(base,"devices/"+device2["id"]+"/revoke","POST",admin)
+                        call(base,"devices/"+(device3 if "device3" in locals() else device2)["id"]+"/revoke","POST",admin)
                         supervisor.wait(timeout=40)
                     except (OSError,subprocess.TimeoutExpired):
                         stop(supervisor)

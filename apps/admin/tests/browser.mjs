@@ -5,11 +5,15 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { chromium } from 'playwright'
+import http from 'node:http'
 const exe=resolve(process.argv[2])
 const evidence=resolve(process.argv[3])
 const root=await mkdtemp(join(tmpdir(),'localtunnel-admin-'))
 const password=randomBytes(24).toString('hex')
-let server,frontend,browser
+let server,frontend,browser,fixture,nginx,worker
+let apiPort, page
+let runtimePath, requestId, adminBearer
+let fixtureInfo
 let stage='initialize'
 const report={}
 const wait=ms=>new Promise(r=>setTimeout(r,ms))
@@ -30,8 +34,19 @@ with sqlite3.connect(sys.argv[1]) as db:
     db.executemany("INSERT INTO nodes(id,name) VALUES (?,?)",[(f'z{i:03d}',f'Pagination fixture {i:03d}') for i in range(101)])
 `,join(root,'control.sqlite3')],{timeout:20000})
   assert.equal(seed.status,0)
-  server=spawn(exe,[root,'0'],{stdio:['ignore','pipe','ignore']})
-  const apiPort=await new Promise((resolve,reject)=>{
+  fixture=spawn('python3',['tests/runtime_fixture.py',root],{stdio:['pipe','pipe','ignore']})
+  fixtureInfo=await new Promise((resolve,reject)=>{
+    const timer=setTimeout(()=>reject(new Error('runtime fixture startup timeout')),120000)
+    let buffer=''
+    fixture.stdout.on('data',b=>{
+      buffer+=b
+      const i=buffer.indexOf('\n')
+      if(i>=0){clearTimeout(timer);try{resolve(JSON.parse(buffer.slice(0,i)))}catch{reject(new Error('invalid fixture output'))}}
+    })
+    fixture.once('exit',()=>{clearTimeout(timer);reject(new Error('runtime fixture exited'))})
+  })
+  server=spawn(exe,[root,'0'],{stdio:['ignore','pipe','ignore'],env:{...process.env,LOCALTUNNEL_DNS_RESOLVER:fixtureInfo.dns}})
+  apiPort=await new Promise((resolve,reject)=>{
     const t=setTimeout(()=>reject(new Error('server startup timeout')),20000)
     let buffer=''
     server.stdout.on('data',b=>{buffer+=b;const m=buffer.match(/LISTENING 127\.0\.0\.1:(\d+)/);if(m){clearTimeout(t);resolve(m[1])}})
@@ -45,7 +60,7 @@ with sqlite3.connect(sys.argv[1]) as db:
     await wait(100)
   }
   browser=await chromium.launch({headless:true})
-  const page=await browser.newPage({viewport:{width:1440,height:900}})
+  page=await browser.newPage({viewport:{width:1440,height:900}})
   const pageErrors=[]
   page.on('pageerror',e=>pageErrors.push(e.message))
   stage='login'
@@ -75,6 +90,7 @@ with sqlite3.connect(sys.argv[1]) as db:
   assert.match(code,/^ltpair_[a-f0-9]{64}$/)
   const enrolled=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/devices/enroll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pairing_code:code,name:'Browser fixture'})})
   assert.equal(enrolled.status,201)
+  await enrolled.json()
   await page.getByRole('button',{name:'刷新数据'}).click()
   await page.getByText('Browser fixture',{exact:true}).waitFor()
   await page.getByRole('button',{name:'管理状态'}).click()
@@ -122,6 +138,77 @@ with sqlite3.connect(sys.argv[1]) as db:
   await page.getByText('域名已删除',{exact:true}).waitFor()
   await page.getByRole('cell',{name:'browser.example.test',exact:true}).waitFor({state:'hidden'})
   report.real_edit_delete_and_domain_reference_guard=true
+  stage='real browser worker lifecycle'
+  // Create a new domain through the actual UI, extract only its public TXT
+  // challenge from the actual HTTP response, and answer via real TCP DNS.
+  const domainCreated=page.waitForResponse(r=>r.url().endsWith('/api/v1/domains')&&r.request().method()==='POST'&&r.status()===201)
+  await page.getByRole('textbox',{name:'域名'}).fill('runtime.example.test')
+  await page.getByRole('button',{name:'添加域名'}).click()
+  const domain=await (await domainCreated).json()
+  await writeFile(join(root,'dns_record.json'),JSON.stringify({name:domain.txt_name,value:domain.txt_value}),{mode:0o600})
+  await page.getByRole('cell',{name:'runtime.example.test',exact:true}).waitFor()
+  await page.getByRole('button',{name:/验\s*证/}).click()
+  await page.getByText('DNS TXT 验证成功',{exact:true}).waitFor()
+  await menu('映射管理').click()
+  for(const [id,option] of [['mapping-device','Browser fixture'],['mapping-node','Local relay'],['mapping-domain','runtime.example.test']]){
+    await page.getByTestId(id).click()
+    await page.locator('.ant-select-dropdown:visible').getByText(option,{exact:true}).click()
+  }
+  // Fill the existing real form and capture the actual created mapping ID.
+  await page.locator('.mapping-form input[role="spinbutton"]').first().fill(String(fixtureInfo.local))
+  const mappingCreated=page.waitForResponse(r=>r.url().endsWith('/api/v1/mappings')&&r.request().method()==='POST'&&r.status()===201)
+  await page.getByRole('button',{name:'创建草稿'}).click()
+  const mapping=await (await mappingCreated).json()
+  assert.equal(mapping.local_port,fixtureInfo.local)
+  const {mkdir}=await import('node:fs/promises')
+  await mkdir(join(root,'browser_gateway'),{mode:0o700})
+  const env={...process.env,LOCALTUNNEL_CORE_CLI:fixtureInfo.core,LOCALTUNNEL_ENGINE:fixtureInfo.engine,LOCALTUNNEL_SERVER_PRIVATE_KEY:fixtureInfo.private,LOCALTUNNEL_SERVER_PUBLIC_KEY:fixtureInfo.public}
+  const prefix=join(root,'browser_gateway')
+  assert.equal(spawnSync(exe,['--preview-gateway',root,'clear','0','browser_gateway',String(fixtureInfo.gateway),'init'],{env,timeout:20000,stdio:'ignore'}).status,0)
+  nginx=spawn('/usr/sbin/nginx',['-p',prefix+'/','-c',join(prefix,'nginx.conf'),'-g','daemon off;'],{stdio:'ignore'})
+  const gatewayUrl='http://127.0.0.1:'+fixtureInfo.gateway+'/'
+  const probe=url=>new Promise(resolve=>{
+    const req=http.get(url,{headers:{Host:'runtime.example.test',Connection:'close'},timeout:2000},r=>{
+      let body='';r.setEncoding('utf8');r.on('data',b=>body+=b);r.on('end',()=>resolve([r.statusCode,body]));r.on('error',()=>resolve(null))
+    })
+    req.on('timeout',()=>req.destroy());req.on('error',()=>resolve(null))
+  })
+  async function until(fn,description,ms=45000){
+    const end=Date.now()+ms
+    while(Date.now()<end){if(await fn())return;await wait(250)}
+    throw new Error(description)
+  }
+  await until(async()=>(await probe(gatewayUrl))?.[0]===421,'empty browser gateway unavailable')
+  await page.getByRole('button',{name:'运行详情'}).click()
+  await page.getByTestId('runtime-state').filter({hasText:/^尚无请求$/}).waitFor()
+  runtimePath='/api/v1/mappings/'+mapping.id
+  const started=page.waitForResponse(r=>r.url().endsWith(runtimePath+'/start')&&r.status()===202)
+  await page.getByRole('button',{name:'请求启动'}).click()
+  const startResponse=await started
+  adminBearer=await startResponse.request().headerValue('authorization')
+  requestId=(await startResponse.json()).request_id
+  await page.getByTestId('runtime-state').filter({hasText:/^等待执行器$/}).waitFor()
+  assert.equal((await probe(gatewayUrl))[0],421)
+  worker=spawn(exe,['--runtime-worker',root,mapping.id,String(mapping.revision),String(fixtureInfo.relay),'browser_bundle','browser_gateway',String(fixtureInfo.gateway),'expected_body'],{env,stdio:'ignore'})
+  await until(async()=>{
+    assert.equal(worker.exitCode,null,'browser runtime worker exited')
+    const r=await probe(gatewayUrl)
+    return r?.[0]===200&&r[1]===fixtureInfo.body
+  },'real browser requested HTTP traffic never converged')
+  await until(async()=>{
+    await page.getByRole('button',{name:'刷新状态'}).click()
+    await page.locator('button:not(.ant-btn-loading)').filter({hasText:'刷新数据'}).waitFor()
+    // Clicking refresh is real API traffic; wait for actual reported phase.
+    try{await page.getByTestId('runtime-state').filter({hasText:'已应用（执行器报告）'}).waitFor({timeout:1000});return true}catch{return false}
+  },'worker state never displayed')
+  await page.getByRole('button',{name:'请求停止'}).click()
+  await until(async()=>worker.exitCode!==null,'browser requested stop did not complete')
+  assert.equal(worker.exitCode,0)
+  await page.getByRole('button',{name:'刷新状态'}).click()
+  await page.getByTestId('runtime-state').filter({hasText:/^已停止$/}).waitFor()
+  assert.equal((await probe(gatewayUrl))[0],421)
+  assert.equal(await probe('http://127.0.0.1:'+mapping.bind_port+'/'),null)
+  report.real_browser_start_stop_noise_gateway=true
   stage='logout'
   await page.getByRole('button',{name:'退出登录'}).click()
   await page.getByRole('heading',{name:'管理后台登录'}).waitFor()
@@ -133,8 +220,17 @@ with sqlite3.connect(sys.argv[1]) as db:
   console.error('Admin browser E2E failed at phase: '+stage)
   throw e
 }finally{
+  if(worker&&worker.exitCode===null&&runtimePath&&requestId&&adminBearer){
+    try{
+      await fetch('http://127.0.0.1:'+apiPort+runtimePath+'/stop',{method:'POST',headers:{Authorization:adminBearer,'Content-Type':'application/json'},body:JSON.stringify({request_id:requestId}),signal:AbortSignal.timeout(4000)})
+      for(let i=0;i<400&&worker.exitCode===null;i++)await wait(100)
+    }catch{}
+  }
+  await close(worker);await close(nginx)
   if(browser)await browser.close()
   await close(frontend);await close(server)
+  if(fixture)fixture.stdin.end()
+  await close(fixture)
   await rm(root,{recursive:true,force:true})
   await writeFile(evidence,JSON.stringify(report,null,2))
 }
