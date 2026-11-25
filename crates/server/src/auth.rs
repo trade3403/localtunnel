@@ -19,11 +19,11 @@ struct Credentials { username:String,password:String }
 #[derive(Clone)]
 pub struct AuthState { pool:SqlitePool,dummy:Arc<String>,budget:Arc<Mutex<(Instant,u32)>>,workers:Arc<Semaphore> }
 #[derive(Serialize)]
-struct Identity { id:String,username:String,role:String }
+pub(crate) struct Identity { pub(crate) id:String,username:String,role:String }
 #[derive(Serialize)]
 struct Session { access_token:String,token_type:&'static str,expires_in:i64 }
 
-fn random<const N:usize>() -> Result<[u8;N],Failure> {
+pub(crate) fn random<const N:usize>() -> Result<[u8;N],Failure> {
     let mut bytes=[0;N];
     OsRng.try_fill_bytes(&mut bytes).map_err(|_|INTERNAL)?;
     Ok(bytes)
@@ -68,7 +68,7 @@ pub fn routes(state:AuthState)->Router{
     Router::new().route("/api/v1/auth/login",post(login)).route("/api/v1/auth/me",get(me)).route("/api/v1/auth/logout",post(logout))
         .layer(DefaultBodyLimit::max(4096)).with_state(state)
 }
-fn uncached(value:impl IntoResponse)->Response{
+pub(crate) fn uncached(value:impl IntoResponse)->Response{
     let mut r=value.into_response();
     r.headers_mut().insert(header::CACHE_CONTROL,header::HeaderValue::from_static("no-store"));
     r
@@ -90,7 +90,7 @@ async fn login(State(state):State<AuthState>,Json(c):Json<Credentials>)->Result<
     if result.rows_affected()!=1{return Err(DENIED)}
     Ok(uncached(Json(Session{access_token:hex::encode(token),token_type:"Bearer",expires_in:TTL})))
 }
-fn bearer(headers:&HeaderMap)->Result<Vec<u8>,Failure>{
+pub(crate) fn bearer(headers:&HeaderMap)->Result<Vec<u8>,Failure>{
     let all=headers.get_all(header::AUTHORIZATION);
     let mut values=all.iter();
     let raw=values.next().ok_or(DENIED)?.to_str().map_err(|_|DENIED)?;
@@ -99,7 +99,7 @@ fn bearer(headers:&HeaderMap)->Result<Vec<u8>,Failure>{
     if token.len()!=64||!token.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)){return Err(DENIED)}
     Ok(Sha256::digest(hex::decode(token).map_err(|_|DENIED)?).to_vec())
 }
-async fn identify(pool:&SqlitePool,digest:&[u8])->Result<Identity,Failure>{
+pub(crate) async fn identify(pool:&SqlitePool,digest:&[u8])->Result<Identity,Failure>{
     let (id,username,role)=sqlx::query_as::<_,(String,String,String)>("SELECT u.id,u.username,u.role FROM admin_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_digest=? AND s.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
         .bind(digest).fetch_optional(pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
     Ok(Identity{id,username,role})

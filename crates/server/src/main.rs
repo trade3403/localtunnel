@@ -1,4 +1,5 @@
 mod auth;
+mod devices;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -13,10 +14,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(6) => (StatusCode::OK, "ready"),
+        Ok(7) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -75,8 +76,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
-        .with_state(pool)
-        .merge(auth::routes(auth));
+        .with_state(pool.clone())
+        .merge(auth::routes(auth))
+        .merge(devices::routes(pool));
     // No configurable public bind or unauthenticated data API in this increment.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("LISTENING {}", listener.local_addr()?);
