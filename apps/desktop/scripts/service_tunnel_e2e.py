@@ -1,6 +1,4 @@
 """Real Windows SCM tunnel under LocalService; disposable, loopback only."""
-import ctypes
-from ctypes import wintypes
 import http.server
 import json
 import os
@@ -19,34 +17,6 @@ import uuid
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "tests"))
 import e2e
-
-class Blob(ctypes.Structure):
-    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
-
-def seal(data):
-    # Machine-scoped DPAPI permits a separately ACL-authorized service to
-    # decrypt. This is NOT user-scoped protection. Do not store real secrets
-    # in this test; its profile contains only randomly generated CI tokens.
-    crypt = ctypes.WinDLL("crypt32", use_last_error=True)
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    crypt.CryptProtectData.argtypes = [
-        ctypes.POINTER(Blob), wintypes.LPCWSTR, ctypes.POINTER(Blob),
-        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(Blob)]
-    crypt.CryptProtectData.restype = wintypes.BOOL
-    kernel.LocalFree.argtypes = [ctypes.c_void_p]
-    kernel.LocalFree.restype = ctypes.c_void_p
-    raw = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
-    source = Blob(len(data), ctypes.cast(raw, ctypes.POINTER(ctypes.c_ubyte)))
-    output = Blob()
-    try:
-        if not crypt.CryptProtectData(ctypes.byref(source), None, None, None, None,
-                                     0x1 | 0x4, ctypes.byref(output)):
-            raise ctypes.WinError(ctypes.get_last_error())
-        return ctypes.string_at(output.pbData, output.cbData)
-    finally:
-        ctypes.memset(raw, 0, len(data))
-        if output.pbData:
-            kernel.LocalFree(ctypes.cast(output.pbData, ctypes.c_void_p))
 
 def run(*args, check=True):
     p = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -73,7 +43,8 @@ def main(executable, evidence):
     name = "LocalTunnelPreview-" + uuid.uuid4().hex
     root = Path(os.environ["ProgramData"]) / name
     report = {"scope": "real SCM LocalService same-host encrypted HTTP; no public E2E",
-              "registered": False, "sealed_profile": False, "forwarded": False,
+              "registered": False, "sealed_profile": False, "invalid_profile_rejected": False,
+              "overwrite_rejected": False, "forwarded": False,
               "stopped": False, "runtime_cleaned": False, "deleted": False}
     created = False
     relay = None
@@ -142,11 +113,26 @@ bind_addr = "127.0.0.1:{mapped}"
                                       "serverKey": public,
                                       "mappings": [{"name": "web", "localPort": fixture.server_port,
                                                     "token": token}]}).encode()
-                encrypted = seal(profile)
+                # Exercise the shipped Rust provisioning entry, not a test-only
+                # implementation. All sensitive input is inherited stdin.
+                command = [str(exe), "--service-seal-profile", name]
+                def provision(data):
+                    return subprocess.run(command, input=data, stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL, timeout=20).returncode
+                bad = json.loads(profile)
+                bad["engine"] = str(engine)
+                if provision(json.dumps(bad).encode()) == 0 or (root / "service-profile.bin").exists():
+                    raise RuntimeError("invalid service profile accepted")
+                report["invalid_profile_rejected"] = True
+                if provision(profile) != 0:
+                    raise RuntimeError("Rust service credential provisioning failed")
+                encrypted = (root / "service-profile.bin").read_bytes()
                 if token.encode() in encrypted:
                     raise RuntimeError("plaintext token in sealed profile")
-                (root / "service-profile.bin").write_bytes(encrypted)
                 report["sealed_profile"] = True
+                if provision(profile) == 0 or (root / "service-profile.bin").read_bytes() != encrypted:
+                    raise RuntimeError("existing service credential overwritten")
+                report["overwrite_rejected"] = True
                 relay = subprocess.Popen([str(engine), str(config)], stdin=subprocess.DEVNULL,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 sc("start", name)

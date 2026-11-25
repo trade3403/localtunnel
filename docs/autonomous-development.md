@@ -60,3 +60,9 @@
 - HEAD 8550b392514ce30aa8ef5b76e1459a0f430e320d，CI #49 https://github.com/trade3403/localtunnel/actions/runs/45519226087 全通过；14/14 Rust 单测、1/1 真 TCP 生命周期（1.15s 测试耗时）、SCM LocalService 注册/启动/PID/停止/删除、锁定构建、NSIS 安装/卸载通过。EXE 3.14 MiB。预览包 https://github.com/trade3403/localtunnel/actions/runs/45519226087/artifacts/14979463637 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45519226087/artifacts/14979812026 。核心 #68、Runner #144 通过。
 - 新增明确 --service-tunnel 模式，复用 Supervisor、固定内置引擎 SHA256、Job Object、核心 Noise 配置；独立 service-profile.bin，DPAPI LocalMachine 封装由 CI 管理员提供，服务读取解密并验证映射，禁止外部引擎路径；临时明文配置位于部署目录 runtime/。隔离部署只支持 ProgramData/LocalTunnelPreview-<32hex>，SCM LocalService + 每服务 SID，管理员/系统完全控制、服务读执行、仅 runtime 子目录可写，需管理员先建立 ACL。机器级 DPAPI 本身不提供账户隔离，不能脱离 ACL；当前生产部署 ACL 自检、正式凭据配置工具、GUI 服务控制和防冲突仍未完成，不得用于真实生产。
 - 新增真实 SCM HTTP 加密转发测试：随机本地 fixture、独立 relay、临时 token、密封配置、每服务 SID、启动后真实业务响应、停止后无转发、临时目录清理及 SCM 删除，仍保留此前全部回归。新代码待 CI，不把运行状态当作认证在线；不涉及真实公网或生产服务。下一步验收，补齐安全 provisioning/自启/恢复与真实状态流量。
+
+
+## 2026-11-25：真实服务隧道验收、Rust 凭据配置入口
+- HEAD ac9cb8dd6f7041d716a61183f22167d094402552，CI #51 https://github.com/trade3403/localtunnel/actions/runs/45525710159 三个工作流通过；14/14 单测、1/1 桌面真实生命周期（0.89s 测试耗时）、独立 SCM LocalService Noise HTTP 隧道/停止后断开/运行时清理/删除、锁定构建及安装卸载通过，EXE 3.15 MiB。预览包 https://github.com/trade3403/localtunnel/actions/runs/45525710159/artifacts/14982322952 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45525710159/artifacts/14983360432 。
+- 新增 Rust --service-seal-profile <preview-name> 入口，仅在约定 ProgramData 部署目录从 stdin 读取有界 JSON，复用核心验证、禁止外部引擎、DPAPI LocalMachine、原子无覆盖写入 service-profile.bin；桌面 DPAPI 仍为 CurrentUser。部署根目录拒绝重解析点；仍依赖管理员预先配置严格 ACL，不是完整 ACL 自检或生产安装工具。无明文文件/命令行 token，不自动注册服务，不启用自启。配置轮换需后续单独实现。
+- CI 改用实际 Rust 配置入口代替 Python 测试专用 DPAPI 加密；加入错误配置拒绝、已存在密文不覆盖、实际服务解密转发门禁，新增 Rust 单测；全部待新 CI 验收。下一步完成安全部署 ACL 验证、显式服务管理、自启、异常恢复及状态/流量；未修改 main，未涉及生产或付费 runner。

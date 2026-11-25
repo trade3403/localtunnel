@@ -250,6 +250,10 @@ fn main() {
     #[cfg(windows)]
     {
         let args: Vec<String> = std::env::args().collect();
+        if args.get(1).is_some_and(|arg| arg == "--service-seal-profile") {
+            let ok = args.len() == 3 && service_host::seal_profile_from_stdin(&args[2]).is_ok();
+            std::process::exit(if ok { 0 } else { 1 });
+        }
         if args.get(1).is_some_and(|arg| arg == "--service-host" || arg == "--service-tunnel") {
             // Explicit SCM-only entry; ordinary desktop startup never registers a service.
             let ok = args.len() == 3 && service_host::dispatch(&args[2], args[1] == "--service-tunnel").is_ok();

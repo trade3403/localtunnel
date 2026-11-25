@@ -4,7 +4,7 @@ mod windows {
     use crate::{build_config, StartRequest};
     use std::{fs, io::{Read, Write}, path::Path, ptr, slice};
     use tempfile::NamedTempFile;
-    use windows_sys::Win32::{Foundation::LocalFree, Security::Cryptography::{CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData}};
+    use windows_sys::Win32::{Foundation::LocalFree, Security::Cryptography::{CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CRYPTPROTECT_LOCAL_MACHINE, CryptProtectData, CryptUnprotectData}};
     use zeroize::{Zeroize, Zeroizing};
 
     const LIMIT: usize = 256 * 1024;
@@ -22,16 +22,16 @@ mod windows {
         }
     }
 
-    fn transform(data: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>, String> {
+    fn transform_scoped(data: &[u8], protect: bool, machine: bool) -> Result<Zeroizing<Vec<u8>>, String> {
         if data.is_empty() || data.len() > LIMIT { return Err("凭据数据大小无效".into()); }
         let mut input = Zeroizing::new(data.to_vec());
         let input_blob = CRYPT_INTEGER_BLOB { cbData: input.len() as u32, pbData: input.as_mut_ptr() };
         let mut output = Blob(CRYPT_INTEGER_BLOB { cbData: 0, pbData: ptr::null_mut() });
         // SAFETY: input lives throughout the call, output initialized, no optional pointers,
-        // no machine-wide scope or interactive prompt. The output allocation is owned by Blob.
+        // no interactive prompt. Only explicit service provisioning uses machine scope.
         let ok = unsafe {
             if protect {
-                CryptProtectData(&input_blob, ptr::null(), ptr::null(), ptr::null(), ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output.0)
+                CryptProtectData(&input_blob, ptr::null(), ptr::null(), ptr::null(), ptr::null(), CRYPTPROTECT_UI_FORBIDDEN | if machine { CRYPTPROTECT_LOCAL_MACHINE } else { 0 }, &mut output.0)
             } else {
                 CryptUnprotectData(&input_blob, ptr::null_mut(), ptr::null(), ptr::null(), ptr::null(), CRYPTPROTECT_UI_FORBIDDEN, &mut output.0)
             }
@@ -40,6 +40,10 @@ mod windows {
             return Err("Windows 凭据保护操作失败".into());
         }
         Ok(Zeroizing::new(unsafe { slice::from_raw_parts(output.0.pbData, output.0.cbData as usize) }.to_vec()))
+    }
+
+    fn transform(data: &[u8], protect: bool) -> Result<Zeroizing<Vec<u8>>, String> {
+        transform_scoped(data, protect, false)
     }
 
     fn validate(request: &StartRequest) -> Result<(), String> {
@@ -78,6 +82,26 @@ mod windows {
     // Service credentials live in an administrator-provisioned, service-SID
     // restricted directory. The blob is separately sealed with machine DPAPI.
     // Machine protection alone is NOT account isolation; the ACL is mandatory.
+    // Caller must first provision a protected deployment directory and verify its
+    // ACL. No overwrite: credential rotation requires a separate stopped-service
+    // operation. Never pass plaintext profile data in argv or environment.
+    pub fn seal_service(dir: &Path, mut source: impl Read) -> Result<(), String> {
+        let mut data = Zeroizing::new(Vec::new());
+        source.by_ref().take((LIMIT + 1) as u64).read_to_end(&mut data)
+            .map_err(|_| "无法读取服务配置")?;
+        if data.is_empty() || data.len() > LIMIT { return Err("服务配置大小无效".into()); }
+        let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "服务配置格式无效")?;
+        if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
+        validate(&request)?;
+        let encrypted = transform_scoped(&data, true, true)?;
+        let mut file = NamedTempFile::new_in(dir).map_err(|_| "无法创建服务凭据文件")?;
+        file.write_all(&encrypted).and_then(|_| file.as_file().sync_all())
+            .map_err(|_| "无法写入服务凭据")?;
+        file.persist_noclobber(dir.join("service-profile.bin"))
+            .map_err(|_| "服务凭据已存在或无法保存")?;
+        Ok(())
+    }
+
     pub fn load_service(dir: &Path) -> Result<StartRequest, String> {
         let file = fs::File::open(dir.join("service-profile.bin")).map_err(|_| "服务凭据缺失")?;
         let mut encrypted = Vec::new();
@@ -101,6 +125,31 @@ mod windows {
     mod tests {
         use super::*;
         use crate::Mapping;
+        #[test]
+        fn machine_service_seal_is_validated_and_never_overwrites() {
+            let dir = tempfile::tempdir().unwrap();
+            let token = "b".repeat(32);
+            let mut request = StartRequest {
+                engine: "C:\\untrusted.exe".into(),
+                remote: "relay.example.test:2333".into(),
+                server_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+                mappings: vec![Mapping { name: "web".into(), local_port: 8080, token: token.clone() }],
+            };
+            assert!(seal_service(dir.path(), serde_json::to_vec(&request).unwrap().as_slice()).is_err());
+            assert!(!dir.path().join("service-profile.bin").exists());
+            request.engine.clear();
+            let json = serde_json::to_vec(&request).unwrap();
+            seal_service(dir.path(), json.as_slice()).unwrap();
+            let file = dir.path().join("service-profile.bin");
+            let original = fs::read(&file).unwrap();
+            assert!(!original.windows(token.len()).any(|w| w == token.as_bytes()));
+            assert_eq!(load_service(dir.path()).unwrap().mappings[0].token, token);
+            assert!(seal_service(dir.path(), json.as_slice()).is_err());
+            assert_eq!(fs::read(&file).unwrap(), original);
+            fs::write(file, b"not ciphertext").unwrap();
+            assert!(load_service(dir.path()).is_err());
+        }
+
         #[test]
         fn dpapi_roundtrip_replace_and_forget() {
             let dir = tempfile::tempdir().unwrap();
@@ -130,7 +179,7 @@ mod windows {
 }
 
 #[cfg(windows)]
-pub use windows::{save, load, forget, load_service};
+pub use windows::{save, load, forget, load_service, seal_service};
 #[cfg(not(windows))]
 pub fn save(_: &std::path::Path, _: &crate::StartRequest) -> Result<(), String> { Err("仅 Windows 支持凭据保护".into()) }
 #[cfg(not(windows))]

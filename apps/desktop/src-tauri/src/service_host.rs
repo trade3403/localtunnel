@@ -97,20 +97,36 @@ unsafe extern "system" fn service_main(argc: u32, argv: *mut *mut u16) {
     let _ = report(handle, SERVICE_STOPPED, if failed { ERROR_GEN_FAILURE } else { 0 });
 }
 
-fn start_provisioned(supervisor: &mut crate::Supervisor) -> Result<(), String> {
-    let name = std::env::args().nth(2).ok_or("service name missing")?;
-    if !valid_name(&name) { return Err("invalid service name".into()); }
+fn deployment_dir(name: &str) -> Result<std::path::PathBuf, String> {
+    if !valid_name(name) { return Err("invalid service name".into()); }
     let exe = std::env::current_exe().map_err(|_| "service executable unavailable")?;
     let dir = exe.parent().ok_or("service directory missing")?;
     // Only accept the explicit per-service deployment directory. Provisioning
     // must establish its ACL before starting SCM (no user-writable install).
     let expected = std::env::var_os("ProgramData").map(std::path::PathBuf::from)
-        .ok_or("ProgramData missing")?.join(&name);
+        .ok_or("ProgramData missing")?.join(name);
     if dir != expected { return Err("unexpected service deployment directory".into()); }
+    // Reject directory junctions/reparse points at the deployment root.
+    use std::os::windows::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(dir).map_err(|_| "service directory unavailable")?;
+    if !metadata.is_dir() || metadata.file_attributes() & 0x400 != 0 {
+        return Err("unsafe deployment directory".into());
+    }
+    Ok(dir.to_path_buf())
+}
+
+pub fn seal_profile_from_stdin(name: &str) -> Result<(), String> {
+    let dir = deployment_dir(name)?;
+    crate::credentials::seal_service(&dir, std::io::stdin().lock())
+}
+
+fn start_provisioned(supervisor: &mut crate::Supervisor) -> Result<(), String> {
+    let name = std::env::args().nth(2).ok_or("service name missing")?;
+    let dir = deployment_dir(&name)?;
     let runtime = dir.join("runtime");
     if !runtime.is_dir() { return Err("service runtime directory missing".into()); }
-    let mut request = crate::credentials::load_service(dir)?;
-    request.engine = crate::bundled_engine(dir)?.to_str().ok_or("invalid engine path")?.to_owned();
+    let mut request = crate::credentials::load_service(&dir)?;
+    request.engine = crate::bundled_engine(&dir)?.to_str().ok_or("invalid engine path")?.to_owned();
     let status = supervisor.start_in(request, Some(&runtime))?;
     if status.state != "running" { return Err("engine did not start".into()); }
     Ok(())
