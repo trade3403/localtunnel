@@ -41,6 +41,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $engine = (Resolve-Path .runtime/rathole.exe).Path
           $digest = (Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($digest -ne "a91717eb37b3dc25c9d2391aca6a1b1f8edde9a3de626264718811ff8113e55b") { throw "Unexpected pinned engine binary SHA-256" }
+          $resources = "apps/desktop/src-tauri/resources/engine"
+          New-Item -ItemType Directory -Force $resources | Out-Null
+          Copy-Item -LiteralPath $engine -Destination (Join-Path $resources "rathole.exe")
           "LOCALTUNNEL_TEST_ENGINE=$engine" >> $env:GITHUB_ENV
           "LOCALTUNNEL_ENGINE_SHA256=$digest" >> $env:GITHUB_ENV
           Write-Host "Verified archive member SHA-256: $digest"

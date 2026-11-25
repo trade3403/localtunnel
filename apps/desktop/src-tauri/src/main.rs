@@ -166,8 +166,21 @@ fn build_config(request: &StartRequest) -> Result<String, String> {
     client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)
 }
 
+fn bundled_engine(resource_dir: &Path) -> Result<std::path::PathBuf, String> {
+    let path = resource_dir.join("engine").join("rathole.exe");
+    if !path.is_absolute() || !path.is_file() {
+        return Err("内置 Rathole 引擎缺失，请重新安装客户端".into());
+    }
+    Ok(path)
+}
+
 #[tauri::command]
-fn start_tunnel(request: StartRequest, supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Status, String> {
+fn start_tunnel(app: tauri::AppHandle, mut request: StartRequest, supervisor: tauri::State<'_, Mutex<Supervisor>>) -> Result<Status, String> {
+    // Empty means the packaged resource, resolved by Rust, not a frontend path.
+    if request.engine.is_empty() {
+        let resource = app.path().resource_dir().map_err(|_| "无法定位应用资源目录")?;
+        request.engine = bundled_engine(&resource)?.to_str().ok_or("引擎路径编码无效")?.to_owned();
+    }
     supervisor.lock().map_err(|_| "进程状态不可用")?.start(request)
 }
 
@@ -418,6 +431,17 @@ mod tests {
         drop(listener);
         assert!(!local_port_open(port).unwrap());
         assert!(local_port_open(0).is_err());
+    }
+
+    #[test]
+    fn bundled_engine_resolves_only_expected_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(bundled_engine(dir.path()).is_err());
+        let engine_dir = dir.path().join("engine");
+        std::fs::create_dir(&engine_dir).unwrap();
+        let exe = engine_dir.join("rathole.exe");
+        std::fs::write(&exe, b"test path only").unwrap();
+        assert_eq!(bundled_engine(dir.path()).unwrap(), exe);
     }
 
     #[test]

@@ -5,7 +5,7 @@ param(
 $ErrorActionPreference = "Stop"
 $installerPath = (Resolve-Path -LiteralPath $Installer).Path
 $installDir = Join-Path $env:RUNNER_TEMP ("localtunnel-install-" + [guid]::NewGuid().ToString("N"))
-$report = [ordered]@{ installed = $false; window_started = $false; uninstalled = $false; scope = "isolated installer smoke, not GUI interaction or public tunnel E2E" }
+$report = [ordered]@{ installed = $false; bundled_engine_verified = $false; bundled_engine_runs = $false; window_started = $false; uninstalled = $false; scope = "isolated installer smoke, not GUI interaction or public tunnel E2E" }
 $app = $null
 try {
     $setup = Start-Process -FilePath $installerPath -ArgumentList "/S /D=$installDir" -PassThru
@@ -14,6 +14,18 @@ try {
     $exe = Join-Path $installDir "localtunnel-desktop.exe"
     if (!(Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Installed application not found" }
     $report.installed = $true
+    $engine = Join-Path $installDir "engine/rathole.exe"
+    $license = Join-Path $installDir "engine/rathole-LICENSE.txt"
+    $notice = Join-Path $installDir "engine/rathole-NOTICE.txt"
+    if (!(Test-Path -LiteralPath $engine -PathType Leaf) -or !(Test-Path -LiteralPath $license -PathType Leaf) -or !(Test-Path -LiteralPath $notice -PathType Leaf)) { throw "Bundled engine or license missing" }
+    $digest = (Get-FileHash -LiteralPath $engine -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($digest -ne "a91717eb37b3dc25c9d2391aca6a1b1f8edde9a3de626264718811ff8113e55b") { throw "Installed engine SHA-256 mismatch" }
+    $report.bundled_engine_sha256 = $digest
+    $report.bundled_engine_verified = $true
+    $engineProcess = Start-Process -FilePath $engine -ArgumentList "--version" -PassThru -WindowStyle Hidden
+    if (!$engineProcess.WaitForExit(15000)) { $engineProcess.Kill(); throw "Installed engine version check timed out" }
+    if ($engineProcess.ExitCode -ne 0) { throw "Installed engine failed to run" }
+    $report.bundled_engine_runs = $true
     $app = Start-Process -FilePath $exe -PassThru
     $deadline = (Get-Date).AddSeconds(40)
     do {
@@ -36,11 +48,12 @@ try {
     # Preserve the removal gate: wait for evidence, never delete the app ourselves.
     $report.uninstaller_launcher_exit_code = $remove.ExitCode
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
-    while ((Test-Path -LiteralPath $exe) -and $watch.Elapsed.TotalSeconds -lt 60) {
+    while (((Test-Path -LiteralPath $exe) -or (Test-Path -LiteralPath $engine) -or (Test-Path -LiteralPath $license) -or (Test-Path -LiteralPath $notice)) -and $watch.Elapsed.TotalSeconds -lt 60) {
         Start-Sleep -Milliseconds 250
     }
     $report.removal_wait_ms = $watch.ElapsedMilliseconds
     if (Test-Path -LiteralPath $exe) { throw "Application remains after uninstall (60-second completion window)" }
+    if ((Test-Path -LiteralPath $engine) -or (Test-Path -LiteralPath $license) -or (Test-Path -LiteralPath $notice)) { throw "Engine or license remains after uninstall" }
     $report.uninstalled = $true
 } finally {
     if ($app -and !$app.HasExited) { Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue }

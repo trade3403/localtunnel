@@ -43,8 +43,8 @@ mod windows {
     }
 
     fn validate(request: &StartRequest) -> Result<(), String> {
-        if request.engine.len() > 4096 || !Path::new(&request.engine).is_absolute() {
-            return Err("引擎路径须为绝对路径".into());
+        if request.engine.len() > 4096 || (!request.engine.is_empty() && !Path::new(&request.engine).is_absolute()) {
+            return Err("自定义引擎路径须为绝对路径，留空使用内置引擎".into());
         }
         let _config = Zeroizing::new(build_config(request)?);
         Ok(())

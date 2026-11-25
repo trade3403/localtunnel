@@ -1,0 +1,9 @@
+Rathole v0.5.0 (Windows x86_64 official release binary, unmodified)
+Upstream: https://github.com/rathole-org/rathole/tree/v0.5.0
+Authors: Yujia Qiao and Rathole contributors (see upstream project).
+License: Apache License 2.0; see rathole-LICENSE.txt.
+Archive: https://github.com/rathole-org/rathole/releases/download/v0.5.0/rathole-x86_64-pc-windows-msvc.zip
+Archive SHA-256: 2f3b4900a63d32a14e1578b2de68f78daad89b7c47b9388c26d922962faef430
+Executable SHA-256: a91717eb37b3dc25c9d2391aca6a1b1f8edde9a3de626264718811ff8113e55b
+LocalTunnel uses this separate executable without modifying it.
+This preview does not establish a complete third-party dependency/license audit.

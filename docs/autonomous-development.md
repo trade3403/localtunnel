@@ -42,3 +42,9 @@
 ## 2026-11-25：依赖锁定增量
 - CI #43 https://github.com/trade3403/localtunnel/actions/runs/45495224323 三个工作流通过；桌面 11/11 单测、真实隧道及安装门禁通过。产物：https://github.com/trade3403/localtunnel/actions/runs/45495224323/artifacts/14969265290 。
 - 重组真实日志 110 个 Base64 分块，逐块核验偏移、文件字节数和 SHA256，Cargo.lock 114832 字节 bf267572bd5eb29f4cdc6c150a60a6072e4ccd6df8dae60c2a6876d12386f339；package-lock.json 52974 字节 26116400ee3aedc2f0e2e60605a58fb09fe6abba4d520abddb1b4b4e299b1e7a。检查 Cargo registry 仅 crates.io，npm resolved 仅 npm 官方 registry 且有 integrity。提交原始字节；启用 npm ci、cargo test --locked、Tauri cargo build --locked 和构建后锁文件不变门禁，删除临时日志导出。锁定构建仍待新 CI 验收；下一项为可信引擎安装包集成、许可证及真实安装验证。未修改 main、未发布。
+
+
+## 2026-11-25：依赖锁验收、内置引擎增量
+- HEAD 00f644d2dcefb6e1067236f98f666964bb18f844 的 CI #45 https://github.com/trade3403/localtunnel/actions/runs/45512870320 全部步骤通过，锁定 npm/Cargo 构建及锁文件未变检查通过，真实隧道、安装启动卸载通过；预览包 https://github.com/trade3403/localtunnel/actions/runs/45512870320/artifacts/14976902272 ，报告 https://github.com/trade3403/localtunnel/actions/runs/45512870320/artifacts/14976178448 。核心 #66、Runner #140 通过。
+- 新增 Tauri bundle.resources：将固定 SHA256 的 v0.5.0 官方 Windows x64 EXE 与上游 Apache-2.0 LICENSE（原始 blob d9a10c0d8e868ebf8da0b3dc95bb0be634c34bfe）和来源说明打包到 engine/。CI 先验证原始 archive，再校验二进制固定 SHA256，再复制至资源目录；未提交 EXE 源文件。默认空引擎路径由 Rust 解析安装资源，保留原有外部绝对路径及相同运行时校验；普通/DPAPI 配置支持保存空路径。新增资源定位测试、默认配置测试；安装验收新增实际安装引擎 SHA、--version 运行、许可证存在、卸载后资源移除门禁。仍须新 CI 验收；未完成所有依赖的许可证/安全审计，不声称正式发布。
+- 本地构建须先执行 tests/e2e.py 的 engine 下载函数，将校验后的 EXE 复制至 apps/desktop/src-tauri/resources/engine/rathole.exe 并设置 LOCALTUNNEL_ENGINE_SHA256；参考 Windows CI。下一阶段：Windows Service/显式自启、真实状态与流量、异常清理及 GUI/托盘操作验收。main 未修改，仍使用免费 runner。

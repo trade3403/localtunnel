@@ -163,9 +163,9 @@ async function toggle() {
           <div class="fields">
             <label>服务器地址<input v-model="remote" :disabled="locked" required placeholder="relay.example.com:2333" /></label>
             <label>服务器公钥<input v-model="serverKey" :disabled="locked" required autocomplete="off" placeholder="X25519 公钥（Base64）" /></label>
-            <label class="wide">Rathole 引擎路径<input v-model="engine" :disabled="locked" required placeholder="C:\LocalTunnel\rathole.exe" /></label>
+            <label class="wide">Rathole 引擎路径（可选）<input v-model="engine" :disabled="locked" placeholder="留空使用安装包内置引擎" /></label>
           </div>
-          <p class="hint">仅使用已校验的官方引擎。普通保存不写入 Token；仅主动选择加密保存才保留凭据。</p>
+          <p class="hint">默认使用内置 Rathole v0.5.0；自定义引擎仍须通过 SHA-256 校验。普通保存不写入 Token；仅主动选择加密保存才保留凭据。</p>
           <div class="profile-actions">
             <button type="button" class="secondary" :disabled="locked" @click="profileAction('save')">保存配置</button>
             <button type="button" class="secondary" :disabled="locked" @click="profileAction('load')">读取配置</button>
