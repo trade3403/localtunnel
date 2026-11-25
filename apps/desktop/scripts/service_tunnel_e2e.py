@@ -81,7 +81,9 @@ def main(executable, evidence):
               "unknown_runtime_preserved": False, "unsafe_recovery_rejected": False,
               "automatic_host_recovered": False, "normal_stop_no_recovery": False,
               "recovery_disabled": False, "readonly_scm_status": False, "service_traffic_measured": False,
-              "recovered_traffic_measured": False}
+              "recovered_traffic_measured": False, "history_checkpoint": False,
+              "history_after_host_recovery": False, "history_after_stop": False,
+              "history_preserved_unregister": False, "unsafe_history_rejected": False}
     created = False
     relay = None
     fixture = None
@@ -97,6 +99,7 @@ def main(executable, evidence):
         (root / "engine").mkdir()
         shutil.copyfile(engine, root / "engine" / "rathole.exe")
         (root / "runtime").mkdir()
+        (root / "history").mkdir()
         run("icacls.exe", str(root), "/setowner", "*S-1-5-32-544", "/T")
         def control(action, check=True):
             return run(str(exe), "--service-control", name, action, check=check)
@@ -112,6 +115,15 @@ def main(executable, evidence):
                     return record
                 time.sleep(.3)
             raise RuntimeError("real service traffic sample unavailable")
+        def wait_history(minimum_up, minimum_down):
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                record = snapshot().get("history")
+                if (record and record["uploadBytes"] >= minimum_up
+                        and record["downloadBytes"] >= minimum_down):
+                    return record
+                time.sleep(.3)
+            raise RuntimeError("saved service history unavailable")
         if run(str(executable), "--service-status", "Spooler", check=False).returncode == 0:
             raise RuntimeError("status accepted unrelated system service")
         run("icacls.exe", str(root), "/grant:r", "*S-1-1-0:RX")
@@ -132,6 +144,7 @@ def main(executable, evidence):
         service = "NT SERVICE\\" + name
         run("icacls.exe", str(root), "/grant:r", service + ":(OI)(CI)RX")
         run("icacls.exe", str(root / "runtime"), "/grant:r", service + ":(OI)(CI)M")
+        run("icacls.exe", str(root / "history"), "/grant:r", service + ":(OI)(CI)M")
         run("icacls.exe", str(root), "/setowner", "*S-1-5-32-544", "/T")
         report["registered"] = True
         body = secrets.token_hex(32).encode()
@@ -202,6 +215,12 @@ bind_addr = "127.0.0.1:{mapped}"
                 if token.encode() in encrypted:
                     raise RuntimeError("plaintext token in sealed profile")
                 report["sealed_profile"] = True
+                run("icacls.exe", str(root / "history"), "/grant:r", "*S-1-1-0:RX")
+                if control("start", check=False).returncode == 0:
+                    raise RuntimeError("unsafe service history directory accepted")
+                wait_state(name, 1)
+                report["unsafe_history_rejected"] = True
+                run("icacls.exe", str(root / "history"), "/remove:g", "*S-1-1-0")
                 if provision(profile) == 0 or (root / "service-profile.bin").read_bytes() != encrypted:
                     raise RuntimeError("existing service credential overwritten")
                 report["overwrite_rejected"] = True
@@ -249,7 +268,9 @@ bind_addr = "127.0.0.1:{mapped}"
                 if old_child is None:
                     raise RuntimeError("service engine child missing")
                 old_pid, old_dir = old_child
-                wait_traffic(host_pid, old_pid, len(body))
+                first_traffic = wait_traffic(host_pid, old_pid, len(body))
+                initial_history = wait_history(first_traffic["uploadBytes"], first_traffic["downloadBytes"])
+                report["history_checkpoint"] = True
                 report["service_traffic_measured"] = True
                 # Fault injection targets only the child just verified above.
                 run("taskkill.exe", "/PID", str(old_pid), "/F")
@@ -306,6 +327,9 @@ bind_addr = "127.0.0.1:{mapped}"
                 previous_child = engine_child(previous_host, root)
                 if previous_child is None:
                     raise RuntimeError("engine missing before automatic recovery")
+                previous_traffic = wait_traffic(previous_host, previous_child[0], len(body))
+                before_crash = wait_history(initial_history["uploadBytes"] + previous_traffic["uploadBytes"],
+                                             initial_history["downloadBytes"] + previous_traffic["downloadBytes"])
                 started_at = time.monotonic()
                 run("taskkill.exe", "/PID", str(previous_host), "/F")
                 deadline = time.monotonic() + 35
@@ -328,7 +352,10 @@ bind_addr = "127.0.0.1:{mapped}"
                 recovered_child = engine_child(recovered_host, root)
                 if recovered_child is None:
                     raise RuntimeError("recovered engine absent")
-                wait_traffic(recovered_host, recovered_child[0], len(body))
+                recovered_traffic = wait_traffic(recovered_host, recovered_child[0], len(body))
+                after_crash = wait_history(before_crash["uploadBytes"] + recovered_traffic["uploadBytes"],
+                                            before_crash["downloadBytes"] + recovered_traffic["downloadBytes"])
+                report["history_after_host_recovery"] = True
                 report["recovered_traffic_measured"] = True
                 report["automatic_host_recovered"] = True
                 report["automatic_host_recovery_seconds"] = round(time.monotonic() - started_at, 3)
@@ -346,6 +373,11 @@ bind_addr = "127.0.0.1:{mapped}"
                         or stopped_snapshot["traffic"] is not None):
                     raise RuntimeError("read-only SCM snapshot retained stopped PID")
                 report["readonly_scm_status"] = True
+                final_history = stopped_snapshot.get("history")
+                if (not final_history or final_history["uploadBytes"] < after_crash["uploadBytes"]
+                        or final_history["downloadBytes"] < after_crash["downloadBytes"]):
+                    raise RuntimeError("history lost at service stop")
+                report["history_after_stop"] = True
                 if any((root / "runtime").iterdir()):
                     raise RuntimeError("service runtime files survived stop")
                 report["runtime_cleaned"] = True
@@ -372,6 +404,9 @@ bind_addr = "127.0.0.1:{mapped}"
         if not (root / "service-profile.bin").is_file():
             raise RuntimeError("unregister unexpectedly deleted credentials")
         report["unregister_preserved_profile"] = True
+        if json.loads((root / "history" / "traffic-history.json").read_text(encoding="utf-8")) != final_history:
+            raise RuntimeError("unregister modified saved history")
+        report["history_preserved_unregister"] = True
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             result = sc("query", name, check=False)

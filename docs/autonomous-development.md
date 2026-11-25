@@ -131,3 +131,8 @@
 ## 2026-11-25：后台流量验收、桌面历史流量持久化
 - HEAD 34debd43b55eca358565f3ffd4a74d054cb8bbf0，CI #77 https://github.com/trade3403/localtunnel/actions/runs/45560354544 全部通过；24/24 单测、1/1 实际桌面 TCP（0.93s 测试耗时）、真实 SCM 流量/恢复/停止、锁定构建、安装卸载成功，EXE 3.27 MiB。核心 #82、Runner #172 通过。安装包 https://github.com/trade3403/localtunnel/actions/runs/45560354544/artifacts/14998141224 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45560354544/artifacts/14998041614 。
 - 本轮新增桌面本机用户目录 traffic-history.json 与 OS 排他文件锁，历史存储只含上传/下载数值和保存时间，限制4KiB、拒绝异常路径/损坏数据；基于启动时基线+当前实际会话计数，避免周期保存重复累加。独立线程每5秒检查并原子替换已同步文件，停止时先结束转发再最终保存；失败可显示，启动遇损坏历史不覆盖，其他桌面实例不能并发写同一历史。GUI 分开显示会话实时数据和已保存跨重启累计。新增重开/重复保存/并发锁/损坏保留测试及真实32768/65536字节转发停止保存、重开不重复。使用已验收 CI Rust 1.100 支持的 std File::try_lock；未新增依赖。新代码待 CI，后台服务历史另做，文件为用户本地非计费证据、信任用户目录、断电/强退可能丢失未保存增量及遗留临时文件，尚未测实际断电/性能。未改 main。
+
+
+## 2026-11-25：桌面历史验收、SCM 历史持久化
+- HEAD be0df515b7005b80b257daf008b43418c4d1ba62，CI #79 https://github.com/trade3403/localtunnel/actions/runs/45569925600 全部通过，真实桌面流量与持久化、防重复、排他锁、损坏保护、SCM 回归与安装卸载通过；核心 #83、Runner #174 通过。预览包 https://github.com/trade3403/localtunnel/actions/runs/45569925600/artifacts/15001529468 ，证据 https://github.com/trade3403/localtunnel/actions/runs/45569925600/artifacts/15001828433 。
+- SCM 可选历史目录：管理员在专属 ProgramData/LocalTunnelPreview-<32hex>/history 建目录（runtime 的同级，不参与临时清理），拥有者 Administrators/SYSTEM，继承仅 Administrators/SYSTEM Full，给此服务 SID (OI)(CI)M，根目录仍 RX。不自动创建或放宽 ACL；旧部署缺 history 保留会话计量，存在但 ACL/重解析点不安全则拒绝启动/自启。复用桌面5秒持久化、排他锁、原子替换、结束最终保存，宿主与引擎恢复按已持久化基线累加；SCM 状态返回独立历史（停止时也可读），未配置/无权限/无数据返回空。CI 增加真实服务流量历史检查、拒绝 Everyone 授权、强杀宿主前确认检查点、恢复后新增真实计量、停止及注销保留历史。新功能待 CI；异常退出可能丢失未保存增量，记录不是计费凭据；历史目录配置仍需管理员，未做自动升级/GUI 权限提升，不修改 main。

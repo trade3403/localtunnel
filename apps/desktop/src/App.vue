@@ -14,7 +14,7 @@ const transportLabel = computed(() => !ready.value || transport.value.state === 
 const transportHint = computed(() => transport.value.matchScope === 'port_only' ? '按中转端口匹配候选 TCP；未验证域名/认证' :
   transport.value.matchScope === 'ip_port' ? '按中转 IP 和端口匹配；未验证认证' : '非公网在线证明')
 type ServiceTraffic = { hostPid: number; enginePid: number; sampledAtMs: number; uploadBytes: number; downloadBytes: number; uploadBytesPerSecond: number | null; downloadBytesPerSecond: number | null }
-type ServiceSnapshot = { state: string; startup: string; hostPid: number | null; win32ExitCode: number; serviceExitCode: number; traffic: ServiceTraffic | null }
+type ServiceSnapshot = { state: string; startup: string; hostPid: number | null; win32ExitCode: number; serviceExitCode: number; traffic: ServiceTraffic | null; history: { uploadBytes: number; downloadBytes: number; savedAtMs: number } | null }
 const serviceName = ref('')
 const watchedService = ref('')
 const serviceSnapshot = ref<ServiceSnapshot | null>(null)
@@ -274,6 +274,13 @@ async function toggle() {
           <div><small>计量引擎 PID</small><strong>{{ serviceSnapshot.traffic.enginePid }}</strong><span>本次引擎会话</span></div>
         </div>
         <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照暂不可用（权限不足、恢复中或尚未采样）。</p>
+        <div v-if="serviceSnapshot?.history" class="summary">
+          <div><small>服务历史累计上传</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.uploadBytes) }}</strong><span>已保存</span></div>
+          <div><small>服务历史累计下载</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.downloadBytes) }}</strong><span>已保存</span></div>
+          <div><small>最近保存</small><strong class="protocol">{{ new Date(serviceSnapshot.history.savedAtMs).toLocaleTimeString() }}</strong><span>独立于桌面历史</span></div>
+        </div>
+        <p v-else-if="serviceSnapshot" class="hint">服务历史暂无可读记录（未配置、未保存或权限不足）。</p>
+        <p v-if="serviceSnapshot?.history" class="hint">已保存历史含本次已保存增量，不与会话流量重复相加；强制结束可能丢失未保存增量。</p>
         <p v-if="serviceError" class="error" role="alert">{{ serviceError }}</p>
         <p class="hint">只读取明确指定的预览服务，不修改配置、不读取凭据；本地桌面隧道与后台服务独立管理。</p>
       </section>

@@ -162,6 +162,36 @@ pub fn clear_stale_runtime(dir: &Path, name: &str) -> Result<(), String> {
 // Only a bounded numeric snapshot from the exact ACL-checked runtime.
 // No profile or client.toml reads. Ordinary users without file access
 // still get SCM status; traffic is explicitly unavailable.
+// History is opt-in via an administrator-created sibling of runtime.
+// The service must never create or grant access to its deployment root.
+pub fn history_dir(dir: &Path, name: &str) -> Result<Option<std::path::PathBuf>, String> {
+    let service = service_sid(name)?;
+    check(dir, true, &service, RX)?;
+    let path = dir.join("history");
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("history directory unavailable".into()),
+        Ok(_) => (),
+    }
+    check(&path, true, &service, MODIFY)?;
+    for file in ["traffic-history.json", "traffic-history.lock"] {
+        let entry = path.join(file);
+        match std::fs::symlink_metadata(&entry) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(_) => return Err("history entry unavailable".into()),
+            Ok(_) => check_entry(&entry, false, &service, MODIFY, true)?,
+        }
+    }
+    Ok(Some(path))
+}
+
+pub fn read_history(dir: &Path, name: &str) -> Result<Option<crate::history::Totals>, String> {
+    match history_dir(dir, name)? {
+        Some(path) => crate::history::read(&path),
+        None => Ok(None),
+    }
+}
+
 pub fn read_traffic(dir: &Path, name: &str, host_pid: u32) -> Result<crate::traffic::ServiceSample, String> {
     use std::io::Read;
     let service = service_sid(name)?;

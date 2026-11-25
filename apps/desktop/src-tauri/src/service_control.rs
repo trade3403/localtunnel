@@ -75,6 +75,7 @@ pub struct ServiceSnapshot {
     win32_exit_code: u32,
     service_exit_code: u32,
     traffic: Option<crate::traffic::ServiceSample>,
+    history: Option<crate::history::Totals>,
 }
 
 fn state_label(state: u32) -> &'static str {
@@ -125,6 +126,7 @@ pub fn snapshot(name: &str) -> Result<ServiceSnapshot, String> {
         win32_exit_code: data.dwWin32ExitCode,
         service_exit_code: data.dwServiceSpecificExitCode,
         traffic,
+        history: crate::service_acl::read_history(&dir, name).ok().flatten(),
     })
 }
 
@@ -302,6 +304,8 @@ pub fn execute(name: &str, action: &str) -> Result<(), String> {
     // profile or ACL was damaged. Never start/enable an unsafe deployment.
     if matches!(action, "start" | "autostart-on" | "recovery-on" | "check") {
         crate::service_acl::validate(&dir, name, true)?;
+        // Validate the optional history location before start/autostart.
+        crate::service_acl::history_dir(&dir, name)?;
         crate::credentials::load_service(&dir)?;
         let scratch = tempfile::tempdir().map_err(|_| "engine check directory unavailable")?;
         crate::engine_integrity::stage(&crate::bundled_engine(&dir)?, scratch.path())?;

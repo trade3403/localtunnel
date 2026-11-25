@@ -190,7 +190,10 @@ fn start_provisioned(supervisor: &mut crate::Supervisor) -> Result<(), String> {
     }
     let mut request = crate::credentials::load_service(&dir)?;
     request.engine = crate::bundled_engine(&dir)?.to_str().ok_or("invalid engine path")?.to_owned();
-    let status = supervisor.start_in(request, Some(&runtime))?;
+    // Existing deployments without an explicitly provisioned directory
+    // retain live metering only. An unsafe configured directory fails closed.
+    let history = crate::service_acl::history_dir(&dir, &name)?;
+    let status = supervisor.start_in_with_history(request, Some(&runtime), history.as_deref())?;
     if status.state != "running" { return Err("engine did not start".into()); }
     Ok(())
 }
