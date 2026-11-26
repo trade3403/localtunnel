@@ -31,6 +31,46 @@ tc -s -j qdisc show dev lo > "$9"
 """
 
 
+def verify_qdisc_config(text, loss):
+    """Validate actual tc text tokens without ambiguous regex escape sequences."""
+    tokens = text.split()
+    assert tokens[:2] == ["qdisc", "netem"] and "root" in tokens
+    def value(key):
+        assert tokens.count(key) == 1 and tokens.index(key) + 1 < len(tokens)
+        return tokens[tokens.index(key) + 1]
+    assert re.fullmatch(r"10(?:[.]0+)?ms", value("delay"))
+    assert value("limit") == "10000"
+    if loss == "1%":
+        assert re.fullmatch(r"1(?:[.]0+)?%", value("loss"))
+    else:
+        assert loss == "0%"
+        if "loss" in tokens:
+            assert re.fullmatch(r"0(?:[.]0+)?%", value("loss"))
+
+
+def test_qdisc_config():
+    # Exact observed shape from failed CI (seed omitted: kernel-generated).
+    sample = "qdisc netem 8001: root refcnt 2 limit 10000 delay 10ms"
+    verify_qdisc_config(sample, "0%")
+    verify_qdisc_config(sample + " loss 1%", "1%")
+    verify_qdisc_config(sample.replace("10ms", "10.0ms") + " loss 1.0%", "1%")
+    for config, loss in [
+        (sample, "1%"),
+        (sample + " loss 1%", "0%"),
+        (sample.replace("10ms", "100ms"), "0%"),
+        (sample.replace("10ms", "10us"), "0%"),
+        (sample.replace("10000", "1000"), "0%"),
+        (sample.replace("netem", "fq"), "0%"),
+        (sample + " loss 0.1%", "1%"),
+        (sample + " delay 10ms", "0%"),
+    ]:
+        try:
+            verify_qdisc_config(config, loss)
+        except AssertionError:
+            continue
+        raise AssertionError("invalid netem configuration was accepted")
+
+
 def run(results):
     results.mkdir(parents=True, exist_ok=True)
     report = {"scope": "real kernel netem on all loopback legs in disposable Linux network namespaces",
@@ -69,12 +109,10 @@ def run(results):
                                 str(config), str(evidence), str(archive), str(stats)],
                                cwd=ROOT, check=True, timeout=145)
                 assert os.readlink("/proc/self/ns/net") == outer_ns
-                text = config.read_text()
-                assert "netem" in text and re.search(r"delay\\s+10(?:\\.0+)?ms", text)
-                if loss == "1%":
-                    assert re.search(r"loss\\s+1(?:\\.0+)?%", text)
+                verify_qdisc_config(config.read_text(), loss)
                 qdiscs = json.loads(stats.read_text())
                 netem, = [q for q in qdiscs if q["kind"] == "netem"]
+                assert abs(netem["options"]["delay"]["delay"] - 0.01) < 1e-9
                 packets, drops = netem["packets"], netem["drops"]
                 assert packets > 0
                 assert drops > 0 if loss == "1%" else drops == 0
@@ -98,4 +136,5 @@ def run(results):
 
 
 if __name__ == "__main__":
+    test_qdisc_config()
     run(Path(sys.argv[1]).resolve())
