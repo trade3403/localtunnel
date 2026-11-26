@@ -589,12 +589,12 @@ pub async fn recover(pool:&SqlitePool,root:&Path,prefix:&str,rid:&str)->Result<(
 #[derive(sqlx::FromRow)]
 struct UdpDraft { id:String, local_port:i64, bind_port:i64 }
 
-async fn checked_udp(pool:&SqlitePool,id:&str,revision:i64)->Result<UdpDraft>{
+async fn checked_udp(pool:&SqlitePool,id:&str,revision:i64,rid:Option<&str>)->Result<UdpDraft>{
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
         return Err("invalid UDP mapping identity")
     }
-    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')")
-        .bind(id).bind(revision).fetch_optional(pool).await.map_err(|_|"UDP draft read failed")?.ok_or("UDP preview requires current authorized draft")
+    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
+        .bind(id).bind(revision).bind(rid).bind(rid).fetch_optional(pool).await.map_err(|_|"UDP draft read failed")?.ok_or("UDP preview requires current authorized draft")
 }
 
 fn udp_echo_probe(socket:&std::net::UdpSocket)->bool{
@@ -618,11 +618,39 @@ fn udp_echo_probe(socket:&std::net::UdpSocket)->bool{
 /// binaries, keys, unused ports and an actual local UDP echo fixture.
 /// No automatic registration, no public bind, no HTTP activation state.
 pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str)->Result<()>{
+    supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,None,None).await
+}
+
+/// The operator preselects the exact revision, ports and bounded byte budget.
+/// API callers cannot choose executables, ports, credentials or limit values.
+pub async fn udp_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str,rate:u32,burst:u32)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle)||relay_port<30000||internal_port<30000||relay_port==internal_port
+        || !(1024..=240000).contains(&rate)||!(1200..=76800).contains(&burst){
+        return Err("invalid UDP worker parameters")
+    }
+    private_dir(root)?;
+    let _worker_lock=acquire_lock(root,"udp-worker",id)?;
+    let deadline=Instant::now()+Duration::from_secs(60);
+    let rid=loop{
+        match crate::runtime::resident_state(pool,id,revision,"udp").await?.as_deref(){
+            None|Some("stopped")|Some("queued")=>{},
+            _=>return Err("claimed or unknown UDP request requires local inspection"),
+        }
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{break rid}
+        if Instant::now()>=deadline{return Err("no fresh UDP start request")}
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let result=supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,Some(&rid),Some((rate,burst))).await;
+    crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+    result
+}
+
+async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str,rid:Option<&str>,limits:Option<(u32,u32)>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(bundle)||relay_port<30000||internal_port<30000||relay_port==internal_port{
         return Err("invalid UDP preview parameters")
     }
     private_dir(root)?;
-    let m=checked_udp(pool,id,revision).await?;
+    let m=checked_udp(pool,id,revision,rid).await?;
     if [relay_port,internal_port,m.bind_port as u16].contains(&(m.local_port as u16)){
         return Err("conflicting UDP preview ports")
     }
@@ -661,7 +689,7 @@ pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,rela
         opts.write(true).create_new(true);
         #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
         let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"UDP manifest unavailable")?;
-        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port});
+        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port,"request_id":rid,"byte_rate":limits.map(|v|v.0),"burst_bytes":limits.map(|v|v.1)});
         file.write_all(data.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"UDP manifest write failed")?;
         Ok(())
     })();
@@ -672,11 +700,17 @@ pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,rela
     let mut tunnel=TunnelChildren(Vec::new());
     let mut entrance=TunnelChildren(Vec::new());
     let result=async{
-        checked_udp(pool,id,revision).await?;
+        checked_udp(pool,id,revision,rid).await?;
+        if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}}
         tunnel.start(&engine,&dir.join("server.toml"))?;
         tunnel.start(&engine,&dir.join("client.toml"))?;
         let mut cmd=Command::new(&core);
-        cmd.args(["udp-guard",&ingress,&internal]).env_clear().env("PATH","/usr/bin:/bin")
+        if let Some((rate,burst))=limits{
+            cmd.args(["udp-guard-limited",&ingress,&internal,&rate.to_string(),&burst.to_string()]);
+        }else{
+            cmd.args(["udp-guard",&ingress,&internal]);
+        }
+        cmd.env_clear().env("PATH","/usr/bin:/bin")
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         protect_child(&mut cmd)?;
         entrance.0.push(cmd.spawn().map_err(|_|"UDP guard launch failed")?);
@@ -686,7 +720,10 @@ pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,rela
         let mut ready=false;
         loop{
             if stop_requested(Some(&stop_marker))?{return Ok(())}
-            if checked_udp(pool,id,revision).await.is_err(){
+            if let Some(rid)=rid{
+                if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
+            }
+            if checked_udp(pool,id,revision,rid).await.is_err(){
                 return Err("UDP draft authorization or revision changed")
             }
             if !tunnel.healthy()||!matches!(entrance.0[0].try_wait(),Ok(None)){
@@ -694,6 +731,7 @@ pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,rela
             }
             if udp_echo_probe(&probe){
                 if !ready{
+                    if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}}
                     println!("UDP_PREVIEW_READY");
                     use std::io::Write;
                     std::io::stdout().flush().map_err(|_|"UDP preview output failed")?;

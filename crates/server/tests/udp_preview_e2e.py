@@ -33,7 +33,7 @@ def call(base,path,status,method="GET",token=None,data=None):
     except urllib.error.HTTPError as e:
         code,raw=e.code,e.read()
     assert code==status, f"{method} {path}: expected {status}, got {code}"
-    if code in (200,201):
+    if code in (200,201,202):
         return json.loads(raw)
 def line(p,prefix,seconds):
     with selectors.DefaultSelector() as s:
@@ -68,10 +68,12 @@ try:
         fixture.settimeout(.2)
         local=fixture.getsockname()[1]
         stopped=threading.Event()
+        seen=[]
         def echo():
             while not stopped.is_set():
                 try:
                     data,addr=fixture.recvfrom(65535)
+                    seen.append(data)
                     fixture.sendto(data,addr)
                 except socket.timeout:
                     continue
@@ -141,6 +143,46 @@ try:
             assert p.wait(timeout=10)==0
             closed()
             report["real_udp_preview_explicit_stop_closes_owned_children"]=True
+            # A separately authorized API route queues an operator-fixed worker;
+            # no public listener, executable path or limits accepted in JSON.
+            route="mappings/"+mid
+            call(base,route+"/udp-start",409,"POST",admin,{"expected_revision":m["revision"]+1})
+            queued=call(base,route+"/udp-start",202,"POST",admin,{"expected_revision":m["revision"]})
+            assert queued["state"]=="queued"
+            call(base,route+"/udp-start",409,"POST",admin,{"expected_revision":m["revision"]})
+            assert call(base,route+"/stop",202,"POST",admin,{"request_id":queued["request_id"]})["state"]=="stopped"
+            queued=call(base,route+"/udp-start",202,"POST",admin,{"expected_revision":m["revision"]})
+            rid=queued["request_id"]
+            worker=[exe,"--runtime-udp-worker",str(root),mid,str(m["revision"]),str(relay),str(internal),"udp_api","4096","1200"]
+            p=subprocess.Popen(worker,env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            children.append(p)
+            line(p,"UDP_PREVIEW_READY",45)
+            state=call(base,route+"/runtime",200,token=admin)
+            assert state["request"]["request_id"]==rid and state["request"]["state"]=="running" and state["worker_recent"]
+            manifest=json.loads((root/"udp_api"/"manifest.json").read_text())
+            assert manifest["request_id"]==rid and manifest["byte_rate"]==4096 and manifest["burst_bytes"]==1200
+            assert exchange()
+            # Send four large but otherwise valid datagrams below the old
+            # per-source packet burst. At least one must be byte-limited.
+            prefix=secrets.token_bytes(16)
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sender:
+                sender.bind(("127.0.0.1",0))
+                start=time.monotonic()
+                for n in range(4):
+                    sender.sendto(prefix+bytes([n])+secrets.token_bytes(983),("127.0.0.1",ingress))
+                time.sleep(.3)
+                actual=sum(v.startswith(prefix) and len(v)==1000 for v in seen)
+                elapsed=time.monotonic()-start
+                assert 0<actual<4 and actual*1000<=1200+4096*elapsed
+            assert exchange()
+            report["real_udp_api_worker_claim_and_byte_limit"]=True
+            call(base,route+"/stop",409,"POST",admin,{"request_id":secrets.token_hex(16)})
+            assert call(base,route+"/stop",202,"POST",admin,{"request_id":rid})["state"]=="stopping"
+            assert p.wait(timeout=10)==0
+            closed()
+            state=call(base,route+"/runtime",200,token=admin)
+            assert state["request"]["state"]=="stopped" and not state["worker_recent"]
+            report["real_udp_api_stop_reaps_children_and_closes_ports"]=True
             p=launch("udp_second")
             assert exchange()
             call(base,"devices/"+device["id"]+"/revoke",204,"POST",admin)
@@ -161,4 +203,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==3 and all(v is True for v in report.values())
+assert len(report)==5 and all(v is True for v in report.values())

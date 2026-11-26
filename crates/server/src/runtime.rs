@@ -23,6 +23,7 @@ pub fn routes(pool:SqlitePool)->Router{
     Router::new()
         .route("/api/v1/mappings/{id}/runtime",get(status))
         .route("/api/v1/mappings/{id}/start",post(start))
+        .route("/api/v1/mappings/{id}/udp-start",post(start_udp))
         .route("/api/v1/mappings/{id}/stop",post(stop))
         .layer(DefaultBodyLimit::max(4096)).with_state(pool)
 }
@@ -51,6 +52,19 @@ async fn start(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Heade
     // Expired unclaimed requests may be replaced; unknown or claimed ones
     // never restart automatically. Session and eligibility checked at write.
     let query=format!("INSERT INTO runtime_requests(mapping_id,request_id,mapping_revision,state,requested_at,updated_at) SELECT m.id,?,m.revision,'queued',unixepoch(),unixepoch() FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN admin_sessions a ON a.user_id=u.id WHERE m.id=? AND m.owner_id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND m.local_host='127.0.0.1' AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND n.enabled=1 AND u.enabled=1 AND u.role='admin' AND a.token_digest=? AND a.expires_at>unixepoch() AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch() ON CONFLICT(mapping_id) DO UPDATE SET request_id=excluded.request_id,mapping_revision=excluded.mapping_revision,state='queued',requested_at=excluded.requested_at,updated_at=excluded.updated_at WHERE runtime_requests.state='stopped' OR (runtime_requests.state='queued' AND runtime_requests.requested_at<unixepoch()-120) RETURNING {FIELDS}");
+    let r=sqlx::query_as::<_,Request>(&query).bind(rid).bind(id).bind(owner).bind(c.expected_revision).bind(token)
+        .fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)?;
+    Ok(auth::uncached((StatusCode::ACCEPTED,Json(r))))
+}
+async fn start_udp(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Start>)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    owned(&pool,&id,&owner).await?;
+    if c.expected_revision<1{return Err(BAD)}
+    let rid=hex::encode(auth::random::<16>()?);
+    // Expired unclaimed requests may be replaced; unknown or claimed ones
+    // never restart automatically. Session and eligibility checked at write.
+    let query=format!("INSERT INTO runtime_requests(mapping_id,request_id,mapping_revision,state,requested_at,updated_at) SELECT m.id,?,m.revision,'queued',unixepoch(),unixepoch() FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN users u ON u.id=m.owner_id JOIN admin_sessions a ON a.user_id=u.id WHERE m.id=? AND m.owner_id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND n.enabled=1 AND u.enabled=1 AND u.role='admin' AND a.token_digest=? AND a.expires_at>unixepoch() ON CONFLICT(mapping_id) DO UPDATE SET request_id=excluded.request_id,mapping_revision=excluded.mapping_revision,state='queued',requested_at=excluded.requested_at,updated_at=excluded.updated_at WHERE runtime_requests.state='stopped' OR (runtime_requests.state='queued' AND runtime_requests.requested_at<unixepoch()-120) RETURNING {FIELDS}");
     let r=sqlx::query_as::<_,Request>(&query).bind(rid).bind(id).bind(owner).bind(c.expected_revision).bind(token)
         .fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)?;
     Ok(auth::uncached((StatusCode::ACCEPTED,Json(r))))
