@@ -42,6 +42,8 @@ jobs:
           git diff --exit-code -- Cargo.lock
       - name: Actual native CLI architecture and private configuration
         run: python3 tests/native_agent_e2e.py target/release/localtunnel ${{ matrix.system }} ${{ matrix.machine }} native-evidence/cli.json
+      - name: Real Unix private agent store lifecycle and denial
+        run: python3 tests/unix_agent_store_e2e.py target/release/localtunnel native-evidence/unix-store.json
       - name: Observe upstream candidate engine without execution
         run: python3 tests/native_engine_inventory.py ${{ matrix.engine }} native-evidence/engine-candidate.json
       - name: Install fixed upstream source build compiler

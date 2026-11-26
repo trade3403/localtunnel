@@ -139,6 +139,20 @@ fn run() -> Result<(), String> {
             localtunnel::certificates::check(chain, key, ca, days, domains)?;
             println!("certificate preflight passed");
         }
+        #[cfg(unix)]
+        [command, root] if command == "agent-store-init" => {
+            localtunnel::unix_agent_store::init(Path::new(root))?;
+        }
+        #[cfg(unix)]
+        [command, root, remote, name, local] if command == "agent-config-create" => {
+            localtunnel::unix_agent_store::create(Path::new(root), remote, name,
+                local.parse().map_err(|_| "invalid local address")?, std::io::stdin().lock())?;
+        }
+        #[cfg(unix)]
+        [command, root] if command == "agent-config-check" => {
+            localtunnel::unix_agent_store::checked_config(Path::new(root))?;
+            println!("private agent configuration verified");
+        }
         [command, config] if command == "run" => {
             let binary = env::var_os("LOCALTUNNEL_ENGINE").ok_or("set LOCALTUNNEL_ENGINE to the absolute path of the verified rathole executable")?;
             if !Path::new(&binary).is_absolute() { return Err("engine path must be absolute".into()); }
@@ -149,7 +163,7 @@ fn run() -> Result<(), String> {
             if !status.success() { return Err(format!("engine exited: {status}")); }
         }
         [command] if command == "--version" => println!("localtunnel {}", env!("CARGO_PKG_VERSION")),
-        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | gateway-apply-checked <prefix> <bind> <domain> <relay-port> <expected-body-file> (Linux) | gateway-tls-init/gateway-tls-apply <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> [...] (Linux) | gateway-tls-apply-checked <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> <expected-body-file> (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | run <config-file> | --version".into()),
+        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | gateway-apply-checked <prefix> <bind> <domain> <relay-port> <expected-body-file> (Linux) | gateway-tls-init/gateway-tls-apply <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> [...] (Linux) | gateway-tls-apply-checked <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> <expected-body-file> (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | agent-store-init <new-absolute-dir> | agent-config-create <dir> <server:port> <name> <loopback-IP:port> (Unix; stdin token and public key) | agent-config-check <dir> (Unix) | run <config-file> | --version".into()),
     }
     Ok(())
 }
