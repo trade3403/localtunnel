@@ -17,6 +17,7 @@
 - [V0.5 最终验收、实测数据与未完成边界](docs/v0.5-acceptance.md)
 - [V0.6 跨平台客户端开发记录](docs/v0.6.md)
 - [V0.6 开发预览验收与实际安装包](docs/v0.6-acceptance.md)
+- [V0.7 UDP / QUIC 开发记录](docs/v0.7.md)
 - [自主开发与 CI 记录](docs/autonomous-development.md)
 
 ## 技术栈
@@ -34,8 +35,9 @@ V0.1–V0.4 已通过免费 GitHub Hosted Runner 的同机开发预览回归。V
 | V0.3 | Windows 客户端及安装包 | 桌面、托盘、Windows Service、安装卸载与真实回环转发 CI 通过；未签名，实机和公网待验收 |
 | V0.4 | Web 管理后台、管理设备、受控预览运行 | 同机功能及最终证据门禁验收通过；生产边界未完成 |
 | V0.5 | 安全、稳定性与负载测试 | 同机开发预览功能基线 CI 全绿（90项管理+88项桌面）；生产门禁未完成 |
-| V0.6 | Linux/macOS/ARM64 agent | 开发预览验收通过（四平台原生安装包及真实服务）；收尾文档 CI 待验收 |
-| V0.7–V1.0 | 扩展、商业化、多节点及发行 | 待开发 |
+| V0.6 | Linux/macOS/ARM64 agent | 开发预览及收尾 CI 全部通过 |
+| V0.7 | UDP / QUIC 协议扩展 | UDP over Noise/TCP 第一增量，待 CI |
+| V0.8–V1.0 | 商业化、多节点及发行 | 待开发 |
 
 首个里程碑：Windows agent + Linux relay + 自定义域名，真实公网端到端访问本地 HTTP 服务。验收标准见开发文档。
 

@@ -35,6 +35,7 @@ jobs:
         shell: bash
         env:
           LOCALTUNNEL_GATEWAY_E2E: ${{ runner.os == 'Linux' && '1' || '0' }}
+          LOCALTUNNEL_UDP_E2E: '1'
         run: python tests/e2e.py
       - name: Package CLI build
         shell: bash

@@ -1,7 +1,7 @@
 name: V0.6 Native Agent CI
 on:
   pull_request:
-    branches: ['feat/v0.5-security-stability']
+    branches: ['feat/v0.5-security-stability', 'feat/v0.6-cross-platform']
   workflow_dispatch:
 permissions:
   contents: read
@@ -64,6 +64,7 @@ jobs:
       - name: Real native encrypted tunnel E2E with pinned engine
         env:
           LOCALTUNNEL_GATEWAY_E2E: '0'
+          LOCALTUNNEL_UDP_E2E: '1'
           LOCALTUNNEL_NATIVE_AGENT_PROCESS_E2E: '1'
           LOCALTUNNEL_NATIVE_AGENT_SERVICE_E2E: '1'
           LOCALTUNNEL_NATIVE_AGENT_PACKAGE_E2E: '1'

@@ -1,7 +1,7 @@
 name: V0.4 Management API CI
 on:
   push:
-    branches: ['feat/v0.4-management-api', 'feat/v0.5-security-stability', 'feat/v0.6-cross-platform']
+    branches: ['feat/v0.4-management-api', 'feat/v0.5-security-stability', 'feat/v0.6-cross-platform', 'feat/v0.7-udp-quic']
   pull_request:
     paths:
       - 'crates/server/**'

@@ -67,6 +67,10 @@ fn mapping_count(count: usize) -> Result<(), &'static str> {
 }
 
 pub fn server_configs(bind: SocketAddr, mappings: &[ServerMapping<'_>], key: &str) -> Result<String, &'static str> {
+    server_configs_for(bind, mappings, key, "tcp")
+}
+
+fn server_configs_for(bind: SocketAddr, mappings: &[ServerMapping<'_>], key: &str, kind: &str) -> Result<String, &'static str> {
     use std::collections::HashSet;
     use std::fmt::Write;
     validate_key(key)?;
@@ -83,12 +87,16 @@ pub fn server_configs(bind: SocketAddr, mappings: &[ServerMapping<'_>], key: &st
         if !names.insert(m.name) { return Err("duplicate mapping name"); }
         if bind.port() == m.port || !ports.insert(m.port) { return Err("duplicate or conflicting mapping port"); }
         if !tokens.insert(m.token) { return Err("each mapping must use an independent token"); }
-        writeln!(config, "\n[server.services.{}]\ntype = \"tcp\"\ntoken = \"{}\"\nbind_addr = \"127.0.0.1:{}\"", m.name, m.token, m.port).map_err(|_| "configuration formatting failed")?;
+        writeln!(config, "\n[server.services.{}]\ntype = \"{kind}\"\ntoken = \"{}\"\nbind_addr = \"127.0.0.1:{}\"", m.name, m.token, m.port).map_err(|_| "configuration formatting failed")?;
     }
     Ok(config)
 }
 
 pub fn client_configs(remote: &str, mappings: &[ClientMapping<'_>], key: &str) -> Result<String, &'static str> {
+    client_configs_for(remote, mappings, key, "tcp")
+}
+
+fn client_configs_for(remote: &str, mappings: &[ClientMapping<'_>], key: &str, kind: &str) -> Result<String, &'static str> {
     use std::collections::HashSet;
     use std::fmt::Write;
     validate_key(key)?;
@@ -104,7 +112,7 @@ pub fn client_configs(remote: &str, mappings: &[ClientMapping<'_>], key: &str) -
         if !m.local.ip().is_loopback() { return Err("local target must be loopback"); }
         if !names.insert(m.name) { return Err("duplicate mapping name"); }
         if !tokens.insert(m.token) { return Err("each mapping must use an independent token"); }
-        writeln!(config, "\n[client.services.{}]\ntype = \"tcp\"\ntoken = \"{}\"\nlocal_addr = \"{}\"", m.name, m.token, m.local).map_err(|_| "configuration formatting failed")?;
+        writeln!(config, "\n[client.services.{}]\ntype = \"{kind}\"\ntoken = \"{}\"\nlocal_addr = \"{}\"", m.name, m.token, m.local).map_err(|_| "configuration formatting failed")?;
     }
     Ok(config)
 }
@@ -115,6 +123,47 @@ pub fn server_config(bind: SocketAddr, name: &str, port: u16, token: &str, key: 
 
 pub fn client_config(remote: &str, name: &str, local: SocketAddr, token: &str, key: &str) -> Result<String, &'static str> {
     client_configs(remote, &[ClientMapping { name, local, token }], key)
+}
+
+/// Experimental UDP service over the existing Noise transport (not QUIC).
+/// The relay UDP service and client destination remain loopback-only.
+pub fn server_udp_config(bind: SocketAddr, name: &str, port: u16, token: &str, key: &str) -> Result<String, &'static str> {
+    server_configs_for(bind, &[ServerMapping { name, port, token }], key, "udp")
+}
+
+pub fn client_udp_config(remote: &str, name: &str, local: SocketAddr, token: &str, key: &str) -> Result<String, &'static str> {
+    client_configs_for(remote, &[ClientMapping { name, local, token }], key, "udp")
+}
+
+#[cfg(test)]
+mod udp_tests {
+    use super::*;
+    const TOKEN: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn udp_explicit_and_tcp_unchanged() {
+        let bind = "127.0.0.1:2333".parse().unwrap();
+        let local = "127.0.0.1:8080".parse().unwrap();
+        let server = server_udp_config(bind, "udp-echo", 20800, TOKEN, KEY).unwrap();
+        let client = client_udp_config("localhost:2333", "udp-echo", local, TOKEN, KEY).unwrap();
+        assert_eq!(server, server_config(bind, "udp-echo", 20800, TOKEN, KEY).unwrap().replace("type = \"tcp\"", "type = \"udp\""));
+        assert_eq!(client, client_config("localhost:2333", "udp-echo", local, TOKEN, KEY).unwrap().replace("type = \"tcp\"", "type = \"udp\""));
+        assert!(server.contains("bind_addr = \"127.0.0.1:20800\""));
+        assert!(client.contains("remote_public_key") && client.contains("type = \"noise\""));
+    }
+
+    #[test]
+    fn udp_inherits_existing_security_validations() {
+        let bind = "127.0.0.1:2333".parse().unwrap();
+        assert!(server_udp_config(bind,"echo",0,TOKEN,KEY).is_err());
+        assert!(server_udp_config(bind,"echo",2333,TOKEN,KEY).is_err());
+        assert!(client_udp_config("localhost:2333","echo","0.0.0.0:8080".parse().unwrap(),TOKEN,KEY).is_err());
+        assert!(client_udp_config("localhost:2333","echo","192.168.1.1:8080".parse().unwrap(),TOKEN,KEY).is_err());
+        assert!(client_udp_config("localhost:2333","../bad","127.0.0.1:8080".parse().unwrap(),TOKEN,KEY).is_err());
+        assert!(client_udp_config("localhost:2333","echo","127.0.0.1:8080".parse().unwrap(),"short",KEY).is_err());
+        assert!(client_udp_config("localhost:2333","echo","127.0.0.1:8080".parse().unwrap(),TOKEN,"bad").is_err());
+    }
 }
 
 #[cfg(test)]

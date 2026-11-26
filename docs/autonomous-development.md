@@ -426,3 +426,9 @@
 ## V0.6 开发预览最终验收
 - 功能基线 `9275d9bea8dc03c3decb490229e71e2f95ca2c78` 七项同SHA CI全部通过；下载并校验 Native run 45768028865 全部8个实际ZIP及四种内部安装包，核查四平台27个报告结果组/平台（108个平台-结果组）。真实安装后Noise、前台和systemd/launchd均成功。详见 [V0.6 验收记录](v0.6-acceptance.md)，含全部实际产物、SHA256、尺寸、限制和V0.7边界。
 - 本次为文档收尾提交，须等待其同SHA CI 再次全部成功方可从本分支创建V0.7叠加分支；不提前合并main或正式发布。
+
+## V0.7 第一增量：UDP over Noise/TCP（待 CI）
+- V0.6最终文档提交 `9457e4e3af76e0a72ef6c92bafd3037d0b2dd014` 同SHA 7/7 CI通过：[Native](https://github.com/trade3403/localtunnel/actions/runs/45770609150)、[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45770609133)、[Windows](https://github.com/trade3403/localtunnel/actions/runs/45770609125)、Management [PR](https://github.com/trade3403/localtunnel/actions/runs/45770609121)/[push](https://github.com/trade3403/localtunnel/actions/runs/45770602318)、Hosted [PR](https://github.com/trade3403/localtunnel/actions/runs/45770609136)/[push](https://github.com/trade3403/localtunnel/actions/runs/45770602281)。从此精确提交创建 feat/v0.7-udp-quic，叠加V0.6草稿PR，不合并main。
+- 固定上游Rathole v0.5.0 commit ebb764ae53d7ffe4fcb45f83f7563bec5c74199d 的 src/config.rs 与 tests/for_udp/noise_transport.toml 已核查支持 UDP 服务及 Noise transport。新增显式 server-udp-config/client-udp-config 单映射 CLI，共享原有配置验证/独立随机token/固定公钥、拒绝非回环本地目标及覆盖。原TCP默认输出保持一致；不改变Unix私有store、管理API或Windows UI。
+- 真实UDP测试使用原有已经校验的引擎、真实本机UDP echo socket、实际relay/agent进程：配置安全检查、错误token拒绝、真实往返、1/64/512/1200字节二进制数据报、8客户端共64次隔离往返、relay重启恢复。独立udp.json报告、记录本次并发耗时，不将其称作吞吐量或公网基准；四Unix原生runner及原Gateway Windows/Linux矩阵强制执行。保留原七项TCP证据及V0.6完整回归；Native增加V0.6 base，Management增加V0.7 push触发。
+- 当前UDP服务通过既有Noise加密TCP传输，不是QUIC或不可靠原生UDP WAN传输。仅同机回环；未实现混合多映射、管理/UI/Unix私有store UDP集成、UDP速率/会话资源边界、公网、QUIC基准或正式发布。后续先验收当前真实UDP，再补协议隔离/资源限制和可复现QUIC实验，只有实际证据支持才采用。无新crate、无付费runner、无生产部署。

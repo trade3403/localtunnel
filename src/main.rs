@@ -34,6 +34,14 @@ fn run() -> Result<(), String> {
             let config = client_config(remote, name, local.parse().map_err(|_| "invalid local address")?, &env_required("LOCALTUNNEL_TOKEN")?, &env_required("LOCALTUNNEL_SERVER_PUBLIC_KEY")?)?;
             write_new(Path::new(output), &config)?;
         }
+        [command, output, bind, name, port] if command == "server-udp-config" => {
+            let config = localtunnel::server_udp_config(bind.parse().map_err(|_| "invalid bind address")?, name, port.parse().map_err(|_| "invalid mapping port")?, &env_required("LOCALTUNNEL_TOKEN")?, &env_required("LOCALTUNNEL_SERVER_PRIVATE_KEY")?)?;
+            write_new(Path::new(output), &config)?;
+        }
+        [command, output, remote, name, local] if command == "client-udp-config" => {
+            let config = localtunnel::client_udp_config(remote, name, local.parse().map_err(|_| "invalid local address")?, &env_required("LOCALTUNNEL_TOKEN")?, &env_required("LOCALTUNNEL_SERVER_PUBLIC_KEY")?)?;
+            write_new(Path::new(output), &config)?;
+        }
         [command, output, endpoint, rest @ ..] if command == "server-multi" || command == "client-multi" => {
             if rest.is_empty() || rest.len() % 2 != 0 || rest.len() > 128 {
                 return Err("provide 1-64 name/address pairs".into());
@@ -175,7 +183,7 @@ fn run() -> Result<(), String> {
             if !status.success() { return Err(format!("engine exited: {status}")); }
         }
         [command] if command == "--version" => println!("localtunnel {}", env!("CARGO_PKG_VERSION")),
-        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | gateway-apply-checked <prefix> <bind> <domain> <relay-port> <expected-body-file> (Linux) | gateway-tls-init/gateway-tls-apply <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> [...] (Linux) | gateway-tls-apply-checked <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> <expected-body-file> (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | agent-store-init <new-absolute-dir> | agent-config-create <dir> <server:port> <name> <loopback-IP:port> (Unix; stdin token and public key) | agent-config-check <dir> (Unix) | agent-engine-install <dir> <absolute-engine> (Unix) | agent-run <dir> (Unix foreground) | agent-service-generate <dir> <32hex-id> (Linux/macOS user service) | run <config-file> | --version".into()),
+        _ => return Err("usage: localtunnel server-config <new-file> <bind-IP:port> <name> <mapping-port> | client-config <new-file> <server:port> <name> <loopback-IP:port> | server-udp-config <new-file> <bind-IP:port> <name> <mapping-port> | client-udp-config <new-file> <server:port> <name> <loopback-IP:port> | server-multi <new-file> <bind-IP:port> <name> <mapping-port> [...] | client-multi <new-file> <server:port> <name> <loopback-IP:port> [...] | gateway-http <new-file> <bind-IP:port> <domain> <upstream-port> [...] | gateway-https <new-file> <bind-IP:port> <cert-path> <key-path> <domain> <upstream-port> [...] | gateway-init/gateway-apply <dedicated-prefix> <loopback-IP:port> [<domain> <relay-port> ...] (Linux) | gateway-apply-checked <prefix> <bind> <domain> <relay-port> <expected-body-file> (Linux) | gateway-tls-init/gateway-tls-apply <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> [...] (Linux) | gateway-tls-apply-checked <prefix> <bind> <probe> <chain> <key> <CA> <minimum-days> <domain> <relay-port> <expected-body-file> (Linux) | cert-check <chain> <key> <CA> <minimum-days> <domain> [...] (Linux) | agent-store-init <new-absolute-dir> | agent-config-create <dir> <server:port> <name> <loopback-IP:port> (Unix; stdin token and public key) | agent-config-check <dir> (Unix) | agent-engine-install <dir> <absolute-engine> (Unix) | agent-run <dir> (Unix foreground) | agent-service-generate <dir> <32hex-id> (Linux/macOS user service) | run <config-file> | --version".into()),
     }
     Ok(())
 }
