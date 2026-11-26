@@ -96,3 +96,64 @@ def exercise(cli,upstream,seen,results,terminate):
         for s in sockets:
             s.close()
         (results/"udp-guard.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
+
+    # Run the new configured byte gate against the same live encrypted mapping.
+    limited_exercise(cli,upstream,seen,results,terminate)
+
+
+def limited_exercise(cli,upstream,seen,results,terminate):
+    report={"scope":"real configured per-direction UDP byte gate, same-host Noise/TCP",
+            "bytes_per_second_each_direction":1,"burst_bytes_each_direction":1200,"passed":[]}
+    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as reserve:
+        reserve.bind(("127.0.0.1",0))
+        listen=reserve.getsockname()[1]
+    args=[str(cli),"udp-guard-limited",f"127.0.0.1:{listen}",f"127.0.0.1:{upstream}"]
+    for rate,burst in [("0","1200"),("240001","1200"),("1","1199"),("1","76801"),("-1","1200"),("x","1200")]:
+        p=subprocess.run([*args,rate,burst],capture_output=True,timeout=5)
+        assert p.returncode!=0
+    report["passed"].append("invalid rate and burst rejected before binding")
+    process=subprocess.Popen([*args,"1","1200"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+    def exchange(sock,data,timeout):
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(data,("127.0.0.1",listen))
+            reply,addr=sock.recvfrom(65535)
+            assert addr==("127.0.0.1",listen)
+            return reply
+        except (socket.timeout,ConnectionResetError,ConnectionRefusedError):
+            return None
+    try:
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as b:
+            a.bind(("127.0.0.1",0))
+            b.bind(("127.0.0.1",0))
+            deadline=time.monotonic()+15
+            while time.monotonic()<deadline:
+                assert process.poll() is None
+                marker=secrets.token_bytes(16)
+                got=exchange(a,marker,.5)
+                if got==bytes([0])+marker:
+                    break
+                assert got is None
+            else:
+                raise AssertionError("limited guard startup failed")
+            # 256 bytes admitted; 1024 is below the existing 1200-byte
+            # packet limit but exceeds remaining mapping byte budget.
+            first=secrets.token_bytes(256)
+            assert exchange(a,first,3)==bytes([0])+first
+            denied=secrets.token_bytes(1024)
+            started=time.monotonic()
+            assert exchange(b,denied,.6) is None
+            assert denied not in seen
+            # Another source cannot bypass the shared byte bucket, but a
+            # smaller request within the remaining budget still works.
+            small=secrets.token_bytes(32)
+            assert exchange(b,small,3)==bytes([0])+small
+            assert time.monotonic()-started<15
+            assert first in seen and small in seen and denied not in seen
+            report["verified_fixture_bytes"]=[256,32]
+            report["denied_fixture_bytes"]=1024
+            report["passed"].append("real shared byte budget rejects larger datagram while smaller traffic survives")
+        assert len(report["passed"])==2
+    finally:
+        terminate(process)
+        (results/"udp-guard-limited.json").write_text(json.dumps(report,indent=2),encoding="utf-8")

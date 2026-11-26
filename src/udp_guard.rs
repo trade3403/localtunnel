@@ -24,10 +24,32 @@ impl Bucket {
     fn new(rate: f64, burst: f64, now: Instant) -> Self {
         Self { tokens: burst, rate, burst, last: now }
     }
-    fn take(&mut self, now: Instant) -> bool {
+    fn take(&mut self, now: Instant) -> bool { self.take_amount(now,1) }
+    fn take_amount(&mut self, now: Instant, amount: usize) -> bool {
         self.tokens = (self.tokens + now.saturating_duration_since(self.last).as_secs_f64()*self.rate).min(self.burst);
         self.last = now;
-        if self.tokens < 1.0 { false } else { self.tokens -= 1.0; true }
+        let cost=amount as f64;
+        if self.tokens < cost { false } else { self.tokens -= cost; true }
+    }
+}
+
+/// Optional per-direction application-byte budget for one UDP mapping.
+/// Values may only tighten the existing packet and resource guard. A burst
+/// must accommodate one maximum-sized supported datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ByteLimits {
+    bytes_per_second: u32,
+    burst_bytes: u32,
+}
+impl ByteLimits {
+    pub fn new(bytes_per_second: u32, burst_bytes: u32) -> Result<Self, &'static str> {
+        if !(1..=240_000).contains(&bytes_per_second) || !(1200..=76_800).contains(&burst_bytes) {
+            return Err("UDP byte limits require 1..240000 B/s and 1200..76800 burst bytes");
+        }
+        Ok(Self { bytes_per_second, burst_bytes })
+    }
+    fn bucket(self,now:Instant)->Bucket {
+        Bucket::new(f64::from(self.bytes_per_second),f64::from(self.burst_bytes),now)
     }
 }
 
@@ -71,6 +93,8 @@ pub struct UdpStats {
     pub to_source_packets: u64,
     pub rejected_from_source: u64,
     pub rejected_from_target: u64,
+    pub byte_limited_from_source: u64,
+    pub byte_limited_from_target: u64,
 }
 
 fn count(bytes: &mut u64, packets: &mut u64, n: usize) {
@@ -89,6 +113,8 @@ pub struct UdpForwarder {
     admission: Admission,
     inbound: Bucket,
     outbound: Bucket,
+    inbound_bytes: Option<Bucket>,
+    outbound_bytes: Option<Bucket>,
     buf: Box<[u8; 65536]>,
     stats: UdpStats,
 }
@@ -97,6 +123,9 @@ impl UdpForwarder {
     /// Port zero is permitted only for programmatic ephemeral binding.
     /// The public guard CLI still requires a nonzero, explicit port.
     pub fn bind(listen: SocketAddr, target: SocketAddr) -> Result<Self, &'static str> {
+        Self::bind_with_limits(listen,target,None)
+    }
+    pub fn bind_with_limits(listen: SocketAddr, target: SocketAddr, limits: Option<ByteLimits>) -> Result<Self, &'static str> {
         let loopback = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
         if listen.ip() != loopback || target.ip() != loopback || target.port()==0 || listen==target {
             return Err("UDP forwarder requires distinct IPv4 loopback endpoints");
@@ -109,6 +138,8 @@ impl UdpForwarder {
         Ok(Self { ingress, target, sessions: HashMap::new(), admission: Admission::new(),
             inbound: Bucket::new(GLOBAL_RATE,GLOBAL_BURST,now),
             outbound: Bucket::new(GLOBAL_RATE,GLOBAL_BURST,now),
+            inbound_bytes: limits.map(|l|l.bucket(now)),
+            outbound_bytes: limits.map(|l|l.bucket(now)),
             buf: Box::new([0u8;65536]), stats: UdpStats::default() })
     }
 
@@ -149,7 +180,15 @@ impl UdpForwarder {
                     outbound:Bucket::new(PEER_RATE,PEER_BURST,now)});
             }
             if let Some(s)=self.sessions.get_mut(&peer) {
-                if s.inbound.take(now) && s.socket.send(&self.buf[..n]).ok()==Some(n) {
+                if !s.inbound.take(now) {
+                    reject(&mut self.stats.rejected_from_source); continue;
+                }
+                if self.inbound_bytes.as_mut().is_some_and(|bucket| !bucket.take_amount(now,n)) {
+                    reject(&mut self.stats.byte_limited_from_source);
+                    reject(&mut self.stats.rejected_from_source); continue;
+                }
+                // A failed send consumes budget conservatively but is never metered.
+                if s.socket.send(&self.buf[..n]).ok()==Some(n) {
                     s.last_forwarded=now;
                     count(&mut self.stats.to_target_bytes,&mut self.stats.to_target_packets,n);
                 } else { reject(&mut self.stats.rejected_from_source); }
@@ -162,8 +201,14 @@ impl UdpForwarder {
                     Err(_)=>break, // no state expansion or retry queue on error
                 };
                 let now=Instant::now();
-                if n>0 && n<=MAX_PAYLOAD && self.outbound.take(now) && s.outbound.take(now)
-                    && self.ingress.send_to(&self.buf[..n],peer).ok()==Some(n) {
+                if n==0 || n>MAX_PAYLOAD || !self.outbound.take(now) || !s.outbound.take(now) {
+                    reject(&mut self.stats.rejected_from_target); continue;
+                }
+                if self.outbound_bytes.as_mut().is_some_and(|bucket| !bucket.take_amount(now,n)) {
+                    reject(&mut self.stats.byte_limited_from_target);
+                    reject(&mut self.stats.rejected_from_target); continue;
+                }
+                if self.ingress.send_to(&self.buf[..n],peer).ok()==Some(n) {
                     count(&mut self.stats.to_source_bytes,&mut self.stats.to_source_packets,n);
                 } else { reject(&mut self.stats.rejected_from_target); }
             }
@@ -173,10 +218,13 @@ impl UdpForwarder {
 }
 
 pub fn run(listen: SocketAddr, relay: SocketAddr) -> Result<(), &'static str> {
+    run_with_limits(listen,relay,None)
+}
+pub fn run_with_limits(listen: SocketAddr, relay: SocketAddr, limits: Option<ByteLimits>) -> Result<(), &'static str> {
     if !valid_endpoints(listen,relay) {
         return Err("UDP guard requires distinct nonzero IPv4 127.0.0.1 endpoints");
     }
-    let mut forwarder = UdpForwarder::bind(listen,relay)?;
+    let mut forwarder = UdpForwarder::bind_with_limits(listen,relay,limits)?;
     loop {
         forwarder.poll()?;
         std::thread::sleep(Duration::from_millis(2));
@@ -259,7 +307,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         assert_eq!(f.stats(),UdpStats {to_target_bytes:48,to_target_packets:2,
-            to_source_bytes:66,to_source_packets:2,rejected_from_source:1,rejected_from_target:1});
+            to_source_bytes:66,to_source_packets:2,rejected_from_source:1,rejected_from_target:1,..UdpStats::default()});
         for sock in [&target,&a,&b] {
             assert!(matches!(sock.recv_from(&mut buf),Err(e) if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut)));
         }
@@ -279,5 +327,72 @@ mod tests {
         assert!(UdpForwarder::bind("0.0.0.0:0".parse().unwrap(),"127.0.0.1:80".parse().unwrap()).is_err());
         assert!(UdpForwarder::bind("127.0.0.1:0".parse().unwrap(),"127.0.0.1:0".parse().unwrap()).is_err());
         assert!(UdpForwarder::bind("127.0.0.1:0".parse().unwrap(),"192.168.1.2:80".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn byte_budget_validation_and_refill() {
+        for (rate,burst) in [(0,1200),(240001,1200),(1,1199),(1,76801)] {
+            assert!(ByteLimits::new(rate,burst).is_err());
+        }
+        let now=Instant::now();
+        let mut bucket=ByteLimits::new(100,1200).unwrap().bucket(now);
+        assert!(bucket.take_amount(now,1200));
+        assert!(!bucket.take_amount(now,1));
+        assert!(!bucket.take_amount(now+Duration::from_millis(500),51));
+        assert!(bucket.take_amount(now+Duration::from_millis(500),50));
+        assert!(bucket.take_amount(now+Duration::from_secs(100),1200));
+        assert!(!bucket.take_amount(now+Duration::from_secs(100),1));
+    }
+
+    #[test]
+    fn real_byte_limits_independent_directions_and_shared_sources() {
+        let target=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut f=UdpForwarder::bind_with_limits("127.0.0.1:0".parse().unwrap(),
+            target.local_addr().unwrap(),Some(ByteLimits::new(1,1200).unwrap())).unwrap();
+        let addr=f.local_addr().unwrap();
+        let a=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b=UdpSocket::bind("127.0.0.1:0").unwrap();
+        for sock in [&target,&a,&b] { sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap(); }
+        fn receive(f:&mut UdpForwarder,sock:&UdpSocket,buf:&mut [u8])->(usize,SocketAddr) {
+            let until=Instant::now()+Duration::from_secs(3);
+            loop {
+                f.poll().unwrap();
+                match sock.recv_from(buf) {
+                    Ok(value)=>return value,
+                    Err(e) if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut)=>{},
+                    Err(e)=>panic!("unexpected UDP error: {e}"),
+                }
+                assert!(Instant::now()<until,"byte-limited UDP receive timed out");
+            }
+        }
+        let mut buf=[0u8;2048];
+        a.send_to(&[1;600],addr).unwrap();
+        let (n,pa)=receive(&mut f,&target,&mut buf);
+        assert_eq!(&buf[..n],&[1;600]);
+        b.send_to(&[2;600],addr).unwrap();
+        let (n,pb)=receive(&mut f,&target,&mut buf);
+        assert_eq!(&buf[..n],&[2;600]);
+        assert_ne!(pa,pb);
+        // Both peers share the same exhausted ingress budget.
+        a.send_to(&[3;600],addr).unwrap();
+        // Egress has an independent budget despite exhausted ingress.
+        target.send_to(&[4;1000],pa).unwrap();
+        let (n,_)=receive(&mut f,&a,&mut buf);
+        assert_eq!(&buf[..n],&[4;1000]);
+        target.send_to(&[5;1000],pb).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        loop {
+            f.poll().unwrap();
+            let stats=f.stats();
+            if stats.byte_limited_from_source==1 && stats.byte_limited_from_target==1 { break; }
+            assert!(Instant::now()<until,"byte denial not observed");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(f.stats(),UdpStats {to_target_bytes:1200,to_target_packets:2,
+            to_source_bytes:1000,to_source_packets:1,rejected_from_source:1,rejected_from_target:1,
+            byte_limited_from_source:1,byte_limited_from_target:1});
+        for sock in [&target,&a,&b] {
+            assert!(matches!(sock.recv_from(&mut buf),Err(e) if matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::TimedOut)));
+        }
     }
 }
