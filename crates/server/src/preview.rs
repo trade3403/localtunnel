@@ -331,12 +331,14 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     export_inner(pool,root,id,revision,relay_port,bundle,limiter.as_ref().map(|g|g.port()),m.bandwidth_bps).await?;
     let mut children=TunnelChildren(Vec::new());
     let mut meter=None;
+    let mut reservation=None;
     let result=async {
         if stop_requested(stop_marker)?{return Ok(())}
         if let Some(rid)=request{
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
         if checked_protocol(pool,id,revision,transport.protocol()).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,request,m.bandwidth_bps,m.bandwidth_bps.map(|bps|(bps/8).min(125000000) as u32)).await?);
         children.start(&engine,&root.join(bundle).join("server.toml"))?;
         children.start(&engine,&root.join(bundle).join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
@@ -387,6 +389,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     stopped?;
     limited?;
     cleared?;
+    crate::commercial::release_bandwidth(pool,reservation.as_deref()).await?;
     // Only resident-owned, freshly created bundle is removed after a known
     // clean result. Failed/unknown runs retain evidence for the operator.
     if stop_marker.is_some()&&result.is_ok(){
@@ -808,11 +811,13 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     if device_lease{fs::remove_file(dir.join("client.toml")).map_err(|_|"unused client config cleanup failed")?;}
     let mut tunnel=TunnelChildren(Vec::new());
     let mut entrance=TunnelChildren(Vec::new());
+    let mut reservation=None;
     let result=async{
         let current=checked_udp(pool,id,revision,rid).await?;
         if current.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
         if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
         if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}}
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,rid,m.bandwidth_bps,if m.bandwidth_bps.is_some(){limits.map(|v|v.0)}else{None}).await?);
         tunnel.start(&engine,&dir.join("server.toml"))?;
         if !device_lease{tunnel.start(&engine,&dir.join("client.toml"))?;}
         let mut cmd=Command::new(&core);
@@ -885,6 +890,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     }
     entrance_stopped?;
     tunnel_stopped?;
+    crate::commercial::release_bandwidth(pool,reservation.as_deref()).await?;
     if device_lease{
         fs::remove_file(dir.join("server.toml")).map_err(|_|"UDP relay configuration cleanup failed")?;
     }
@@ -1007,9 +1013,11 @@ async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16
     })();
     if let Err(e)=created{let _=fs::remove_dir_all(&dir);return Err(e)}
     let mut children=TunnelChildren(Vec::new());
+    let mut reservation=None;
     let result=async{
         if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         if checked_tcp(pool,id,revision,rid).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,Some(rid),m.bandwidth_bps,m.bandwidth_bps.map(|_|rate)).await?);
         children.start(&engine,&dir.join("server.toml"))?;
         children.start(&engine,&dir.join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
@@ -1036,6 +1044,7 @@ async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16
     let limited=guard.stop();
     stopped?;
     limited?;
+    crate::commercial::release_bandwidth(pool,reservation.as_deref()).await?;
     if result.is_ok(){
         fs::remove_dir_all(&dir).map_err(|_|"TCP bundle cleanup failed")?;
     }

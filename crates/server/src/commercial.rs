@@ -15,6 +15,7 @@ struct Entitlement {
     max_active_devices:i64,max_retained_devices:i64,max_mappings:i64,
     max_bandwidth_bps:Option<i64>,max_monthly_bytes:Option<i64>,max_concurrent_connections:Option<i64>,
     active_devices:i64,retained_devices:i64,mappings:i64,
+    bandwidth_reservations:i64, reserved_bytes_per_second:Option<i64>,
 }
 #[derive(Serialize)]
 struct View {
@@ -25,6 +26,7 @@ struct View {
     udp_bandwidth_scope:&'static str,
     web_bandwidth_scope:&'static str,
     tcp_bandwidth_scope:&'static str,
+    aggregate_bandwidth_scope:&'static str,
     entitlement:Entitlement,
 }
 pub fn routes(pool:SqlitePool)->Router{
@@ -35,10 +37,10 @@ async fn current(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Respon
     // Identity, policy and real counts in one SQL snapshot. No caller-
     // supplied owner/tenant selector, no device credentials or hashes.
     let entitlement=sqlx::query_as::<_,Entitlement>(
-        "SELECT t.id AS tenant_id,p.id AS plan_id,p.code AS plan_code,p.version AS plan_version,p.name AS plan_name,e.revision,e.state,e.expires_at,CASE WHEN e.state='suspended' THEN 'suspended' WHEN e.expires_at IS NOT NULL AND e.expires_at<=unixepoch() THEN 'expired' ELSE 'active' END AS effective_state,p.max_active_devices,p.max_retained_devices,p.max_mappings,p.max_bandwidth_bps,p.max_monthly_bytes,p.max_concurrent_connections,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id AND d.enabled=1) AS active_devices,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id) AS retained_devices,(SELECT count(*) FROM mappings m WHERE m.owner_id=u.id) AS mappings FROM users u JOIN admin_sessions a ON a.user_id=u.id JOIN tenants t ON t.owner_id=u.id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
+        "SELECT t.id AS tenant_id,p.id AS plan_id,p.code AS plan_code,p.version AS plan_version,p.name AS plan_name,e.revision,e.state,e.expires_at,CASE WHEN e.state='suspended' THEN 'suspended' WHEN e.expires_at IS NOT NULL AND e.expires_at<=unixepoch() THEN 'expired' ELSE 'active' END AS effective_state,p.max_active_devices,p.max_retained_devices,p.max_mappings,p.max_bandwidth_bps,p.max_monthly_bytes,p.max_concurrent_connections,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id AND d.enabled=1) AS active_devices,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id) AS retained_devices,(SELECT count(*) FROM mappings m WHERE m.owner_id=u.id) AS mappings,(SELECT count(*) FROM bandwidth_reservations b WHERE b.tenant_id=t.id) AS bandwidth_reservations,CASE WHEN EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.rate_bytes_per_second IS NULL) THEN NULL ELSE (SELECT coalesce(sum(b.rate_bytes_per_second),0) FROM bandwidth_reservations b WHERE b.tenant_id=t.id) END AS reserved_bytes_per_second FROM users u JOIN admin_sessions a ON a.user_id=u.id JOIN tenants t ON t.owner_id=u.id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
         .bind(digest).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
     Ok(auth::uncached(Json(View{scope:"owner_inventory_only",commercial_enforcement:false,
-        enforced_admission:["active_devices","retained_devices","mappings","active_entitlement_for_creation"],enforced_runtime_entitlement:true,udp_bandwidth_scope:"per_mapping_per_direction_guarded_payload_only",web_bandwidth_scope:"supervised_web_per_mapping_per_direction_tcp_stream",tcp_bandwidth_scope:"supervised_tcp_per_mapping_per_direction_stream",entitlement})))
+        enforced_admission:["active_devices","retained_devices","mappings","active_entitlement_for_creation"],enforced_runtime_entitlement:true,udp_bandwidth_scope:"per_mapping_per_direction_guarded_payload_only",web_bandwidth_scope:"supervised_web_per_mapping_per_direction_tcp_stream",tcp_bandwidth_scope:"supervised_tcp_per_mapping_per_direction_stream",aggregate_bandwidth_scope:"same_database_fixed_reservations_per_direction_not_measured_usage",entitlement})))
 }
 
 
@@ -142,4 +144,29 @@ async fn assign(pool:&SqlitePool,c:Assignment)->Result<String,&'static str>{
         .bind(revision).bind(&c.state).bind(&c.tenant_id).execute(&mut *tx).await.map_err(|_|"owner audit write failed")?;
     tx.commit().await.map_err(|_|"commercial commit outcome unknown")?;
     Ok(c.tenant_id)
+}
+
+
+/// Acquire the actual configured budget, before any owned engine or UDP
+/// ingress starts. A NULL reservation marks an uncapped preview and blocks
+/// finite admission until that preview has been confirmed stopped.
+/// The INSERT is the atomic admission operation across independent workers.
+pub async fn reserve_bandwidth(pool:&SqlitePool,mapping:&str,revision:i64,request:Option<&str>,bps:Option<i64>,rate:Option<u32>)->Result<String,&'static str>{
+    if bps.is_some()!=rate.is_some(){return Err("invalid bandwidth reservation")}
+    let id=random_id()?;
+    let rate=rate.map(i64::from);
+    let changed=sqlx::query("INSERT INTO bandwidth_reservations(id,tenant_id,mapping_id,mapping_revision,request_id,rate_bytes_per_second) SELECT ?,t.id,m.id,m.revision,?,? FROM mappings m JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE m.id=? AND m.revision=? AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND p.max_bandwidth_bps IS ? AND (p.max_bandwidth_bps IS NULL OR (? BETWEEN 1 AND p.max_bandwidth_bps/8 AND NOT EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.rate_bytes_per_second IS NULL) AND (SELECT coalesce(sum(b.rate_bytes_per_second),0) FROM bandwidth_reservations b WHERE b.tenant_id=t.id)<=p.max_bandwidth_bps/8-?))")
+        .bind(&id).bind(request).bind(rate).bind(mapping).bind(revision).bind(bps).bind(rate).bind(rate)
+        .execute(pool).await.map_err(|_|"bandwidth admission unavailable")?;
+    if changed.rows_affected()!=1{return Err("tenant bandwidth budget unavailable or policy changed")}
+    Ok(id)
+}
+/// Only the worker which reserved capacity may release its exact ID after
+/// confirmed process/guard cleanup. No timer-based reaping or adoption.
+pub async fn release_bandwidth(pool:&SqlitePool,id:Option<&str>)->Result<(),&'static str>{
+    if let Some(id)=id{
+        let n=sqlx::query("DELETE FROM bandwidth_reservations WHERE id=?").bind(id).execute(pool).await.map_err(|_|"bandwidth release unavailable")?.rows_affected();
+        if n!=1{return Err("bandwidth release outcome unknown")}
+    }
+    Ok(())
 }

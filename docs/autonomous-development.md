@@ -645,3 +645,12 @@
 - 管理后台TCP草稿的真实请求启动/停止按钮及范围提示；无TCP网关流量统计时明确不显示虚构计费数据。commercial/entitlement增加tcp_bandwidth_scope；整体commercial_enforcement仍false。
 - 新真实Linux TCP E2E 5组强制报告：拒绝跨owner/错误协议/版本/重复请求及取消排队，真实Noise经共享预算2并发各256KiB随机回显（每方向512KiB，耗时下界3.8秒，真实结果由CI产生），停止后的三端口及bundle清理，暂停快速续期旧请求仍停止，套餐切换旧预算关闭。新增实际浏览器TCP请求/取消/删除强制字段。保留旧协议测试。本轮未本地编译或运行真实引擎，待CI。
 - 下一增量：同机多映射租户共享预算（保守分配/事务控制），随后持久月流量、并发连接额度及商业UI。仍须满足V0.9管理与中转完全解耦、单机兼容。未改main、未增加依赖或迁移。
+
+## V0.8 第八增量：同库租户汇总带宽固定预算预留（待 CI）
+- 基线 `c04a322bf1492a31d909e88eb4eda5701aff1bf4` 同SHA 7/7成功：[Hosted PR](https://github.com/trade3403/localtunnel/actions/runs/45908173875)/[push](https://github.com/trade3403/localtunnel/actions/runs/45908168259)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45908173897)，[Native](https://github.com/trade3403/localtunnel/actions/runs/45908173822)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45908173816)，[Management PR](https://github.com/trade3403/localtunnel/actions/runs/45908173853)/[push](https://github.com/trade3403/localtunnel/actions/runs/45908168231)。独立TCP真实加密转发/共享限速/停止及浏览器操作通过。
+- 0014新增bandwidth_reservations，独立随机预留ID、tenant/mapping/revision/request、每方向B/s预算、创建时间，无映射删除级联、无自动TTL；同一SQLite库中的HTTP/HTTPS/TCP/UDP全部受控执行器，在启动自有引擎/入口前通过单条原子INSERT检查当前有效套餐、mapping版本、预期bps及现存租户预算总和。有限套餐要求sum+本次rate<=floor(max_bandwidth_bps/8)，独立进程并发也不能分别按全额准入。无商业上限的受控会话记录NULL，阻止未来有限套餐新会话在旧无上限会话尚未确认停止时启动；不将NULL视作0。原有默认兼容套餐继续允许无上限会话。
+- 本增量是固定预算分配/拒绝式准入，不是实时借用闲置带宽或按流量自动公平调度。TCP/UDP操作员可设低于套餐的单映射速率；HTTP/HTTPS目前预留原有效单映射速率，可能占满整个套餐，其他隧道需等待释放。原单方向独立令牌桶突发仍存在，汇总瞬时可出现多个映射的burst之和；长期配置速率和不超套餐每方向预算，不是双向合计、线速或账单。降低套餐时原受控会话停止需要周期复核/清理，非瞬时收紧。
+- 只有持有本次预留ID的执行器在确认拥有的引擎、guard及适用网关清理后释放；清理失败、进程被杀、结果未知保留预留，不靠心跳超时释放。旧恢复CLI尚不自动解除该新表的崩溃预留；未实现自动/在线恢复或安全的人工清理CLI，异常保留可能阻塞有限套餐准入（包含旧无上限会话的NULL预留）。备份恢复亦不擅自清除预留；下一增量需可审计的离线恢复机制。升级应先停掉旧版本所有预览；旧已导出独立配置及绕过管理的进程无法登记，不能宣称不可绕过生产配额。尚未跨DB/多节点分配；V0.9须迁移到控制面授权与独立relay实施。
+- 商业只读API新增owner隔离的bandwidth_reservations数量及reserved_bytes_per_second（存在NULL预留时返回null）、aggregate_bandwidth_scope，表示预留而非实测流量；commercial_enforcement仍false。readiness增加表检查，HTTP连续迁移清单扩至1-14。
+- 扩展真实TCP E2E至10组布尔门禁：两个独立TCP worker各65536 B/s同时传输各256KiB真实随机回显，共512KiB每方向且有耗时下界，第三UDP超额拒绝；另一租户实际TCP可独立使用其预算；停止一TCP后真实UDP获取释放额度并与剩余TCP同时回显；实际杀掉一个worker验证SQLite精确预留仍在且其他worker不得超额再用。新增5个强制证据字段，保留原测试。实际测量由CI产生，当前未本地编译或执行真实服务。
+- 下一增量：预留安全恢复与持久月度流量预算，随后套餐并发额度、商业UI及V0.8验收。未修改main、未新增依赖。

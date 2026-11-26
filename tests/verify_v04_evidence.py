@@ -270,6 +270,11 @@ REQUIRED["management-v08"] = {
         "real_tcp_stop_closes_listeners_and_bundle",
         "real_tcp_suspend_and_rapid_renewal_stops_generation",
         "real_tcp_plan_change_closes_old_budget",
+        "real_tenant_two_tcp_workers_share_fixed_budget",
+        "real_tenant_bandwidth_owner_isolation",
+        "real_tenant_cross_protocol_over_budget_denied",
+        "real_tenant_released_budget_reused_by_other_protocol",
+        "real_tenant_crash_reservation_fail_closed",
     ],
     "udp-preview.json": [
         "real_udp_commercial_suspend_revokes_lease_and_closes_relay",

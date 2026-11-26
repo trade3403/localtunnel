@@ -8,6 +8,7 @@ import secrets
 import selectors
 import socket
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -37,11 +38,11 @@ def call(base,path,status,method="GET",token=None,data=None):
     assert code==status,f"{method} {path}: expected {status}, got {code}"
     if code in (200,201,202):return json.loads(raw)
 
-def free(lo,hi,exclude):
+def free(lo,hi,exclude,kind=socket.SOCK_STREAM):
     for _ in range(200):
         port=lo+secrets.randbelow(hi-lo+1)
         if port in exclude:continue
-        with socket.socket() as s:
+        with socket.socket(socket.AF_INET,kind) as s:
             try:s.bind(("127.0.0.1",port))
             except OSError:continue
             return port
@@ -128,9 +129,9 @@ try:
                 manifest=json.loads((root/bundle/"manifest.json").read_text())
                 assert manifest["byte_rate"]==131072 and manifest["commercial_bandwidth_bps"]==1048576 and manifest["request_id"]==q["request_id"]
                 return p,q["request_id"],manifest["tcp_limiter_port"]
-            def exchange(n):
+            def exchange(n,port=ingress):
                 data=secrets.token_bytes(n)
-                with socket.create_connection(("127.0.0.1",ingress),timeout=10) as s:
+                with socket.create_connection(("127.0.0.1",port),timeout=10) as s:
                     s.sendall(data)
                     reply=bytearray()
                     while len(reply)<n:
@@ -172,6 +173,141 @@ try:
             policy("legacy-v1")
             closed(p,rid,guard,"tcp_third")
             report["real_tcp_plan_change_closes_old_budget"]=True
+            # Distinct processes and mappings must share the same tenant
+            # capacity, including reservations for a different protocol.
+            policy()
+            used=[local,ingress,relay]
+            def alloc(lo,hi,kind=socket.SOCK_STREAM):
+                value=free(lo,hi,used,kind)
+                used.append(value)
+                return value
+            def new_mapping(token,device,protocol,target):
+                port=alloc(20000,29999,socket.SOCK_DGRAM if protocol=="udp" else socket.SOCK_STREAM)
+                item=call(base,"mappings",201,"POST",token,{"device_id":device["id"],"node_id":node,"protocol":protocol,"local_port":target,"bind_port":port})
+                return item
+            def inventory(token=admin):
+                return call(base,"commercial/entitlement",200,token=token)["entitlement"]
+            def spawn_tcp(item,bundle,token=admin):
+                path="mappings/"+item["id"]
+                q=call(base,path+"/tcp-start",202,"POST",token,{"expected_revision":item["revision"]})
+                port=alloc(30000,60000)
+                child=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),item["id"],str(item["revision"]),str(port),bundle,"65536"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                children.append(child)
+                return child,q["request_id"],path,port,bundle
+            def ready_tcp(run):
+                child,rid,path,port,bundle=run
+                line(child,"TCP_PREVIEW_READY",45)
+                manifest=json.loads((root/bundle/"manifest.json").read_text())
+                assert manifest["byte_rate"]==65536
+                return manifest["tcp_limiter_port"]
+            def stop_run(run,token=admin):
+                child,rid,path,port,bundle=run
+                call(base,path+"/stop",202,"POST",token,{"request_id":rid})
+                assert child.wait(timeout=15)==0
+                assert call(base,path+"/runtime",200,token=token)["request"]["state"]=="stopped"
+                assert not (root/bundle).exists()
+            a=new_mapping(admin,device,"tcp",local)
+            b=new_mapping(admin,device,"tcp",local)
+            run_a=spawn_tcp(a,"aggregate_a")
+            run_b=spawn_tcp(b,"aggregate_b")
+            ready_tcp(run_a)
+            ready_tcp(run_b)
+            assert inventory()["reserved_bytes_per_second"]==131072 and inventory()["bandwidth_reservations"]==2
+            started=time.monotonic()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures=[pool.submit(exchange,262144,item["bind_port"]) for item in (a,b)]
+                for f in futures:f.result()
+            elapsed=time.monotonic()-started
+            assert 3.8<=elapsed<=30
+            report["tenant_tcp_measurements"]={"bytes_each_direction":524288,"elapsed_seconds":elapsed}
+            report["real_tenant_two_tcp_workers_share_fixed_budget"]=True
+            # Another owner may reserve the same amount independently.
+            other_ent=inventory(other)
+            command("--commercial-assign",{"tenant_id":other_ent["tenant_id"],"plan_id":plan,"expected_revision":other_ent["revision"],"state":"active","expires_at":None})
+            pair=call(base,"devices/pairing-code",200,"POST",other)["pairing_code"]
+            other_device=call(base,"devices/enroll",201,"POST",data={"pairing_code":pair,"name":"Other TCP"})
+            other_map=new_mapping(other,other_device,"tcp",local)
+            run_other=spawn_tcp(other_map,"aggregate_other",other)
+            ready_tcp(run_other)
+            exchange(1024,other_map["bind_port"])
+            assert inventory(other)["reserved_bytes_per_second"]==65536
+            assert inventory()["reserved_bytes_per_second"]==131072
+            stop_run(run_other,other)
+            assert inventory(other)["bandwidth_reservations"]==0
+            report["real_tenant_bandwidth_owner_isolation"]=True
+            # A UDP worker cannot acquire a third budget while TCP owns it.
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp:
+                udp.bind(("127.0.0.1",alloc(30000,60000,socket.SOCK_DGRAM)))
+                udp.settimeout(.2)
+                udp_local=udp.getsockname()[1]
+                stop_echo=threading.Event()
+                def udp_echo():
+                    while not stop_echo.is_set():
+                        try:
+                            data,peer=udp.recvfrom(65535)
+                            udp.sendto(data,peer)
+                        except socket.timeout:continue
+                        except OSError:return
+                echo_thread=threading.Thread(target=udp_echo,daemon=True)
+                echo_thread.start()
+                try:
+                    def spawn_udp(item,bundle):
+                        path="mappings/"+item["id"]
+                        q=call(base,path+"/udp-start",202,"POST",admin,{"expected_revision":item["revision"]})
+                        rp=alloc(30000,60000)
+                        ip=alloc(30000,60000,socket.SOCK_DGRAM)
+                        child=subprocess.Popen([exe,"--runtime-udp-worker",str(root),item["id"],str(item["revision"]),str(rp),str(ip),bundle,"65536","1200"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                        children.append(child)
+                        return child,q["request_id"],path,rp,ip
+                    denied=new_mapping(admin,device,"udp",udp_local)
+                    child,denied_rid,denied_path,rp,ip=spawn_udp(denied,"aggregate_denied")
+                    assert child.wait(timeout=15)!=0
+                    assert "UDP_PREVIEW_READY" not in child.stdout.read()
+                    assert call(base,denied_path+"/runtime",200,token=admin)["request"]["state"]=="failed_or_unknown"
+                    assert inventory()["reserved_bytes_per_second"]==131072
+                    report["real_tenant_cross_protocol_over_budget_denied"]=True
+                    stop_run(run_a)
+                    assert inventory()["reserved_bytes_per_second"]==65536
+                    allowed=new_mapping(admin,device,"udp",udp_local)
+                    child,udp_rid,udp_path,rp,ip=spawn_udp(allowed,"aggregate_udp")
+                    line(child,"UDP_PREVIEW_READY",45)
+                    assert inventory()["reserved_bytes_per_second"]==131072
+                    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
+                        probe.settimeout(2)
+                        data=secrets.token_bytes(128)
+                        probe.sendto(data,("127.0.0.1",allowed["bind_port"]))
+                        assert probe.recvfrom(65535)==(data,("127.0.0.1",allowed["bind_port"]))
+                    exchange(1024,b["bind_port"])
+                    call(base,udp_path+"/stop",202,"POST",admin,{"request_id":udp_rid})
+                    assert child.wait(timeout=15)==0
+                    assert inventory()["reserved_bytes_per_second"]==65536
+                    stop_run(run_b)
+                    assert inventory()["reserved_bytes_per_second"]==0 and inventory()["bandwidth_reservations"]==0
+                    report["real_tenant_released_budget_reused_by_other_protocol"]=True
+                finally:
+                    stop_echo.set()
+                    echo_thread.join(timeout=2)
+            # A killed supervisor cannot prove cleanup; capacity must remain
+            # reserved in SQLite even though its children receive PDEATHSIG.
+            crashed=spawn_tcp(a,"aggregate_crash")
+            ready_tcp(crashed)
+            crashed[0].kill()
+            crashed[0].wait(timeout=10)
+            assert inventory()["reserved_bytes_per_second"]==65536
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT mapping_id,request_id,rate_bytes_per_second FROM bandwidth_reservations").fetchall()==[(a["id"],crashed[1],65536)]
+            survivor=spawn_tcp(b,"aggregate_survivor")
+            ready_tcp(survivor)
+            exchange(1024,b["bind_port"])
+            assert inventory()["reserved_bytes_per_second"]==131072
+            extra=new_mapping(admin,device,"tcp",local)
+            denied_run=spawn_tcp(extra,"aggregate_crash_denied")
+            assert denied_run[0].wait(timeout=15)!=0
+            assert "TCP_PREVIEW_READY" not in denied_run[0].stdout.read()
+            stop_run(survivor)
+            assert inventory()["reserved_bytes_per_second"]==65536
+            assert inventory()["bandwidth_reservations"]==1
+            report["real_tenant_crash_reservation_fail_closed"]=True
         finally:
             for p in reversed(children):
                 if p.poll() is None:
@@ -183,4 +319,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len([v for v in report.values() if v is True])==5
+assert len([v for v in report.values() if v is True])==10
