@@ -36,6 +36,9 @@ def exercise(d, binary, cli, body, local_port, private, public, results, port, w
     print("Native CLI staging: build links =",build_meta.st_nlink,
           "build mode =",oct(build_meta.st_mode&0o777),
           "installed links =",installed_meta.st_nlink,flush=True)
+    if os.environ.get("LOCALTUNNEL_NATIVE_AGENT_PACKAGE_E2E")=="1":
+        from unix_agent_package_e2e import exercise as package_exercise
+        agent_cli,binary=package_exercise(project,d,agent_cli,binary,results)
     root=d/"agent-store"
     def command(*args,data=b"",success=True,exe=agent_cli):
         p=subprocess.run([str(exe),*map(str,args)],input=data,capture_output=True,timeout=10)
@@ -118,6 +121,12 @@ def exercise(d, binary, cli, body, local_port, private, public, results, port, w
         if os.environ.get("LOCALTUNNEL_NATIVE_AGENT_SERVICE_E2E")=="1":
             from unix_agent_service_e2e import exercise as service_exercise
             service_exercise(root,agent_cli,url,body,relay,token,results,get)
+        if os.environ.get("LOCALTUNNEL_NATIVE_AGENT_PACKAGE_E2E")=="1":
+            package_report=json.loads((results/"unix-package.json").read_text(encoding="utf-8"))
+            assert package_report["agent_cli_sha256"]==report["agent_cli_sha256"]
+            assert package_report["engine_sha256"]==report["engine_sha256"]
+            package_report["real_installed_package_tunnel_process_and_service"]=True
+            (results/"unix-package.json").write_text(json.dumps(package_report,indent=2),encoding="utf-8")
         # Ship only the verified CLI in the existing CI artifact, never config.
         dist=project/"native-dist"
         dist.mkdir(exist_ok=True)
