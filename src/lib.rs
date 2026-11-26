@@ -1,6 +1,7 @@
 pub mod managed_gateway;
 pub mod certificates;
 pub mod gateway;
+pub mod udp_guard;
 #[cfg(unix)]
 pub mod unix_agent_store;
 #[cfg(unix)]

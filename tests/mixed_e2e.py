@@ -169,6 +169,8 @@ def exercise(d,binary,cli,private,public,results,port,terminate,get,body,local_t
         ready(relay,agent,[0,1])
         report["passed"].append("all mixed mappings recover after relay restart")
         assert len(report["passed"])==5
+        from udp_guard_e2e import exercise as guard_exercise
+        guard_exercise(cli,mapped[0],seen[0],results,terminate)
     finally:
         for p in reversed(processes):
             terminate(p)
