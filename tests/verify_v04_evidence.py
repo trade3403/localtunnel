@@ -265,6 +265,11 @@ REQUIRED["management-v08"] = {
         "real_authenticated_owner_inventory_isolation",
         "real_policy_state_and_revoked_session_observation",
         "real_restart_persistence_and_commercial_readiness",
+        "real_operator_versioned_immutable_plan_creation",
+        "real_operator_atomic_account_and_plan_assignment",
+        "real_created_account_login_and_no_http_policy_mutation",
+        "real_assignment_optimistic_concurrency_expiry_and_renewal",
+        "real_committed_operator_audit_and_owner_isolation",
     ],
 }
 

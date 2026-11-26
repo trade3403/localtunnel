@@ -51,8 +51,14 @@ fn verify(password:&str,encoded:&str)->bool{
     }
     hasher().verify_password(password.as_bytes(),&h).is_ok()
 }
-fn valid(c:&Credentials)->bool{
-    (3..=64).contains(&c.username.len()) && c.username.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-') && (12..=256).contains(&c.password.len())
+fn valid(c:&Credentials)->bool{valid_parts(&c.username,&c.password)}
+fn valid_parts(username:&str,password:&str)->bool{
+    (3..=64).contains(&username.len()) && username.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'_'||b==b'-') && (12..=256).contains(&password.len())
+}
+// Trusted local operator path only; share the existing password policy.
+pub(crate) fn operator_password_hash(username:&str,password:&str)->Result<String,&'static str>{
+    if !valid_parts(username,password){return Err("invalid account credentials")}
+    hash(password).map_err(|_|"password hashing unavailable")
 }
 pub async fn init_admin(pool:&SqlitePool)->Result<(),Failure>{
     let mut input=Vec::new();

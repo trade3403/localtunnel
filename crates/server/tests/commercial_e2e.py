@@ -1,4 +1,5 @@
 """Real pre-0012 SQLx upgrade and owner-scoped commercial inventory."""
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import secrets
@@ -137,7 +138,96 @@ try:
             call(base,"/readyz",503)
             report["real_restart_persistence_and_commercial_readiness"]=True
         finally: stop(p)
+
+    # Separate live service and real operator commands. Never expose the
+    # operator's write authority through a tenant's HTTP session.
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp)
+        db_path=root/"control.sqlite3"
+        assert subprocess.run([exe,"--init-admin",str(root)],input=json.dumps({"username":"operator","password":password}).encode(),capture_output=True,timeout=20).returncode==0
+        customer_password=secrets.token_hex(24)
+        def command(action,data):
+            result=subprocess.run([exe,action,str(root)],input=json.dumps(data).encode(),capture_output=True,timeout=20)
+            assert customer_password.encode() not in result.stdout+result.stderr,"credential leaked in command output"
+            return result
+        def success(action,data):
+            result=command(action,data)
+            assert result.returncode==0,"operator action failed"
+            value=result.stdout.decode().strip()
+            assert len(value)==32 and all(ch in "0123456789abcdef" for ch in value)
+            return value
+        def reject(action,data):
+            result=command(action,data)
+            assert result.returncode!=0 and not result.stdout.strip(),"invalid operator action committed"
+        plan={"code":"starter","version":1,"name":"Starter fixture","max_active_devices":2,"max_retained_devices":4,
+              "max_mappings":3,"max_bandwidth_bps":1000000,"max_monthly_bytes":100000000,"max_concurrent_connections":5}
+        pid=success("--commercial-create-plan",plan)
+        reject("--commercial-create-plan",plan)
+        reject("--commercial-create-plan",{**plan,"version":2,"max_retained_devices":1})
+        reject("--commercial-create-plan",{**plan,"version":2,"max_monthly_bytes":0})
+        next_pid=success("--commercial-create-plan",{**plan,"version":2,"max_mappings":5})
+        with sqlite3.connect(db_path) as db:
+            try: db.execute("UPDATE commercial_plans SET max_mappings=99 WHERE id=?",(pid,))
+            except sqlite3.IntegrityError: pass
+            else: raise AssertionError("published policy mutated")
+            try: db.execute("DELETE FROM commercial_plans WHERE id=?",(pid,))
+            except sqlite3.IntegrityError: pass
+            else: raise AssertionError("published plan deleted")
+            assert db.execute("SELECT max_mappings FROM commercial_plans WHERE id=?",(pid,)).fetchone()==(3,)
+        report["real_operator_versioned_immutable_plan_creation"]=True
+        account={"username":"customer01","password":customer_password,"plan_id":pid,"expires_at":None}
+        reject("--commercial-create-account",{**account,"plan_id":"f"*32})
+        reject("--commercial-create-account",{**account,"role":"admin"})
+        reject("--commercial-create-account",{**account,"password":"short"})
+        tenant=success("--commercial-create-account",account)
+        reject("--commercial-create-account",{**account,"username":"CUSTOMER01"})
+        with sqlite3.connect(db_path) as db:
+            assert db.execute("SELECT count(*) FROM users").fetchone()==(2,)
+            phc=db.execute("SELECT password_hash FROM users WHERE username='customer01'").fetchone()[0]
+            assert phc.startswith("$argon2id$") and customer_password not in phc
+            assert db.execute("SELECT plan_id,revision FROM tenant_entitlements WHERE tenant_id=?",(tenant,)).fetchone()==(pid,1)
+        report["real_operator_atomic_account_and_plan_assignment"]=True
+        p,base=launch(root)
+        try:
+            admin=call(base,"/api/v1/auth/login",200,"POST",data={"username":"operator","password":password})["access_token"]
+            customer=call(base,"/api/v1/auth/login",200,"POST",data={"username":"customer01","password":customer_password})["access_token"]
+            route="/api/v1/commercial/entitlement"
+            own=call(base,route,200,token=customer)["entitlement"]
+            assert own["tenant_id"]==tenant and own["plan_id"]==pid and own["max_mappings"]==3
+            assert call(base,route,200,token=admin)["entitlement"]["tenant_id"]!=tenant
+            call(base,route,405,"POST",customer,{"plan_id":next_pid})
+            call(base,route,405,"PATCH",customer,{"plan_id":next_pid})
+            report["real_created_account_login_and_no_http_policy_mutation"]=True
+            spec={"tenant_id":tenant,"plan_id":next_pid,"expected_revision":1,"state":"active","expires_at":1}
+            reject("--commercial-assign",{**spec,"expected_revision":2})
+            reject("--commercial-assign",{**spec,"plan_id":"f"*32})
+            assert success("--commercial-assign",spec)==tenant
+            expired=call(base,route,200,token=customer)["entitlement"]
+            assert expired["revision"]==2 and expired["plan_id"]==next_pid and expired["effective_state"]=="expired"
+            reject("--commercial-assign",spec)
+            renewal={**spec,"expected_revision":2,"expires_at":None}
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results=list(executor.map(lambda value:command("--commercial-assign",value),[renewal,{**renewal,"state":"suspended"}]))
+            assert sum(result.returncode==0 for result in results)==1,"concurrent revision check failed"
+            current=call(base,route,200,token=customer)["entitlement"]
+            assert current["revision"]==3 and current["state"] in ("active","suspended") and current["expires_at"] is None
+            assert success("--commercial-assign",{**renewal,"expected_revision":3})==tenant
+            assert call(base,route,200,token=customer)["entitlement"]["effective_state"]=="active"
+            report["real_assignment_optimistic_concurrency_expiry_and_renewal"]=True
+            with sqlite3.connect(db_path) as db:
+                audit=db.execute("SELECT event,tenant_id,plan_id,revision,state,expires_at FROM commercial_operator_audit ORDER BY seq").fetchall()
+                assert len(audit)==6
+                assert audit[:3]==[("plan.created",None,pid,1,None,None),("plan.created",None,next_pid,2,None,None),("account.created",tenant,pid,1,"active",None)]
+                assert [row[3] for row in audit[3:]]==[2,3,4]
+                assert all(row[0]=="entitlement.assigned" and row[1]==tenant and row[2]==next_pid for row in audit[3:])
+                assert customer_password not in repr(audit)
+            owner_audit=call(base,"/api/v1/audit",200,token=customer)["events"]
+            assert sorted(e["revision"] for e in owner_audit if e["event"]=="commercial.entitlement_assigned")==[2,3,4]
+            assert any(e["event"]=="commercial.account_created" for e in owner_audit)
+            assert not any(e["event"].startswith("commercial.") for e in call(base,"/api/v1/audit",200,token=admin)["events"])
+            report["real_committed_operator_audit_and_owner_isolation"]=True
+        finally: stop(p)
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==5 and all(value is True for value in report.values())
+assert len(report)==10 and all(value is True for value in report.values())
