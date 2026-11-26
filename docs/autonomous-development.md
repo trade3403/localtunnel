@@ -506,3 +506,7 @@
 - 实际核验 Linux [ZIP](https://github.com/trade3403/localtunnel/actions/runs/45836081652/artifacts/15126555526)，31392字节，SHA256 e59b44892cd7710d75b07234ee34ddcbcb1f90113b610f2f34a7b2024832a515；两组真实netem通过，每组每协议128次。10ms/0%组内核20181包、0丢包；Noise/TCP中位101.038571ms、p95 101.201390ms、59.198615Mbps；QUIC中位61.024463ms、p95 61.238600ms、57.812662Mbps。10ms/1%组24474包、251丢包；Noise/TCP中位101.037571ms、p95 734.237146ms、22.253115Mbps；QUIC中位61.093671ms、p95 182.930661ms、4.331720Mbps。内核计数含所有回环腿，不能作为单一隧道链路统计；当前QUIC在此实验尾延迟有优势但吞吐偏低，非Rust产品对照。
 - 本轮在独立实验的应用注册及转发任务入口实施同步有界接纳（4个全局注册任务、8个转发任务，不创建等待队列；超额注册DENIED、转发EOF）；保留原有5/8秒期限、TLS/ALPN/令牌和全部旧门禁。新 tests/quic_resilience.py 使用真实不完整流占满上限，验证超额拒绝、业务未到达本地fixture、完成/释放后真实二进制业务恢复。新增真实回环UDP双向转发开关，实际断流后等原10秒idle_timeout触发注册清除，拒绝旧注册访问；恢复后新TLS连接，先拒绝错误令牌再通过正确令牌，验证新随机echo，记录实际转发/丢弃数据报数、注册失效时间及重新连接耗时。
 - Linux Gateway独立强制步骤生成quic-resilience.json（原6组及新增3组）。只限制应用接纳任务，不宣称限制aioquic握手/内部stream缓存、总连接或内核资源；恢复是显式新连接，不是自动重连、连接迁移或生产网络故障保证。未新增依赖、未改产品协议、未改main或部署。后续以实际报告决策是否暂缓QUIC集成，再推进Windows UDP SCM、计量和管理控制。
+
+## V0.7 第九增量：QUIC 技术选型已决定（决策提交待 CI）
+- 基线 `06231df415278f8dfb0080b2a2f65071d70ac81b` 7/7 CI全部成功，Linux Gateway实际断流与资源上限专项通过。真实证据、四轮配对数值、依赖元数据及完整审计缺口已整理至 [v0.7-quic-decision.md](v0.7-quic-decision.md)。本轮作出暂缓正式采用的技术决定：保留Noise/TCP产品数据平面与UDP-over-Noise/TCP，保留全部QUIC实验；不新增运行时依赖或修改安全门禁。
+- 下一增量Windows SCM UDP：已定位main.rs supervisor、service_provision/control/host、credentials、service_tunnel_e2e.py，要求实际服务混合转发、未知计量不误报、DPAPI/ACL/引擎完整性及TCP回归。此轮未修改产品或CI，仅记录可追溯的选型结果和明确的后续实现边界，不宣称SCM UDP已完成。
