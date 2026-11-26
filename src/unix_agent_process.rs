@@ -137,6 +137,13 @@ fn lock(root: &Path) -> Result<File> {
     Ok(file)
 }
 
+pub(crate) fn preflight(root: &Path) -> Result<()> {
+    private_dir(root)?;
+    checked_config(root)?;
+    verified_engine(&root.join(ENGINE),true)?;
+    Ok(())
+}
+
 pub fn run(root: &Path) -> Result<()> {
     private_dir(root)?;
     let config=checked_config(root)?;

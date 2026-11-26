@@ -99,6 +99,9 @@ def exercise(d, binary, cli, body, local_port, private, public, results, port, w
         assert len(report)==4 and all(v is True for v in report.values())
         report["engine_sha256"]=digest
         report["agent_cli_sha256"]=hashlib.sha256(agent_cli.read_bytes()).hexdigest()
+        if os.environ.get("LOCALTUNNEL_NATIVE_AGENT_SERVICE_E2E")=="1":
+            from unix_agent_service_e2e import exercise as service_exercise
+            service_exercise(root,agent_cli,url,body,relay,token,results,get)
         # Ship only the verified CLI in the existing CI artifact, never config.
         dist=project/"native-dist"
         dist.mkdir(exist_ok=True)
