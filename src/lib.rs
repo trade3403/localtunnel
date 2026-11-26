@@ -1,6 +1,12 @@
 pub mod managed_gateway;
 pub mod certificates;
 pub mod gateway;
+#[cfg(unix)]
+pub mod unix_agent_store;
+#[cfg(unix)]
+pub mod unix_agent_process;
+#[cfg(any(target_os="linux",target_os="macos"))]
+pub mod unix_agent_service;
 use std::net::SocketAddr;
 
 const PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
