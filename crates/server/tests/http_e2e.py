@@ -62,7 +62,7 @@ def assert_migrations(db):
     migrations = Path(__file__).resolve().parents[1] / "migrations"
     expected = [(int(path.stem.split("_", 1)[0]), 1, hashlib.sha384(path.read_bytes()).digest())
                 for path in sorted(migrations.glob("*.sql"))]
-    assert [version for version, _, _ in expected] == list(range(1, 12))
+    assert [version for version, _, _ in expected] == list(range(1, 13))
     actual = db.execute("SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version").fetchall()
     assert actual == expected, "database migration inventory or checksum mismatch"
 

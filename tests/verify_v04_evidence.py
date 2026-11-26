@@ -256,6 +256,18 @@ REQUIRED["management-v05"] = {
     ],
 }
 
+# V0.8 extends rather than replaces existing management gates.
+REQUIRED["management-v08"] = {
+    **REQUIRED["management-v05"],
+    "commercial.json": [
+        "real_legacy_upgrade_preserves_existing_owner_data",
+        "fresh_bootstrap_and_legacy_tenant_assignment",
+        "real_authenticated_owner_inventory_isolation",
+        "real_policy_state_and_revoked_session_observation",
+        "real_restart_persistence_and_commercial_readiness",
+    ],
+}
+
 def unique_object(pairs):
     obj = {}
     for key, value in pairs:

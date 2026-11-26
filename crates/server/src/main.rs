@@ -1,5 +1,6 @@
 mod auth;
 mod devices;
+mod commercial;
 mod mappings;
 mod nodes;
 mod domains;
@@ -25,10 +26,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(12) => (StatusCode::OK, "ready"),
+        Ok(15) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -238,6 +239,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .with_state(pool.clone())
         .merge(auth::routes(auth))
         .merge(devices::routes(pool.clone(),root.clone()))
+        .merge(commercial::routes(pool.clone()))
         .merge(mappings::routes(pool.clone()))
         .merge(nodes::routes(pool.clone()))
         .merge(runtime::routes(pool.clone()))

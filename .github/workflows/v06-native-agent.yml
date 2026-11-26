@@ -1,7 +1,7 @@
 name: V0.6 Native Agent CI
 on:
   pull_request:
-    branches: ['feat/v0.5-security-stability', 'feat/v0.6-cross-platform']
+    branches: ['feat/v0.5-security-stability', 'feat/v0.6-cross-platform', 'feat/v0.7-udp-quic', 'feat/v0.8-commercial-management']
   workflow_dispatch:
 permissions:
   contents: read
