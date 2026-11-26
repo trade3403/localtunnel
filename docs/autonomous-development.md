@@ -422,3 +422,7 @@
 - 新增 packaging/unix/install.py（Python3标准库、非root、明确目标及外部可信SHA256）、README.txt和真实安装测试。生成linux-x64/linux-arm64/macos-x64/macos-arm64各自tar.gz，包含已锁定引擎配套CLI、引擎、manifest逐文件SHA256、说明及与Windows既有同一上游Apache2.0 LICENSE和平台引擎provenance NOTICE。仅分发测试预览、不声称签名、公证、完整依赖许可审计或正式release。
 - 安装器限定64MiB、精确成员白名单/类型/大小/摘要、本机架构、拒绝路径穿越/链接/重复/覆盖、检查可信祖先，新目录0700、独立文件0700/0600；不使用tar.extract、不自动执行包、不自动注册服务、不保存凭据。安装失败只清理本次创建文件。调用需先通过可信来源取得installer和外部包摘要；SHA256不是签名。实际测试坏归档摘要、路径穿越、坏成员摘要、真实安装、权限、拒绝覆盖；从安装包副本执行原有实际引擎安装/Noise/进程/真实系统服务强杀恢复，全部通过才记录包验收。CI artifact包含对应tar.gz/install.py/SHA256SUMS及原CLI。现有门禁不降级。
 - 选择可移植tar.gz+Python3安装器而非.deb/.rpm/.pkg/.dmg，后者及图形界面、OS重启验证、用户服务产品注册CLI、升级回滚、签名/公证、公网E2E仍未完成；手工删除安装目录前须明确停止并卸载用户服务，私有store单独保留。下一步按CI结果完善验收/安装管理。未改main、未部署公网、未发布正式版本。
+
+## V0.6 开发预览最终验收
+- 功能基线 `9275d9bea8dc03c3decb490229e71e2f95ca2c78` 七项同SHA CI全部通过；下载并校验 Native run 45768028865 全部8个实际ZIP及四种内部安装包，核查四平台27个报告结果组/平台（108个平台-结果组）。真实安装后Noise、前台和systemd/launchd均成功。详见 [V0.6 验收记录](v0.6-acceptance.md)，含全部实际产物、SHA256、尺寸、限制和V0.7边界。
+- 本次为文档收尾提交，须等待其同SHA CI 再次全部成功方可从本分支创建V0.7叠加分支；不提前合并main或正式发布。
