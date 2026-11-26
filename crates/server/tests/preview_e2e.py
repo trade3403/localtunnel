@@ -400,9 +400,9 @@ try:
                 assert last["sampling_state"]=="partial" and last["requests"]>=rows[0]["requests"]
                 report["real_gateway_observed_bytes_and_owner_isolation"]=True
                 report["api_start_stop_scoped_request_real_worker"]=True
-                def policy(state="active",expires_at=None):
+                def policy(state="active",expires_at=None,plan_id=None):
                     e=expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
-                    spec={"tenant_id":e["tenant_id"],"plan_id":e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                    spec={"tenant_id":e["tenant_id"],"plan_id":plan_id or e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
                     p=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
                     assert p.returncode==0,"commercial assignment failed"
                 # A pending request cannot be revived by suspend/renew.
@@ -432,6 +432,49 @@ try:
                 expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),409)
                 policy()
                 report["real_http_commercial_expiry_and_queued_cancellation"]=True
+                # Use an actual published policy and the real supervised
+                # Noise tunnel, not a mocked bandwidth or gateway response.
+                plan={"code":"http-preview","version":1,"name":"Web bandwidth fixture",
+                      "max_active_devices":64,"max_retained_devices":256,"max_mappings":4096,
+                      "max_bandwidth_bps":1048576,"max_monthly_bytes":None,"max_concurrent_connections":None}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                capped=created.stdout.decode().strip()
+                policy(plan_id=capped)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"unlimited_bypass").returncode!=0
+                assert not (root/"unlimited_bypass").exists()
+                assert operator("--preview-gateway",mid3,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"commercial_bandwidth","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                    if current["state"]=="running":break
+                    time.sleep(.2)
+                else: raise AssertionError("capped HTTP worker not running")
+                manifest=json.loads((root/"commercial_bandwidth"/"manifest.json").read_text())
+                assert manifest["commercial_bandwidth_bps"]==1048576 and manifest["byte_rate"]==131072
+                assert manifest["byte_limit_scope"]=="per_mapping_per_direction_tcp_stream"
+                guard_port=manifest["tcp_limiter_port"]
+                assert guard_port not in (bp,rp,gp,fixture.server_port)
+                assert ("127.0.0.1:"+str(guard_port)) in (root/"commercial_bandwidth"/"client.toml").read_text()
+                measured=transfer(gp,"preview.example.test",[*processes,supervisor],workers=2,rounds=1)
+                assert measured["bytes_uploaded"]==measured["bytes_downloaded"]==524288
+                # Two independent sockets share one 131072 B/s direction
+                # budget; a 4096-byte initial burst is allowed.
+                assert 3.8<=measured["elapsed_seconds"]<=30
+                report["http_commercial_bandwidth_measurements"]=measured
+                policy(plan_id="legacy-v1")
+                assert supervisor.wait(timeout=40)==0
+                current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                assert current["request_id"]==queued["request_id"] and current["state"]=="stopped"
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                with socket.socket() as check:
+                    check.settimeout(.5)
+                    assert check.connect_ex(("127.0.0.1",guard_port))!=0
+                report["real_http_commercial_tcp_bandwidth_and_plan_change_cleanup"]=True
                 # Resident owns a single fixed mapping, but accepts multiple
                 # independently authorized requests without operator relaunch.
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)

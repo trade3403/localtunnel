@@ -6,12 +6,12 @@ use std::{ffi::OsString,fs,path::{Path,PathBuf},process::{Child,Command,Stdio},t
 
 type Result<T> = std::result::Result<T,&'static str>;
 #[derive(sqlx::FromRow)]
-struct Mapping {id:String,revision:i64,local_port:i64,bind_port:i64,hostname:String,protocol:String}
+struct Mapping {id:String,revision:i64,local_port:i64,bind_port:i64,hostname:String,protocol:String,bandwidth_bps:Option<i64>}
 async fn checked_protocol(pool:&SqlitePool,id:&str,revision:i64,protocol:&str)->Result<Mapping>{
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{return Err("invalid mapping identity")}
     // Only web protocols, disabled draft, currently enabled owner/device/node and a
     // recent successful TXT observation. This is not continuous DNS proof.
-    sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname,m.protocol FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND (?='web' OR m.protocol=?) AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch() AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()))")
+    sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname,m.protocol,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND (?='web' OR m.protocol=?) AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch() AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()))")
         .bind(id).bind(revision).bind(protocol).bind(protocol).fetch_optional(pool).await.map_err(|_|"mapping read failed")?.ok_or("preview requires current eligible web draft and recent TXT proof")
 }
 async fn checked(pool:&SqlitePool,id:&str,revision:i64)->Result<Mapping>{
@@ -57,8 +57,13 @@ fn mkdir(path:&Path)->Result<()>{
 fn mkdir(_path:&Path)->Result<()>{Err("Linux preview only")}
 
 pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,name:&str)->Result<()>{
+    export_inner(pool,root,id,revision,relay_port,name,None,None).await
+}
+async fn export_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,name:&str,limited_target:Option<u16>,expected_bps:Option<i64>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(name){return Err("invalid preview request")}
     let m=checked_protocol(pool,id,revision,"web").await?;
+    if m.bandwidth_bps!=expected_bps||m.bandwidth_bps.is_some()!=limited_target.is_some(){return Err("commercial web export requires supervised TCP limiter")}
+    let local_port=limited_target.map(i64::from).unwrap_or(m.local_port);
     let relay=port(relay_port)?;
     if i64::from(relay_port)==m.bind_port{return Err("conflicting relay port")}
     let core=core()?;
@@ -73,7 +78,7 @@ pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:
         let service=format!("m_{}",m.id);
         invoke(&core,&["server-config".into(),dir.join("server.toml").into_os_string(),relay.clone().into(),service.clone().into(),m.bind_port.to_string().into()],
             &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PRIVATE_KEY",&private)])?;
-        invoke(&core,&["client-config".into(),dir.join("client.toml").into_os_string(),relay.into(),service.into(),format!("127.0.0.1:{}",m.local_port).into()],
+        invoke(&core,&["client-config".into(),dir.join("client.toml").into_os_string(),relay.into(),service.into(),format!("127.0.0.1:{}",local_port).into()],
             &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PUBLIC_KEY",&public)])?;
         // Non-secret snapshot descriptor; do not claim runtime application.
         use std::io::Write;
@@ -81,7 +86,7 @@ pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:
         options.write(true).create_new(true);
         #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
         let mut file=options.open(dir.join("manifest.json")).map_err(|_|"manifest creation failed")?;
-        let manifest=serde_json::json!({"mapping_id":m.id,"revision":m.revision,"hostname":m.hostname,"bind_port":m.bind_port,"protocol":m.protocol,"scope":"operator_loopback_preview"});
+        let manifest=serde_json::json!({"mapping_id":m.id,"revision":m.revision,"hostname":m.hostname,"bind_port":m.bind_port,"protocol":m.protocol,"scope":"operator_loopback_preview","commercial_bandwidth_bps":expected_bps,"tcp_limiter_port":limited_target,"byte_rate":expected_bps.map(|bps|(bps/8).min(125000000)),"byte_limit_scope":"per_mapping_per_direction_tcp_stream"});
         file.write_all(manifest.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"manifest write failed")?;
         Ok(())
     })();
@@ -90,6 +95,9 @@ pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:
 }
 
 pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,mode:&str,expected_file:Option<&str>)->Result<()>{
+    gateway_inner(pool,root,id,revision,name,listen,mode,expected_file,false).await
+}
+async fn gateway_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,mode:&str,expected_file:Option<&str>,supervised:bool)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(name)||!matches!(mode,"init"|"apply"|"apply-checked")||(mode=="apply-checked")!=expected_file.is_some(){return Err("invalid preview request")}
     let dir=root.join(name);
     private_dir(&dir)?;
@@ -99,6 +107,7 @@ pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,
         if revision!=0||expected_file.is_some(){return Err("invalid clear revision")}
     }else{
         let m=checked(pool,id,revision).await?;
+        if m.bandwidth_bps.is_some()&&!supervised{return Err("commercial web gateway requires supervised TCP limiter")}
         if i64::from(listen)==m.bind_port{return Err("conflicting gateway port")}
         args.push(m.hostname.into());
         args.push(m.bind_port.to_string().into());
@@ -261,8 +270,8 @@ impl PreviewTransport<'_>{
     }
     async fn gateway(self,pool:&SqlitePool,root:&Path,id:&str,revision:i64,prefix:&str,listen:u16,mode:&str,expected_file:Option<&str>)->Result<()>{
         match self{
-            Self::Http=>gateway(pool,root,id,revision,prefix,listen,mode,expected_file).await,
-            Self::Https{probe,cert_dir}=>tls_gateway(pool,root,id,revision,prefix,listen,probe,cert_dir,mode,expected_file).await,
+            Self::Http=>gateway_inner(pool,root,id,revision,prefix,listen,mode,expected_file,true).await,
+            Self::Https{probe,cert_dir}=>tls_gateway_inner(pool,root,id,revision,prefix,listen,probe,cert_dir,mode,expected_file,true).await,
         }
     }
 }
@@ -304,7 +313,22 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     // Preserve recovery metadata and the empty gateway even when a prior
     // run's retained log inventory prevents admitting a new generation.
     crate::traffic::check_log_budget(&root.join(prefix),true)?;
-    export(pool,root,id,revision,relay_port,bundle).await?;
+    // Bind the guard before generating the client configuration. The
+    // encrypted tunnel can only reach the business fixture via this guard.
+    // The guard lives in this supervisor, not an independently orphanable process.
+    let mut limiter=match m.bandwidth_bps{
+        None=>None,
+        Some(bps)=>{
+            if bps<524288{return Err("commercial TCP bandwidth below preview minimum")}
+            let guard=crate::tcp_limit::Guard::start(m.local_port as u16,(bps/8).min(125000000) as u32)?;
+            if [relay_port,listen,m.bind_port as u16].contains(&guard.port())||
+                matches!(transport,PreviewTransport::Https{probe,..} if probe==guard.port()){
+                return Err("TCP limiter port conflicts with preview")
+            }
+            Some(guard)
+        },
+    };
+    export_inner(pool,root,id,revision,relay_port,bundle,limiter.as_ref().map(|g|g.port()),m.bandwidth_bps).await?;
     let mut children=TunnelChildren(Vec::new());
     let mut meter=None;
     let result=async {
@@ -312,6 +336,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
         if let Some(rid)=request{
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
+        if checked_protocol(pool,id,revision,transport.protocol()).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
         children.start(&engine,&root.join(bundle).join("server.toml"))?;
         children.start(&engine,&root.join(bundle).join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
@@ -320,7 +345,8 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
             if let Some(rid)=request{
                 if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
             }
-            checked_protocol(pool,id,revision,transport.protocol()).await?;
+            if checked_protocol(pool,id,revision,transport.protocol()).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
+            if limiter.as_ref().is_some_and(|g|!g.healthy()){return Err("TCP limiter exited")}
             if !children.healthy(){return Err("tunnel child exited")}
             if relay_probe(&m,&expected){break}
             if Instant::now()>=deadline{return Err("relay business probe timeout")}
@@ -330,13 +356,18 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
         if let Some(rid)=request{
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
+        if checked_protocol(pool,id,revision,transport.protocol()).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
         transport.gateway(pool,root,id,revision,prefix,listen,"apply-checked",Some(expected_file)).await?;
         if request.is_some(){meter=Some(crate::traffic::Meter::new(&root.join(prefix)));}
         // Authorization is re-read after apply and every 500ms. Database
         // errors also fail closed. DNS age is checked, not continuous DNS.
         loop{
             if stop_requested(stop_marker)?{return Ok(())}
-            if checked_protocol(pool,id,revision,transport.protocol()).await.is_err(){return Ok(())}
+            match checked_protocol(pool,id,revision,transport.protocol()).await{
+                Ok(current) if current.bandwidth_bps==m.bandwidth_bps=>{},
+                _=>return Ok(()),
+            }
+            if limiter.as_ref().is_some_and(|g|!g.healthy()){return Err("TCP limiter exited")}
             if !children.healthy(){return Err("tunnel child exited")}
             // Sampled every supervisor iteration. This is a soft admission
             // threshold, not a filesystem-enforced hard byte quota.
@@ -350,9 +381,11 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     }.await;
     // Stop owned tunnel processes even if the gateway clear fails.
     let stopped=children.stop();
+    let limited=match limiter.as_mut(){Some(g)=>g.stop(),None=>Ok(())};
     let cleared=transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await;
     if let (Some(meter),Some(rid))=(meter.as_mut(),request){meter.sample(pool,id,revision,rid,true).await;}
     stopped?;
+    limited?;
     cleared?;
     // Only resident-owned, freshly created bundle is removed after a known
     // clean result. Failed/unknown runs retain evidence for the operator.
@@ -366,6 +399,9 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
 /// TLS preview deliberately requires an immutable, private operator-owned
 /// certificate directory. Empty configurations reject all TLS handshakes.
 pub async fn tls_gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,probe:u16,cert_dir:&str,mode:&str,expected_file:Option<&str>)->Result<()>{
+    tls_gateway_inner(pool,root,id,revision,name,listen,probe,cert_dir,mode,expected_file,false).await
+}
+async fn tls_gateway_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,probe:u16,cert_dir:&str,mode:&str,expected_file:Option<&str>,supervised:bool)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(name)||!safe_name(cert_dir)||name==cert_dir||listen==probe||
         !matches!((mode,id),("init","clear")|("apply","clear")|("apply-checked",_))||
         (mode=="apply-checked")!=expected_file.is_some(){return Err("invalid TLS preview request")}
@@ -390,6 +426,7 @@ pub async fn tls_gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&
         if revision!=0||expected_file.is_some(){return Err("invalid clear revision")}
     }else{
         let m=checked_protocol(pool,id,revision,"https").await?;
+        if m.bandwidth_bps.is_some()&&!supervised{return Err("commercial TLS gateway requires supervised TCP limiter")}
         if i64::from(listen)==m.bind_port||i64::from(probe)==m.bind_port{return Err("conflicting TLS gateway port")}
         args.push(m.hostname.into());
         args.push(m.bind_port.to_string().into());

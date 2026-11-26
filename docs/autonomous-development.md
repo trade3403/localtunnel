@@ -628,3 +628,11 @@
 - 生成私有manifest记录实际byte_rate、burst_bytes、commercial_bandwidth_bps及范围；启动前再次核查cap，运行周期检查cap变化，关闭旧入口及中转，不自动续用旧预算。操作员套餐分配事务对变更套餐的活动managed UDP请求锁存stopping，即使立即恢复也不能取消，旧queued请求取消逻辑保留。手工预览无管理请求的锁存，轮询间短暂政策变化可能未观察到。管理API新增udp_bandwidth_scope，整体commercial_enforcement仍false。
 - 新增边界单测及3组真实管理UDP测试：实际CLI创建/分配16384 bits/s套餐，手工预览实际2048 B/s、1200 burst和回显，低于支持范围拒绝；API worker较高240000 B/s/76800 burst被真实商业预算收紧，发送5个800字节数据报，实际echo fixture与客户端收到的回包符合令牌桶窗口并有丢弃；套餐变化后旧请求关闭且端口释放，快速恢复legacy也不复用旧会话。16组UDP预览报告布尔检查及新增强制字段；原14组商业库存/准入测试和既有安全门禁保留。新提交尚待CI，未本地编译或执行真实引擎。
 - 后续需实现TCP/HTTP/HTTPS真实限速、租户聚合上限、持久月度流量和并发配额；内部端口及绕过受控入口的独立引擎不受当前UDP guard约束，不能宣称生产级不可绕过计费或全协议带宽已经完成。继续V0.9解耦、单机兼容架构。未改main，未新增依赖。
+
+## V0.8 第六增量：HTTP/HTTPS 受控 TCP 双向带宽限制（待 CI）
+- 基线 `72823b3cb30188cb1312d2b4272196cd6a53f351` 同SHA 7/7成功：[Hosted PR](https://github.com/trade3403/localtunnel/actions/runs/45903351405)/[push](https://github.com/trade3403/localtunnel/actions/runs/45903346053)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45903351427)，[Native](https://github.com/trade3403/localtunnel/actions/runs/45903351403)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45903351511)，[Management PR](https://github.com/trade3403/localtunnel/actions/runs/45903351433)/[push](https://github.com/trade3403/localtunnel/actions/runs/45903346194)。上一增量UDP真实套餐限速已通过。
+- 新增tcp_limit.rs，无新增依赖。独立回环监听器及每映射一个有界轮询线程，最多32活动TCP连接，每连接两方向各4096字节缓冲，单方向共享令牌桶、4096字节初始突发，按实际成功socket write扣费，保留半关闭语义、120秒无进展回收、250ms连接超时、轮转服务顺序。停止/崩溃关闭监听及所有连接。不是计费字节、线路吞吐、租户汇总或可配置并发额度。
+- 受控HTTP/HTTPS supervisor生成Noise client配置时以限速器回环端口代替业务端口，业务TCP流包括HTTP报文头及请求/响应体经双向预算；relay端口及恢复记录保持不变。现阶段两端同机，限制器与supervisor同进程，尚未实现跨主机relay强制限速。套餐bps转换为floor(bps/8)，最小65536 B/s（524288 bits/s），最大125000000 B/s；低于预览支持范围拒绝启动，不放宽配额。2ms轮询及固定burst意味着实际高档吞吐可能明显低于配置值，不承诺达到该速率。null保持原运行行为。
+- 启动前及运行期重新读取带宽配置，cap变化或guard异常关闭会话；managed HTTP/HTTPS/UDP套餐变更事务锁存stopping，取消旧queued；恢复仍须新请求。限速套餐禁止独立export和独立非清空gateway apply；原有可信操作员持有已导出配置、同机直接访问业务/内部端口或绕过控制的进程仍可绕过，不宣称生产隔离。单独TCP映射的管理运行路径尚未实现，本次TCP限速器仅接入HTTP/HTTPS。
+- 新增真实TCP单测，两并发连接共享预算，分别核查真实上传与下载阶段下界、半关闭、数据一致性、停止后端口不可达。HTTP/HTTPS真实集成分别发布1048576 bits/s套餐，验证导出/独立apply拒绝、受控Noise实际转发、2并发各256KiB随机回显（双方向各512KiB、SHA256和完整数据、共享限速耗时下界3.8s），切回legacy后旧请求停止、网关清空、guard端口关闭；保留原16事务回归测试默认参数。两组新增强制证据字段，测量结果由CI产生，当前未实际运行，不虚构数值。
+- 下一增量：扩展单独TCP运行路径及租户共享预算，月度流量持久化/并发额度与商业UI。V0.9控制面数据面完全解耦和单机部署兼容要求保持。未改main，未降低原测试门禁。

@@ -383,9 +383,9 @@ try:
                 assert request(bp,hostname) is None
                 assert request(probe,"localtunnel-probe.invalid")[0]==421
                 report["real_https_runtime_api_start_stop"]=True
-                def policy(state="active",expires_at=None):
+                def policy(state="active",expires_at=None,plan_id=None):
                     e=expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
-                    spec={"tenant_id":e["tenant_id"],"plan_id":e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                    spec={"tenant_id":e["tenant_id"],"plan_id":plan_id or e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
                     p=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
                     assert p.returncode==0,"commercial assignment failed"
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
@@ -410,6 +410,53 @@ try:
                 assert request(bp,hostname) is None
                 assert request(probe,"localtunnel-probe.invalid")[0]==421
                 report["real_https_commercial_suspend_latches_stop_across_renewal"]=True
+                # Use an actual published policy and the real supervised
+                # Noise tunnel, not a mocked bandwidth or gateway response.
+                plan={"code":"https-preview","version":1,"name":"Web bandwidth fixture",
+                      "max_active_devices":64,"max_retained_devices":256,"max_mappings":4096,
+                      "max_bandwidth_bps":1048576,"max_monthly_bytes":None,"max_concurrent_connections":None}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                capped=created.stdout.decode().strip()
+                policy(plan_id=capped)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"unlimited_bypass").returncode!=0
+                assert not (root/"unlimited_bypass").exists()
+                assert operator("--preview-tls-gateway",mid3,1,"tls_gateway",gp,probe,"cert_v2","apply-checked","expected_body").returncode!=0
+                queued=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-tls-worker",str(root),mid3,"1",str(rp),"commercial_bandwidth","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                end=time.monotonic()+45
+                while time.monotonic()<end:
+                    assert supervisor.poll() is None
+                    current=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                    try:
+                        if current["state"]=="running" and tls_request(gp,hostname,ca2)==(200,body):break
+                    except (OSError,http.client.HTTPException):pass
+                    time.sleep(.25)
+                else: raise AssertionError("capped HTTPS worker not running")
+                manifest=json.loads((root/"commercial_bandwidth"/"manifest.json").read_text())
+                assert manifest["commercial_bandwidth_bps"]==1048576 and manifest["byte_rate"]==131072
+                assert manifest["byte_limit_scope"]=="per_mapping_per_direction_tcp_stream"
+                guard_port=manifest["tcp_limiter_port"]
+                assert guard_port not in (bp,rp,gp,fixture.server_port)
+                assert ("127.0.0.1:"+str(guard_port)) in (root/"commercial_bandwidth"/"client.toml").read_text()
+                measured=transfer(gp,hostname,[*processes,supervisor],ca2,workers=2,rounds=1)
+                assert measured["bytes_uploaded"]==measured["bytes_downloaded"]==524288
+                # Two independent sockets share one 131072 B/s direction
+                # budget; a 4096-byte initial burst is allowed.
+                assert 3.8<=measured["elapsed_seconds"]<=30
+                report["https_commercial_bandwidth_measurements"]=measured
+                policy(plan_id="legacy-v1")
+                assert supervisor.wait(timeout=40)==0
+                current=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                assert current["request_id"]==queued["request_id"] and current["state"]=="stopped"
+                rejects(gp,hostname,ca2)
+                assert request(bp,hostname) is None
+                assert request(probe,"localtunnel-probe.invalid")[0]==421
+                with socket.socket() as check:
+                    check.settimeout(.5)
+                    assert check.connect_ex(("127.0.0.1",guard_port))!=0
+                report["real_https_commercial_tcp_bandwidth_and_plan_change_cleanup"]=True
                 # Exercise the shared recovery mechanism with actual HTTPS,
                 # a verified certificate and two owned encrypted tunnel children.
                 import signal

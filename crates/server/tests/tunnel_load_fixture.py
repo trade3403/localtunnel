@@ -32,7 +32,7 @@ class EchoFixture:
         self.end_headers()
         self.wfile.write(payload)
 
-def transfer(port, hostname, processes, ca=None):
+def transfer(port, hostname, processes, ca=None, *, workers=WORKERS, rounds=ROUNDS):
     # Each transaction uses a different non-compressible random payload and
     # an independent socket. No retries, fake success, or external endpoints.
     ctx = ssl.create_default_context(cafile=str(ca)) if ca is not None else None
@@ -64,17 +64,17 @@ def transfer(port, hostname, processes, ca=None):
 
     latencies = []
     started = time.monotonic()
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for _ in range(ROUNDS):
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for _ in range(rounds):
             assert all(p.poll() is None for p in processes), "gateway or tunnel exited"
-            latencies.extend(pool.map(one, range(WORKERS)))
+            latencies.extend(pool.map(one, range(workers)))
     elapsed = time.monotonic() - started
     assert all(p.poll() is None for p in processes)
-    assert len(latencies) == WORKERS * ROUNDS and 0 < elapsed <= 60
+    assert len(latencies) == workers * rounds and 0 < elapsed <= 60
     verified_bytes = len(latencies) * PAYLOAD_BYTES
     ordered = sorted(latencies)
     return {
-        "transactions": len(latencies), "workers": WORKERS,
+        "transactions": len(latencies), "workers": workers,
         "bytes_uploaded": verified_bytes, "bytes_downloaded": verified_bytes,
         "elapsed_seconds": round(elapsed, 6),
         "combined_application_goodput_mbps": round(verified_bytes * 2 * 8 / elapsed / 1_000_000, 3),
