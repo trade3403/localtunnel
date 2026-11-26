@@ -494,6 +494,24 @@ async fn management_sync(app:tauri::AppHandle)->Result<serde_json::Value,String>
     #[cfg(not(windows))]{let _=app;Err("仅 Windows 支持设备配对".into())}
 }
 #[tauri::command]
+async fn management_import_udp(app:tauri::AppHandle,id:String,expected_revision:i64,mapping_revision:i64,confirmed:bool)->Result<profile::ProfileMapping,String>{
+    #[cfg(windows)]{
+        if !confirmed{return Err("请确认替换本地编辑草稿".into())}
+        let stopped=||->Result<(),String>{
+            let state=app.state::<Mutex<Supervisor>>();
+            let mut supervisor=state.lock().map_err(|_|"隧道状态不可用")?;
+            if supervisor.status()?.state=="running"{return Err("请先停止桌面隧道".into())}
+            Ok(())
+        };
+        stopped()?;
+        let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
+        let draft=management::import_udp_draft(&dir,&id,expected_revision,mapping_revision).await?;
+        stopped()?;
+        return Ok(draft)
+    }
+    #[cfg(not(windows))]{let _=(app,id,expected_revision,mapping_revision,confirmed);Err("仅 Windows 支持设备配对".into())}
+}
+#[tauri::command]
 fn management_snapshot()->Result<serde_json::Value,String>{
     #[cfg(windows)]{
         return serde_json::to_value(management::snapshot()?).map_err(|_|"管理状态格式无效".into())
@@ -592,7 +610,7 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port,management_saved,management_enroll,management_sync,management_snapshot,management_forget])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port,management_saved,management_enroll,management_sync,management_import_udp,management_snapshot,management_forget])
         .setup(|app| {
             #[cfg(windows)]
             {

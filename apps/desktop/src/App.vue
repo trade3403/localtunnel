@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 
 type ManagedDevice={port:number;id:string}
-type ManagedSync={id:string;name:string;revision:number;mappings:{id:string;protocol:string;local_port:number;bind_port:number;enabled:boolean}[];last_seen_at:number;heartbeat_interval_seconds:number}
+type ManagedSync={id:string;name:string;revision:number;mappings:{id:string;protocol:string;local_port:number;bind_port:number;enabled:boolean;revision:number}[];last_seen_at:number;heartbeat_interval_seconds:number}
 const managementPort=ref<number|null>(1431)
 const managementName=ref('Windows 客户端')
 const pairingCode=ref('')
@@ -21,6 +21,7 @@ async function refreshManagement(){
   try{
     const result=await invoke<{observation:ManagedSync|null;error:string|null;blocked:boolean}>('management_snapshot')
     if(generation!==managementGeneration||managementBusy.value)return
+    if(managedSync.value?.revision!==result.observation?.revision||managedSync.value?.id!==result.observation?.id)importConfirm.value=false
     managedSync.value=result.observation
     managementBlocked.value=result.blocked
     managementError.value=result.error||''
@@ -32,6 +33,22 @@ async function refreshManagement(){
 const managementMessage=ref('')
 const managementError=ref('')
 const forgetConfirm=ref(false)
+const importConfirm=ref(false)
+async function importManagedUdp(item:ManagedSync['mappings'][number]){
+  const snapshot=managedSync.value
+  if(!snapshot||!importConfirm.value||locked.value||managementBusy.value||managementBlocked.value||polling)return
+  const revision=snapshot.revision
+  managementGeneration++;managementBusy.value=true;busy.value=true;importConfirm.value=false
+  managementError.value='';managementMessage.value=''
+  try{
+    const draft=await invoke<{protocol:Protocol;name:string;localPort:number}>('management_import_udp',{id:item.id,expectedRevision:revision,mappingRevision:item.revision,confirmed:true})
+    if(running.value||serviceBusy.value)throw Error('隧道状态变化，未导入')
+    // Do not reuse credentials, an endpoint or an engine from a different mapping.
+    engine.value='';remote.value='';serverKey.value='';mappings.value=[{...draft,id:nextId++,token:''}]
+    managementMessage.value='UDP 草稿已导入，请填写独立中转参数及授权 Token；未启动隧道'
+  }catch(e){managementError.value=String(e);managedSync.value=null}
+  finally{busy.value=false;managementBusy.value=false;void refresh();void refreshManagement()}
+}
 async function loadManagement(){
   managementBusy.value=true
   try{
@@ -42,7 +59,7 @@ async function loadManagement(){
 }
 async function managementAction(action:'pair'|'sync'|'forget'){
   if(managementBusy.value||!managementReady.value)return
-  managementGeneration++;managementBusy.value=true;managementError.value='';managementMessage.value=''
+  managementGeneration++;managementBusy.value=true;importConfirm.value=false;managementError.value='';managementMessage.value=''
   try{
     if(action==='pair'){
       if(!Number.isInteger(managementPort.value)||Number(managementPort.value)<1024||Number(managementPort.value)>65535)throw Error('请输入 1024–65535 的管理端口')
@@ -412,7 +429,9 @@ async function toggle() {
         <div v-if="managedSync" aria-live="polite">
           <p>管理配置版本：{{managedSync.revision}} · 期望映射：{{managedSync.mappings.length}} · 管理模式：idle（未应用隧道配置）</p>
           <p class="hint">最近心跳：{{new Date(managedSync.last_seen_at*1000).toLocaleString()}}；自动同步间隔约30秒（请求耗时另计）。不是实际隧道在线证明。</p>
-          <p v-for="item in managedSync.mappings" :key="item.id" class="hint">{{item.protocol.toUpperCase()}} · 本地 {{item.local_port}} → 中转 {{item.bind_port}} · {{item.enabled?'期望启用':'草稿禁用'}}</p>
+          <label v-if="managedSync.mappings.some(m=>m.protocol==='udp'&&!m.enabled)"><input type="checkbox" aria-label="确认导入 UDP 草稿" v-model="importConfirm" :disabled="locked||managementBusy"/> 确认替换当前编辑表单并清空旧连接参数及 Token（不修改已保存配置或后台服务）</label>
+          <div v-for="item in managedSync.mappings" :key="item.id"><p class="hint">{{item.protocol.toUpperCase()}} · 本地 {{item.local_port}} → 中转 {{item.bind_port}} · {{item.enabled?'期望启用':'草稿禁用'}}</p>
+          <button v-if="item.protocol==='udp'&&!item.enabled" type="button" class="secondary" :disabled="locked||managementBusy||managementBlocked||!importConfirm" @click="importManagedUdp(item)">导入 UDP 草稿</button></div>
         </div>
         <p v-if="managementMessage" class="hint" role="status">{{managementMessage}}</p>
         <p v-if="managementError" class="error" role="alert">{{managementError}}</p>

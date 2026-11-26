@@ -145,6 +145,33 @@ pub async fn sync(dir:&Path)->Result<SyncResult,String>{
     record(&result)?;
     result
 }
+/// Explicit local draft import only. No server-provided relay endpoint,
+/// key, executable, token or permission to activate a tunnel.
+fn select_udp_draft(s:&SyncResult,id:&str,expected_revision:i64,mapping_revision:i64)->Result<crate::profile::ProfileMapping,String>{
+    if !hex(id,32)||expected_revision<1||mapping_revision<1||s.revision!=expected_revision{
+        return Err("管理配置版本已变化，请重新确认".into())
+    }
+    let mut rows=s.mappings.iter().filter(|m|m.id==id);
+    let m=rows.next().ok_or("管理映射不存在")?;
+    if rows.next().is_some()||m.revision!=mapping_revision||m.protocol!="udp"||m.enabled
+        ||m.domain_id.is_some()||m.local_host!="127.0.0.1"||m.local_port==0{
+        return Err("仅允许导入当前禁用 UDP 草稿".into())
+    }
+    Ok(crate::profile::ProfileMapping{protocol:"udp".into(),name:format!("m_{}",m.id),local_port:m.local_port})
+}
+pub async fn import_udp_draft(dir:&Path,id:&str,expected_revision:i64,mapping_revision:i64)->Result<crate::profile::ProfileMapping,String>{
+    let _guard=ACTION.lock().await;
+    if AUTO.lock().map_err(|_|"管理状态不可用")?.blocked{return Err(DENIED.into())}
+    // Fresh identity, coherent metadata and successful authenticated
+    // heartbeat are mandatory. Never import from cached UI state.
+    let result=match load(dir){
+        Ok(Some(s))=>sync_saved(s).await,
+        Ok(None)=>Err("请先配对设备".into()),
+        Err(e)=>Err(e),
+    };
+    record(&result)?;
+    select_udp_draft(&result?,id,expected_revision,mapping_revision)
+}
 pub async fn forget(dir:&Path)->Result<(),String>{
     let _guard=ACTION.lock().await;
     credentials::forget_management(dir)?;
@@ -178,6 +205,28 @@ pub async fn automatic(dir:PathBuf){
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn udp_import_rejects_stale_or_ineligible_metadata(){
+        let id="a".repeat(32);
+        let mut s=SyncResult{id:"b".repeat(32),name:"fixture".into(),revision:5,
+            mappings:vec![Metadata{id:id.clone(),node_id:"node".into(),domain_id:None,
+                protocol:"udp".into(),local_host:"127.0.0.1".into(),local_port:5353,
+                bind_port:24001,enabled:false,revision:2}],last_seen_at:1,heartbeat_interval_seconds:30};
+        let draft=select_udp_draft(&s,&id,5,2).unwrap();
+        assert_eq!(draft.name,format!("m_{id}"));
+        assert_eq!(draft.local_port,5353);
+        assert_eq!(draft.protocol,"udp");
+        assert!(select_udp_draft(&s,&id,4,2).is_err());
+        assert!(select_udp_draft(&s,&id,5,1).is_err());
+        assert!(select_udp_draft(&s,&"c".repeat(32),5,2).is_err());
+        s.mappings[0].enabled=true;
+        assert!(select_udp_draft(&s,&id,5,2).is_err());
+        s.mappings[0].enabled=false;
+        s.mappings[0].protocol="tcp".into();
+        assert!(select_udp_draft(&s,&id,5,2).is_err());
+        s.mappings[0].protocol="udp".into();
+        s.mappings.push(s.mappings[0].clone());
+        assert!(select_udp_draft(&s,&id,5,2).is_err());
+    }
     #[test]fn validates_credentials_and_port(){
         assert!(valid_token(&format!("ltpair_{}","a".repeat(64)),"ltpair_"));
         assert!(!valid_token(&format!("ltdev_{}","A".repeat(64)),"ltdev_"));

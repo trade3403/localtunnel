@@ -354,6 +354,29 @@ try {
   await waitText('管理配置版本：'+updated.reported_revision)
   await waitText('TCP · 本地 '+managedMapping.local_port+' → 中转 '+managedMapping.bind_port+' · 草稿禁用')
   await waitText('UDP · 本地 '+udpMapping.local_port+' → 中转 '+udpMapping.bind_port+' · 草稿禁用')
+  // Explicit import of current UDP metadata must not reuse old tunnel
+  // credentials, start a process or change the saved service profile.
+  await until('UDP import confirmation required',()=>evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="导入 UDP 草稿"&&b.disabled)'))
+  await field('input[placeholder="relay.example.com:2333"]','127.0.0.1:'+relayPort)
+  await field('input[placeholder="X25519 公钥（Base64）"]',publicKey)
+  await field('input[aria-label="映射授权 Token"]',token)
+  await until('explicit UDP import accepted',async()=>{
+    if(await has('UDP 草稿已导入，请填写独立中转参数及授权 Token；未启动隧道'))return true
+    if(await has('处理中…'))return false
+    const confirm=await evaluate('(()=>{const c=document.querySelector("input[aria-label=\\"确认导入 UDP 草稿\\"]");if(!c||c.disabled)return false;if(!c.checked)c.click();return true})()')
+    if(!confirm)return false
+    await click('导入 UDP 草稿')
+    return false
+  })
+  assert.equal(await evaluate('document.querySelectorAll(".mapping").length'),1)
+  assert.equal(await evaluate('document.querySelector("select[aria-label=\\"映射协议\\"]").value'),'udp')
+  assert.equal(await evaluate('document.querySelector("input[aria-label=\\"映射名称\\"]").value'),'m_'+udpMapping.id)
+  assert.equal(await evaluate('Number(document.querySelector("input[aria-label=\\"本地端口\\"]").value)'),udpMapping.local_port)
+  for(const selector of ['input[placeholder="relay.example.com:2333"]','input[placeholder="X25519 公钥（Base64）"]','input[aria-label="映射授权 Token"]']){
+    assert.equal(await evaluate('document.querySelector('+JSON.stringify(selector)+').value'),'')
+  }
+  assert.equal(await has('进程运行中'),false)
+  report.real_management_udp_confirmed_draft_import=true
   // Real native process restart; DPAPI saved enrollment must be restored
   // and heartbeat sent without another enrollment or manual sync.
   trayMenu('quit')
@@ -395,6 +418,7 @@ try {
   const revokedState=await revoked.json()
   if(revoked.status!==200||revokedState.enabled||revokedState.management_online||revokedState.last_seen_at!==null)throw Error('revoked device still reports online')
   if(!await evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="同步管理状态"&&b.disabled)'))throw Error('revoked sync still enabled')
+  if(await evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="导入 UDP 草稿"&&!b.disabled)'))throw Error('revoked import still enabled')
   report.native_management_revocation_stops_automatic_sync=true
   if(await has('配置元数据及管理心跳同步成功'))throw Error('stale management status survived revoke')
   await evaluate('document.querySelector("input[aria-label=\\\"确认移除管理凭据\\\"]").click()')
