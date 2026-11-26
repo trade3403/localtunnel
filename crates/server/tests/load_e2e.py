@@ -1,6 +1,8 @@
 """Bounded real loopback management workload on Linux CI, not a production SLA."""
 from concurrent.futures import ThreadPoolExecutor
 import json
+import http.client
+from contextlib import closing
 import math
 from pathlib import Path
 import secrets
@@ -167,6 +169,94 @@ try:
             assert request(base, "/readyz")[1] == b"ready"
             request(base, prefix + "/config", expected=401)
             report["real_post_load_heartbeat_readiness_and_auth"] = True
+
+            # A second bounded workload exceeds the process-wide 120/s
+            # budget, on the same private test server, with no external target.
+            # Eight persistent HTTP/1 connections, each at most 25 requests/s,
+            # 250 requests each. No catch-up, no retries, no queued backlog.
+            time.sleep(2.1)
+            overload_baseline = resources(p.pid)
+            port = int(base.rsplit(":", 1)[1])
+            blocks = 5
+            per_block = 50
+
+            def overload_worker(_):
+                counts = []
+                latency = []
+                with closing(http.client.HTTPConnection("127.0.0.1", port, timeout=5)) as conn:
+                    for block in range(blocks):
+                        tally = {"200": 0, "429": 0}
+                        for _ in range(per_block):
+                            started = time.monotonic()
+                            conn.request("GET", "/healthz")
+                            with conn.getresponse() as response:
+                                body = response.read(1024)
+                                assert response.getheader("Cache-Control") == "no-store"
+                                assert response.getheader("X-Content-Type-Options") == "nosniff"
+                                assert response.getheader("X-Frame-Options") == "DENY"
+                                assert response.getheader("Referrer-Policy") == "no-referrer"
+                                if response.status == 200:
+                                    assert body == b"ok"
+                                else:
+                                    assert response.status == 429, f"unexpected overload status {response.status}"
+                                    assert body == b"request rate exceeded"
+                                    assert response.getheader("Retry-After") == "1"
+                                tally[str(response.status)] += 1
+                            elapsed = time.monotonic() - started
+                            latency.append(elapsed * 1000)
+                            time.sleep(max(0, 0.04 - elapsed))
+                        counts.append(tally)
+                return counts, latency
+
+            started = time.monotonic()
+            with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+                results = list(pool.map(overload_worker, range(WORKERS)))
+            overload_duration = time.monotonic() - started
+            counts = [{code: sum(result[0][i][code] for result in results)
+                       for code in ("200", "429")} for i in range(blocks)]
+            accepted = sum(item["200"] for item in counts)
+            limited = sum(item["429"] for item in counts)
+            times = [value for result in results for value in result[1]]
+            report["overload_measurements"] = {
+                "requests": accepted + limited,
+                "accepted": accepted, "rate_limited": limited,
+                "elapsed_seconds": round(overload_duration, 3),
+                "attempted_requests_per_second": round((accepted + limited) / overload_duration, 3),
+                "accepted_requests_per_second": round(accepted / overload_duration, 3),
+                "request_blocks": counts,
+                "latency_ms": {"p50": percentile(times, .5), "p95": percentile(times, .95),
+                               "p99": percentile(times, .99), "max": round(max(times), 3)},
+                "baseline": overload_baseline,
+            }
+            assert accepted + limited == WORKERS * blocks * per_block
+            assert 9 <= overload_duration <= 20, "overload workload did not complete within its bounded interval"
+            assert accepted > 0 and limited > 0, "both successful and rejected responses required"
+            assert all(item["200"] > 0 and item["429"] > 0 for item in counts[-2:]), "sustained admission and rejection not observed"
+            # The initial full bucket plus refill bounds successful requests,
+            # even with scheduling overhead. No threshold is changed here.
+            assert accepted <= 240 + math.ceil(120 * overload_duration)
+            assert p.poll() is None, "management process exited under load"
+            report["real_sustained_rate_overload_bounded_and_rejected"] = True
+
+            # Refill the original process, verify real authenticated read/write,
+            # no credential bypass, and no residual descriptor/resource growth.
+            time.sleep(2.1)
+            assert request(base, "/healthz")[1] == b"ok"
+            assert request(base, "/readyz")[1] == b"ready"
+            assert request(base, "/api/v1/auth/me", admin)[1]["username"] == "operator"
+            _, receipt = request(base, prefix + "/status", token,
+                                 {"reported_revision": 1, "reported_state": "idle"})
+            assert receipt["last_seen_at"] > 0
+            _, state = request(base, prefix + "/status", admin)
+            assert state["management_online"] is True and state["configuration_current"] is True
+            assert state["reported_state"] == "idle"
+            request(base, prefix + "/config", expected=401)
+            recovered = resources(p.pid)
+            report["overload_measurements"]["recovered"] = recovered
+            assert recovered["fd_count"] <= overload_baseline["fd_count"] + 8
+            assert recovered["rss_kib"] <= overload_baseline["rss_kib"] + 65536
+            assert p.poll() is None
+            report["real_overload_recovery_without_restart_and_authenticated_write"] = True
         finally:
             stop(p)
 finally:

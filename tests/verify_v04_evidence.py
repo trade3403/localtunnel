@@ -230,6 +230,8 @@ REQUIRED["management-v05"] = {
         "real_sustained_mixed_management_workload",
         "real_load_process_resources_sampled_and_recovered",
         "real_post_load_heartbeat_readiness_and_auth",
+        "real_sustained_rate_overload_bounded_and_rejected",
+        "real_overload_recovery_without_restart_and_authenticated_write",
     ],
     "transport.json": [
         "real_incomplete_header_absolute_deadline",
