@@ -126,13 +126,13 @@ async function addMapping(){await run(async()=>{
 async function inspectMapping(m:Mapping){await run(async()=>{selectedMapping.value=m;runtime.value=null;traffic.value=[];runtime.value=await get('/mappings/'+m.id+'/runtime');await readTraffic(m.id)})}
 async function startMapping(){await run(async()=>{
   const m=selectedMapping.value;if(!m)return
-  await send('/mappings/'+m.id+(m.protocol==='udp'?'/udp-start':'/start'),'POST',{expected_revision:m.revision});runtime.value=await get('/mappings/'+m.id+'/runtime');notice.value='启动请求已提交，等待本地执行器'
+  await send('/mappings/'+m.id+(m.protocol==='udp'?'/udp-start':m.protocol==='tcp'?'/tcp-start':'/start'),'POST',{expected_revision:m.revision});runtime.value=await get('/mappings/'+m.id+'/runtime');notice.value='启动请求已提交，等待本地执行器'
 })}
 async function stopMapping(){await run(async()=>{
   const m=selectedMapping.value,r=runtime.value?.request;if(!m||!r)return
   await send('/mappings/'+m.id+'/stop','POST',{request_id:r.request_id});runtime.value=await get('/mappings/'+m.id+'/runtime');notice.value='停止请求已提交'
 })}
-const canStart=computed(()=>selectedMapping.value && !selectedMapping.value.enabled && ['http','https','udp'].includes(selectedMapping.value.protocol) && runtime.value!==null && (!runtime.value.request||runtime.value.request.state==='stopped'||(runtime.value.request.state==='queued'&&runtime.value.request.updated_at<Math.floor(Date.now()/1000)-120)))
+const canStart=computed(()=>selectedMapping.value && !selectedMapping.value.enabled && ['http','https','tcp','udp'].includes(selectedMapping.value.protocol) && runtime.value!==null && (!runtime.value.request||runtime.value.request.state==='stopped'||(runtime.value.request.state==='queued'&&runtime.value.request.updated_at<Math.floor(Date.now()/1000)-120)))
 const canStop=computed(()=>runtime.value?.request && ['queued','starting','running','stopping'].includes(runtime.value.request.state))
 function time(v:number|null){return v?new Date(v*1000).toLocaleString('zh-CN'):'未验证'}
 function nameOf<T extends {id:string}>(rows:T[],id:string|null,field:keyof T){return rows.find(x=>x.id===id)?.[field]||id||'—'}
@@ -233,9 +233,9 @@ onBeforeUnmount(clearPair)
               <a-space><a-button type="primary" html-type="submit" :loading="busy">保存端口</a-button><a-button aria-label="取消编辑" :disabled="busy" @click="editDraft=null">取消</a-button></a-space>
             </form>
           </a-card>
-          <a-card v-if="selectedMapping" title="运行请求详情" size="small"><p>{{selectedMapping.id}}</p><p data-testid="runtime-state">{{runtime?labels[runtime.request?.state||'']||'尚无请求':'查询中'}}</p><p v-if="selectedMapping.protocol==='udp'" class="muted">UDP 仅限可信操作员预配置的本机回显预览；请求启动不代表实际运行或公网可达。</p><p class="muted">执行器最近更新：{{runtime?.worker_recent?'是':'否'}}；不是实时业务探测。</p><a-space><a-button type="primary" :disabled="busy||!canStart" @click="startMapping">请求启动</a-button><a-button danger :disabled="busy||!canStop" @click="stopMapping">请求停止</a-button><a-button :disabled="busy" @click="inspectMapping(selectedMapping)">刷新状态</a-button></a-space>
+          <a-card v-if="selectedMapping" title="运行请求详情" size="small"><p>{{selectedMapping.id}}</p><p data-testid="runtime-state">{{runtime?labels[runtime.request?.state||'']||'尚无请求':'查询中'}}</p><p v-if="selectedMapping.protocol==='udp'" class="muted">UDP 仅限可信操作员预配置的本机回显预览；请求启动不代表实际运行或公网可达。</p><p v-if="selectedMapping.protocol==='tcp'" class="muted">TCP 仅限可信操作员预配置的本机回显预览；请求启动不代表实际运行或公网可达。</p><p class="muted">执行器最近更新：{{runtime?.worker_recent?'是':'否'}}；不是实时业务探测。</p><a-space><a-button type="primary" :disabled="busy||!canStart" @click="startMapping">请求启动</a-button><a-button danger :disabled="busy||!canStop" @click="stopMapping">请求停止</a-button><a-button :disabled="busy" @click="inspectMapping(selectedMapping)">刷新状态</a-button></a-space>
             <a-divider/>
-            <h3>网关流量观测</h3><p v-if="selectedMapping.protocol==='udp'" class="muted">UDP 暂无网关流量统计；不显示虚构计费数据。</p><p class="muted">已完成的 HTTP/HTTPS 请求长度与响应发送字节，含业务探测，非加密链路总量或计费；最多最近50次运行。</p>
+            <h3>网关流量观测</h3><p v-if="selectedMapping.protocol==='udp'" class="muted">UDP 暂无网关流量统计；不显示虚构计费数据。</p><p v-if="selectedMapping.protocol==='tcp'" class="muted">TCP 暂无网关流量统计；不显示虚构计费数据。</p><p class="muted">已完成的 HTTP/HTTPS 请求长度与响应发送字节，含业务探测，非加密链路总量或计费；最多最近50次运行。</p>
             <p v-if="!traffic.length" data-testid="traffic-empty">暂无流量观测</p>
             <a-table v-else data-testid="traffic-table" :data-source="traffic" row-key="request_id" size="small" :pagination="{pageSize:5}" :scroll="{x:600}">
               <a-table-column title="请求数" data-index="requests"/>

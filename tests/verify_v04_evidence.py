@@ -78,6 +78,7 @@ REQUIRED = {
             "real_mapping_and_unverified_activation_denied",
             "real_edit_delete_and_domain_reference_guard",
             "real_browser_udp_request_and_cancel",
+            "real_browser_tcp_request_and_cancel",
             "real_gateway_traffic_visible_in_browser",
             "real_browser_start_stop_noise_gateway",
             "real_committed_audit_visible_in_browser",
@@ -263,6 +264,13 @@ REQUIRED["management-v05"] = {
 # V0.8 extends rather than replaces existing management gates.
 REQUIRED["management-v08"] = {
     **REQUIRED["management-v05"],
+    "tcp-preview.json": [
+        "real_tcp_scoped_queue_and_cancel",
+        "real_tcp_noise_shared_bidirectional_cap",
+        "real_tcp_stop_closes_listeners_and_bundle",
+        "real_tcp_suspend_and_rapid_renewal_stops_generation",
+        "real_tcp_plan_change_closes_old_budget",
+    ],
     "udp-preview.json": [
         "real_udp_commercial_suspend_revokes_lease_and_closes_relay",
         "real_udp_commercial_manual_cap_and_unsupported_rate_denial",

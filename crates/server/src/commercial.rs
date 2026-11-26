@@ -24,6 +24,7 @@ struct View {
     enforced_runtime_entitlement:bool,
     udp_bandwidth_scope:&'static str,
     web_bandwidth_scope:&'static str,
+    tcp_bandwidth_scope:&'static str,
     entitlement:Entitlement,
 }
 pub fn routes(pool:SqlitePool)->Router{
@@ -37,7 +38,7 @@ async fn current(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Respon
         "SELECT t.id AS tenant_id,p.id AS plan_id,p.code AS plan_code,p.version AS plan_version,p.name AS plan_name,e.revision,e.state,e.expires_at,CASE WHEN e.state='suspended' THEN 'suspended' WHEN e.expires_at IS NOT NULL AND e.expires_at<=unixepoch() THEN 'expired' ELSE 'active' END AS effective_state,p.max_active_devices,p.max_retained_devices,p.max_mappings,p.max_bandwidth_bps,p.max_monthly_bytes,p.max_concurrent_connections,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id AND d.enabled=1) AS active_devices,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id) AS retained_devices,(SELECT count(*) FROM mappings m WHERE m.owner_id=u.id) AS mappings FROM users u JOIN admin_sessions a ON a.user_id=u.id JOIN tenants t ON t.owner_id=u.id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
         .bind(digest).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
     Ok(auth::uncached(Json(View{scope:"owner_inventory_only",commercial_enforcement:false,
-        enforced_admission:["active_devices","retained_devices","mappings","active_entitlement_for_creation"],enforced_runtime_entitlement:true,udp_bandwidth_scope:"per_mapping_per_direction_guarded_payload_only",web_bandwidth_scope:"supervised_web_per_mapping_per_direction_tcp_stream",entitlement})))
+        enforced_admission:["active_devices","retained_devices","mappings","active_entitlement_for_creation"],enforced_runtime_entitlement:true,udp_bandwidth_scope:"per_mapping_per_direction_guarded_payload_only",web_bandwidth_scope:"supervised_web_per_mapping_per_direction_tcp_stream",tcp_bandwidth_scope:"supervised_tcp_per_mapping_per_direction_stream",entitlement})))
 }
 
 
@@ -126,7 +127,7 @@ async fn assign(pool:&SqlitePool,c:Assignment)->Result<String,&'static str>{
     // Also stop managed UDP and web runs on a plan change, so a new guard budget
     // is always applied by a fresh worker generation.
     // The first SQL statement is a write; stale assignment rolls it back.
-    sqlx::query("UPDATE runtime_requests SET state=CASE WHEN state='queued' THEN 'stopped' ELSE 'stopping' END,updated_at=CASE WHEN state='queued' THEN unixepoch() ELSE updated_at END WHERE mapping_id IN (SELECT m.id FROM mappings m JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id WHERE t.id=? AND e.revision=? AND (runtime_requests.state='queued' OR (runtime_requests.state IN ('starting','running') AND (e.state<>'active' OR (e.expires_at IS NOT NULL AND e.expires_at<=unixepoch()) OR ?<>'active' OR (? IS NOT NULL AND ?<=unixepoch()) OR (m.protocol IN ('udp','http','https') AND e.plan_id<>?)))))")
+    sqlx::query("UPDATE runtime_requests SET state=CASE WHEN state='queued' THEN 'stopped' ELSE 'stopping' END,updated_at=CASE WHEN state='queued' THEN unixepoch() ELSE updated_at END WHERE mapping_id IN (SELECT m.id FROM mappings m JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id WHERE t.id=? AND e.revision=? AND (runtime_requests.state='queued' OR (runtime_requests.state IN ('starting','running') AND (e.state<>'active' OR (e.expires_at IS NOT NULL AND e.expires_at<=unixepoch()) OR ?<>'active' OR (? IS NOT NULL AND ?<=unixepoch()) OR (m.protocol IN ('udp','tcp','http','https') AND e.plan_id<>?)))))")
         .bind(&c.tenant_id).bind(c.expected_revision).bind(&c.state).bind(c.expires_at).bind(c.expires_at).bind(&c.plan_id)
         .execute(&mut *tx).await.map_err(|_|"commercial runtime stop request failed")?;
     let changed=sqlx::query("UPDATE tenant_entitlements SET plan_id=?,state=?,expires_at=?,revision=revision+1,updated_at=unixepoch() WHERE tenant_id=? AND revision=? AND EXISTS(SELECT 1 FROM commercial_plans WHERE id=?)")

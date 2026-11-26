@@ -636,3 +636,12 @@
 - 启动前及运行期重新读取带宽配置，cap变化或guard异常关闭会话；managed HTTP/HTTPS/UDP套餐变更事务锁存stopping，取消旧queued；恢复仍须新请求。限速套餐禁止独立export和独立非清空gateway apply；原有可信操作员持有已导出配置、同机直接访问业务/内部端口或绕过控制的进程仍可绕过，不宣称生产隔离。单独TCP映射的管理运行路径尚未实现，本次TCP限速器仅接入HTTP/HTTPS。
 - 新增真实TCP单测，两并发连接共享预算，分别核查真实上传与下载阶段下界、半关闭、数据一致性、停止后端口不可达。HTTP/HTTPS真实集成分别发布1048576 bits/s套餐，验证导出/独立apply拒绝、受控Noise实际转发、2并发各256KiB随机回显（双方向各512KiB、SHA256和完整数据、共享限速耗时下界3.8s），切回legacy后旧请求停止、网关清空、guard端口关闭；保留原16事务回归测试默认参数。两组新增强制证据字段，测量结果由CI产生，当前未实际运行，不虚构数值。
 - 下一增量：扩展单独TCP运行路径及租户共享预算，月度流量持久化/并发额度与商业UI。V0.9控制面数据面完全解耦和单机部署兼容要求保持。未改main，未降低原测试门禁。
+
+## V0.8 第七增量：独立 TCP 受控运行与套餐限速（待 CI）
+- 基线 `103eff9bcc5535b32e0d17c2485e15c01784003b` 同SHA 7/7成功：[Hosted PR](https://github.com/trade3403/localtunnel/actions/runs/45905898018)/[push](https://github.com/trade3403/localtunnel/actions/runs/45905893177)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45905898080)，[Native](https://github.com/trade3403/localtunnel/actions/runs/45905897992)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45905897973)，[Management PR](https://github.com/trade3403/localtunnel/actions/runs/45905898053)/[push](https://github.com/trade3403/localtunnel/actions/runs/45905893111)。HTTP/HTTPS真实共享双向带宽门禁已通过。
+- POST /api/v1/mappings/{id}/tcp-start 与UDP共用类型固定的服务端准入逻辑，严格owner/session、revision、禁用草稿、协议、设备/节点及套餐有效性检查。请求只接受expected_revision；返回queued，不代表已运行。旧web及UDP启动接口继续拒绝TCP。复用runtime stop与状态机，禁止重复启动、旧请求停止及未确认结果的重启。
+- 新 Linux 本地可信操作员命令 --runtime-tcp-worker <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <bytes-per-second>。等待最多60秒领取唯一当前请求；每映射独占锁；固定回环，relay>=30000、映射端口20000..29999、可信二进制路径；端口冲突预检后生成私有配置，随机独立Token。复用上一增量TCP guard，Noise client只连接guard，guard连接配置指定的本机业务端口。每方向所有连接共享 min(操作员速率, floor(套餐bps/8))，操作员范围65536..125000000 B/s，套餐低于524288 bits/s拒绝，null保持操作员预算；4096字节突发、32活动连接硬限额。不是租户总带宽或动态套餐并发限制。
+- 真实32字节随机echo往返才报告running，启动期限30秒，之后每500ms校验请求、授权、版本、套餐带宽及子进程和guard健康。此模式只用于可信TCP echo服务预览，不向任意生产业务自动发送探针；启动后的运行状态不是持续业务探测。套餐切换事务锁存stopping，包括快速恢复；正常停止确认两个engine进程与guard退出后清除本次私有bundle；失败保留证据、failed_or_unknown，未提供自动恢复、常驻TCP worker或独立设备远程TCP授权。原Linux父进程死亡保护继续使用。受控同机数据路径可被本机直接访问业务或绕开管理的进程绕过，不宣称公网生产隔离。
+- 管理后台TCP草稿的真实请求启动/停止按钮及范围提示；无TCP网关流量统计时明确不显示虚构计费数据。commercial/entitlement增加tcp_bandwidth_scope；整体commercial_enforcement仍false。
+- 新真实Linux TCP E2E 5组强制报告：拒绝跨owner/错误协议/版本/重复请求及取消排队，真实Noise经共享预算2并发各256KiB随机回显（每方向512KiB，耗时下界3.8秒，真实结果由CI产生），停止后的三端口及bundle清理，暂停快速续期旧请求仍停止，套餐切换旧预算关闭。新增实际浏览器TCP请求/取消/删除强制字段。保留旧协议测试。本轮未本地编译或运行真实引擎，待CI。
+- 下一增量：同机多映射租户共享预算（保守分配/事务控制），随后持久月流量、并发连接额度及商业UI。仍须满足V0.9管理与中转完全解耦、单机兼容。未改main、未增加依赖或迁移。

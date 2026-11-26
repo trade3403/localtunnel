@@ -1,0 +1,186 @@
+"""Real raw TCP management worker, Noise forwarding and commercial policy."""
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import selectors
+import socket
+import socketserver
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"tests"))
+import e2e as core_test
+
+exe=str(Path(sys.argv[1]).resolve())
+evidence=Path(sys.argv[2])
+report={}
+password=secrets.token_hex(24)
+
+def call(base,path,status,method="GET",token=None,data=None):
+    headers={}
+    if token is not None:headers["Authorization"]="Bearer "+token
+    if data is not None:headers["Content-Type"]="application/json"
+    req=urllib.request.Request(base+"/api/v1/"+path,method=method,headers=headers,data=None if data is None else json.dumps(data).encode())
+    try:
+        with urllib.request.urlopen(req,timeout=10) as r:
+            code,raw=r.status,r.read()
+    except urllib.error.HTTPError as e:
+        code,raw=e.code,e.read()
+    assert code==status,f"{method} {path}: expected {status}, got {code}"
+    if code in (200,201,202):return json.loads(raw)
+
+def free(lo,hi,exclude):
+    for _ in range(200):
+        port=lo+secrets.randbelow(hi-lo+1)
+        if port in exclude:continue
+        with socket.socket() as s:
+            try:s.bind(("127.0.0.1",port))
+            except OSError:continue
+            return port
+    raise AssertionError("no free TCP preview port")
+
+def line(p,prefix,seconds):
+    with selectors.DefaultSelector() as s:
+        s.register(p.stdout,selectors.EVENT_READ)
+        assert s.select(seconds),"TCP readiness timed out"
+    assert p.stdout.readline().strip().startswith(prefix),"TCP readiness failed"
+
+class Echo(socketserver.BaseRequestHandler):
+    def handle(self):
+        self.request.settimeout(10)
+        try:
+            while True:
+                data=self.request.recv(4096)
+                if not data:return
+                self.request.sendall(data)
+        except OSError:return
+
+try:
+    with tempfile.TemporaryDirectory() as tmp,socketserver.ThreadingTCPServer(("127.0.0.1",0),Echo) as fixture:
+        fixture.daemon_threads=True
+        thread=threading.Thread(target=fixture.serve_forever,daemon=True)
+        thread.start()
+        root=Path(tmp)
+        def command(action,data):
+            result=subprocess.run([exe,action,str(root)],input=json.dumps(data).encode(),capture_output=True,timeout=20)
+            assert result.returncode==0,"operator action failed"
+            return result.stdout.decode().strip()
+        command("--init-admin",{"username":"operator","password":password})
+        node=subprocess.check_output([exe,"--add-node",str(root),"TCP fixture"],text=True,timeout=20).strip()
+        plan=command("--commercial-create-plan",{"code":"tcp-fixture","version":1,"name":"TCP fixture","max_active_devices":4,
+            "max_retained_devices":8,"max_mappings":8,"max_bandwidth_bps":1048576,"max_monthly_bytes":None,"max_concurrent_connections":None})
+        command("--commercial-create-account",{"username":"other","password":password,"plan_id":"legacy-v1","expires_at":None})
+        engine=core_test.engine(root)
+        keys=subprocess.check_output([str(engine),"--genkey"],text=True,timeout=15)
+        private=re.search(r"Private Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
+        public=re.search(r"Public Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
+        env=dict(os.environ,LOCALTUNNEL_CORE_CLI=str(core_test.CLI.resolve()),LOCALTUNNEL_ENGINE=str(engine),LOCALTUNNEL_SERVER_PRIVATE_KEY=private,LOCALTUNNEL_SERVER_PUBLIC_KEY=public)
+        management=subprocess.Popen([exe,str(root),"0"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+        children=[]
+        try:
+            with selectors.DefaultSelector() as s:
+                s.register(management.stdout,selectors.EVENT_READ)
+                assert s.select(20)
+            address=management.stdout.readline().strip()
+            assert address.startswith("LISTENING 127.0.0.1:")
+            base="http://"+address.split()[1]
+            admin=call(base,"auth/login",200,"POST",data={"username":"operator","password":password})["access_token"]
+            other=call(base,"auth/login",200,"POST",data={"username":"other","password":password})["access_token"]
+            def policy(pid=plan,state="active"):
+                e=call(base,"commercial/entitlement",200,token=admin)["entitlement"]
+                command("--commercial-assign",{"tenant_id":e["tenant_id"],"plan_id":pid,"expected_revision":e["revision"],"state":state,"expires_at":None})
+            policy()
+            pair=call(base,"devices/pairing-code",200,"POST",admin)["pairing_code"]
+            device=call(base,"devices/enroll",201,"POST",data={"pairing_code":pair,"name":"TCP fixture"})
+            local=fixture.server_address[1]
+            ingress=free(20000,29999,[local])
+            relay=free(30000,60000,[local,ingress])
+            m=call(base,"mappings",201,"POST",admin,{"device_id":device["id"],"node_id":node,"protocol":"tcp","local_port":local,"bind_port":ingress})
+            mid=m["id"]
+            route="mappings/"+mid
+            spec={"expected_revision":m["revision"]}
+            call(base,route+"/tcp-start",401,"POST",data=spec)
+            call(base,route+"/tcp-start",404,"POST",other,spec)
+            call(base,route+"/start",409,"POST",admin,spec)
+            call(base,route+"/udp-start",409,"POST",admin,spec)
+            call(base,route+"/tcp-start",409,"POST",admin,{"expected_revision":m["revision"]+1})
+            call(base,route+"/tcp-start",422,"POST",admin,{**spec,"port":12345})
+            q=call(base,route+"/tcp-start",202,"POST",admin,spec)
+            assert q["state"]=="queued"
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            assert call(base,route+"/stop",202,"POST",admin,{"request_id":q["request_id"]})["state"]=="stopped"
+            report["real_tcp_scoped_queue_and_cancel"]=True
+            def start(bundle):
+                q=call(base,route+"/tcp-start",202,"POST",admin,spec)
+                p=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),mid,str(m["revision"]),str(relay),bundle,"240000"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                children.append(p)
+                line(p,"TCP_PREVIEW_READY",45)
+                state=call(base,route+"/runtime",200,token=admin)
+                assert state["worker_recent"] and state["request"]["state"]=="running" and state["request"]["request_id"]==q["request_id"]
+                manifest=json.loads((root/bundle/"manifest.json").read_text())
+                assert manifest["byte_rate"]==131072 and manifest["commercial_bandwidth_bps"]==1048576 and manifest["request_id"]==q["request_id"]
+                return p,q["request_id"],manifest["tcp_limiter_port"]
+            def exchange(n):
+                data=secrets.token_bytes(n)
+                with socket.create_connection(("127.0.0.1",ingress),timeout=10) as s:
+                    s.sendall(data)
+                    reply=bytearray()
+                    while len(reply)<n:
+                        chunk=s.recv(min(n-len(reply),65536))
+                        assert chunk,"TCP stream truncated"
+                        reply.extend(chunk)
+                    assert reply==data
+            def closed(p,rid,guard,bundle):
+                assert p.wait(timeout=15)==0
+                state=call(base,route+"/runtime",200,token=admin)
+                assert state["request"]["request_id"]==rid and state["request"]["state"]=="stopped" and not state["worker_recent"]
+                for port in (ingress,relay,guard):
+                    with socket.socket() as s:
+                        s.settimeout(.5)
+                        assert s.connect_ex(("127.0.0.1",port))!=0
+                assert not (root/bundle).exists()
+            p,rid,guard=start("tcp_first")
+            started=time.monotonic()
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(exchange,[262144,262144]))
+            elapsed=time.monotonic()-started
+            assert 3.8<=elapsed<=30
+            report["tcp_bandwidth_measurements"]={"bytes_each_direction":524288,"elapsed_seconds":elapsed}
+            report["real_tcp_noise_shared_bidirectional_cap"]=True
+            call(base,route+"/stop",404,"POST",other,{"request_id":rid})
+            call(base,route+"/stop",409,"POST",admin,{"request_id":secrets.token_hex(16)})
+            assert call(base,route+"/stop",202,"POST",admin,{"request_id":rid})["state"]=="stopping"
+            closed(p,rid,guard,"tcp_first")
+            report["real_tcp_stop_closes_listeners_and_bundle"]=True
+            p,rid,guard=start("tcp_second")
+            exchange(1024)
+            policy(state="suspended")
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            policy()
+            closed(p,rid,guard,"tcp_second")
+            report["real_tcp_suspend_and_rapid_renewal_stops_generation"]=True
+            p,rid,guard=start("tcp_third")
+            exchange(1024)
+            policy("legacy-v1")
+            closed(p,rid,guard,"tcp_third")
+            report["real_tcp_plan_change_closes_old_budget"]=True
+        finally:
+            for p in reversed(children):
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=10)
+            core_test.terminate(management)
+            fixture.shutdown()
+            thread.join(timeout=5)
+finally:
+    evidence.parent.mkdir(parents=True,exist_ok=True)
+    evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
+assert len([v for v in report.values() if v is True])==5

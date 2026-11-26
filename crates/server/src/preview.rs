@@ -915,3 +915,129 @@ pub async fn udp_device_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,
     crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
     result
 }
+
+
+// Independent raw TCP loopback echo preview. Never infer reachability from
+// an open relay control socket: prove a nonce round trip through the guard.
+#[derive(sqlx::FromRow)]
+struct TcpDraft{local_port:i64,bind_port:i64,bandwidth_bps:Option<i64>}
+async fn checked_tcp(pool:&SqlitePool,id:&str,revision:i64,rid:&str)->Result<TcpDraft>{
+    sqlx::query_as::<_,TcpDraft>("SELECT m.local_port,m.bind_port,cp.max_bandwidth_bps AS bandwidth_bps FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id JOIN runtime_requests r ON r.mapping_id=m.id WHERE m.id=? AND m.revision=? AND m.protocol='tcp' AND m.enabled=0 AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')")
+        .bind(id).bind(revision).bind(rid).fetch_optional(pool).await.map_err(|_|"TCP draft read failed")?.ok_or("TCP draft authorization changed")
+}
+fn tcp_echo_probe(port:u16)->bool{
+    use std::io::{Read,Write};
+    let Ok(nonce)=auth::random::<32>() else{return false};
+    let Ok(mut s)=std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127,0,0,1],port)),Duration::from_millis(500)) else{return false};
+    if s.set_write_timeout(Some(Duration::from_millis(500))).is_err()||s.set_read_timeout(Some(Duration::from_millis(500))).is_err(){return false}
+    if s.write_all(&nonce).is_err(){return false}
+    // Bounded read count as well as timeout; a slowly trickling peer may
+    // not hold the authorization loop indefinitely.
+    let deadline=Instant::now()+Duration::from_millis(500);
+    let mut buf=[0;32];
+    let mut n=0;
+    while n<buf.len(){
+        let remaining=deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()||s.set_read_timeout(Some(remaining)).is_err(){return false}
+        match s.read(&mut buf[n..]){Ok(k) if k>0=>n+=k,_=>return false}
+    }
+    buf==nonce
+}
+pub async fn tcp_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,operator_rate:u32)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle)||id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1||relay_port<30000||!(65536..=125000000).contains(&operator_rate){return Err("invalid TCP worker parameters")}
+    private_dir(root)?;
+    let _lock=acquire_lock(root,"tcp-worker",id)?;
+    let deadline=Instant::now()+Duration::from_secs(60);
+    let rid=loop{
+        match crate::runtime::resident_state(pool,id,revision,"tcp").await?.as_deref(){
+            None|Some("stopped")|Some("queued")=>{},
+            _=>return Err("claimed or unknown TCP request requires local inspection"),
+        }
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{break rid}
+        if Instant::now()>=deadline{return Err("no fresh TCP start request")}
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let result=tcp_run(pool,root,id,revision,relay_port,bundle,operator_rate,&rid).await;
+    crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+    result
+}
+async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,operator_rate:u32,rid:&str)->Result<()>{
+    let m=checked_tcp(pool,id,revision,rid).await?;
+    let bind=m.bind_port as u16;
+    let local=m.local_port as u16;
+    if local==bind||local==relay_port{return Err("TCP worker port collision")}
+    let rate=match m.bandwidth_bps{
+        Some(bps) if bps<524288=>return Err("commercial TCP bandwidth below preview minimum"),
+        Some(bps)=>operator_rate.min((bps/8).min(125000000) as u32),
+        None=>operator_rate,
+    };
+    let core=core()?;
+    let engine=PathBuf::from(std::env::var_os("LOCALTUNNEL_ENGINE").ok_or("set trusted engine path")?);
+    if !engine.is_absolute()||!engine.is_file(){return Err("invalid engine path")}
+    let engine=engine.canonicalize().map_err(|_|"invalid engine path")?;
+    let private=key("LOCALTUNNEL_SERVER_PRIVATE_KEY")?;
+    let public=key("LOCALTUNNEL_SERVER_PUBLIC_KEY")?;
+    let token=hex::encode(auth::random::<32>().map_err(|_|"random generation failed")?);
+    // Reject occupied listeners before creating any secret material.
+    for p in [relay_port,bind]{
+        let tcp=tokio::net::TcpSocket::new_v4().map_err(|_|"TCP preflight socket unavailable")?;
+        tcp.set_reuseaddr(true).map_err(|_|"TCP preflight setup failed")?;
+        tcp.bind(std::net::SocketAddr::from(([127,0,0,1],p))).map_err(|_|"TCP preview port unavailable")?;
+        let _listener=tcp.listen(1).map_err(|_|"TCP preview listener unavailable")?;
+    }
+    let mut guard=crate::tcp_limit::Guard::start(local,rate)?;
+    if [bind,relay_port,local].contains(&guard.port()){return Err("TCP limiter port collision")}
+    let dir=root.join(bundle);
+    mkdir(&dir)?;
+    let created=(||{
+        let service=format!("m_{id}");
+        let relay=port(relay_port)?;
+        invoke(&core,&["server-config".into(),dir.join("server.toml").into_os_string(),relay.clone().into(),service.clone().into(),bind.to_string().into()],
+            &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PRIVATE_KEY",&private)])?;
+        invoke(&core,&["client-config".into(),dir.join("client.toml").into_os_string(),relay.into(),service.into(),format!("127.0.0.1:{}",guard.port()).into()],
+            &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PUBLIC_KEY",&public)])?;
+        use std::io::Write;
+        let mut opts=fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
+        let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"TCP manifest unavailable")?;
+        let manifest=serde_json::json!({"mapping_id":id,"revision":revision,"request_id":rid,"protocol":"tcp","scope":"operator_loopback_tcp_echo_preview","bind_port":bind,"relay_port":relay_port,"tcp_limiter_port":guard.port(),"byte_rate":rate,"commercial_bandwidth_bps":m.bandwidth_bps,"byte_limit_scope":"per_mapping_per_direction_tcp_stream"});
+        file.write_all(manifest.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"TCP manifest write failed")?;
+        Ok(())
+    })();
+    if let Err(e)=created{let _=fs::remove_dir_all(&dir);return Err(e)}
+    let mut children=TunnelChildren(Vec::new());
+    let result=async{
+        if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
+        if checked_tcp(pool,id,revision,rid).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
+        children.start(&engine,&dir.join("server.toml"))?;
+        children.start(&engine,&dir.join("client.toml"))?;
+        let deadline=Instant::now()+Duration::from_secs(30);
+        let mut ready=false;
+        loop{
+            if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
+            if checked_tcp(pool,id,revision,rid).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
+            if !children.healthy()||!guard.healthy(){return Err("TCP worker child or guard exited")}
+            if !ready{
+                if tcp_echo_probe(bind){
+                    if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}
+                    println!("TCP_PREVIEW_READY");
+                    use std::io::Write;
+                    std::io::stdout().flush().map_err(|_|"TCP readiness output failed")?;
+                    ready=true;
+                }else if Instant::now()>=deadline{return Err("TCP echo readiness timeout")}
+            }
+            // After actual startup proof, monitor authorization and child
+            // health, not arbitrary application protocol liveness.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }.await;
+    let stopped=children.stop();
+    let limited=guard.stop();
+    stopped?;
+    limited?;
+    if result.is_ok(){
+        fs::remove_dir_all(&dir).map_err(|_|"TCP bundle cleanup failed")?;
+    }
+    result
+}
