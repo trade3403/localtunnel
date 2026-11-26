@@ -587,14 +587,45 @@ pub async fn recover(pool:&SqlitePool,root:&Path,prefix:&str,rid:&str)->Result<(
 // Local operator preview only. Never claims the HTTP runtime request state,
 // which is still reserved for the web gateway executor.
 #[derive(sqlx::FromRow)]
-struct UdpDraft { id:String, local_port:i64, bind_port:i64, device_id:String, device_revision:i64 }
+struct UdpDraft { id:String, local_port:i64, bind_port:i64, device_id:String, device_revision:i64, bandwidth_bps:Option<i64> }
 
 async fn checked_udp(pool:&SqlitePool,id:&str,revision:i64,rid:Option<&str>)->Result<UdpDraft>{
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
         return Err("invalid UDP mapping identity")
     }
-    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch())) AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
+    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch())) AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
         .bind(id).bind(revision).bind(rid).bind(rid).fetch_optional(pool).await.map_err(|_|"UDP draft read failed")?.ok_or("UDP preview requires current authorized draft")
+}
+
+/// One mapping, each direction separately, application payload only.
+/// A commercial cap may tighten but never relax the operator's budget.
+/// The preview needs at least 1024 B/s for its mandatory echo probes.
+fn effective_udp_limits(operator:Option<(u32,u32)>,bps:Option<i64>)->Result<Option<(u32,u32)>>{
+    match bps{
+        None=>Ok(operator),
+        Some(bps)=>{
+            if bps<8192{return Err("commercial UDP bandwidth below preview minimum")}
+            let rate=(bps/8).min(240000) as u32;
+            let operator_rate=operator.map_or(240000,|v|v.0);
+            Ok(Some((rate.min(operator_rate),1200)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod commercial_udp_tests{
+    use super::effective_udp_limits;
+    #[test]
+    fn commercial_cap_tightens_operator_and_manual_udp(){
+        assert_eq!(effective_udp_limits(None,None).unwrap(),None);
+        assert_eq!(effective_udp_limits(Some((4096,2400)),None).unwrap(),Some((4096,2400)));
+        assert_eq!(effective_udp_limits(None,Some(16385)).unwrap(),Some((2048,1200)));
+        assert_eq!(effective_udp_limits(Some((4096,2400)),Some(16384)).unwrap(),Some((2048,1200)));
+        assert_eq!(effective_udp_limits(Some((1024,1200)),Some(16384)).unwrap(),Some((1024,1200)));
+        assert_eq!(effective_udp_limits(None,Some(i64::MAX)).unwrap(),Some((240000,1200)));
+        assert!(effective_udp_limits(None,Some(8191)).is_err());
+        assert!(effective_udp_limits(Some((4096,1200)),Some(1)).is_err());
+    }
 }
 
 fn udp_echo_probe(socket:&std::net::UdpSocket)->bool{
@@ -681,6 +712,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     }
     private_dir(root)?;
     let m=checked_udp(pool,id,revision,rid).await?;
+    let limits=effective_udp_limits(limits,m.bandwidth_bps)?;
     if device_lease!=bundle.starts_with("udp-device-"){return Err("reserved UDP device bundle name")}
     if [relay_port,internal_port,m.bind_port as u16].contains(&(m.local_port as u16)){
         return Err("conflicting UDP preview ports")
@@ -726,7 +758,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
         opts.write(true).create_new(true);
         #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
         let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"UDP manifest unavailable")?;
-        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port,"request_id":rid,"byte_rate":limits.map(|v|v.0),"burst_bytes":limits.map(|v|v.1)});
+        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port,"request_id":rid,"byte_rate":limits.map(|v|v.0),"burst_bytes":limits.map(|v|v.1),"commercial_bandwidth_bps":m.bandwidth_bps,"byte_limit_scope":"per_mapping_per_direction_application_payload"});
         file.write_all(data.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"UDP manifest write failed")?;
         Ok(())
     })();
@@ -741,6 +773,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     let mut entrance=TunnelChildren(Vec::new());
     let result=async{
         let current=checked_udp(pool,id,revision,rid).await?;
+        if current.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
         if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
         if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}}
         tunnel.start(&engine,&dir.join("server.toml"))?;
@@ -782,6 +815,9 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
                 if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
             }
             let current=checked_udp(pool,id,revision,rid).await?;
+            // No live reconfiguration or silent continuation on a changed
+            // rate. Close the owned ingress and relay; require a fresh run.
+            if current.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
             if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
             let healthy=if device_lease{tunnel.0.len()==1&&matches!(tunnel.0[0].try_wait(),Ok(None))}else{tunnel.healthy()};
             if !healthy||!matches!(entrance.0[0].try_wait(),Ok(None)){

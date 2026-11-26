@@ -261,7 +261,12 @@ REQUIRED["management-v05"] = {
 # V0.8 extends rather than replaces existing management gates.
 REQUIRED["management-v08"] = {
     **REQUIRED["management-v05"],
-    "udp-preview.json": ["real_udp_commercial_suspend_revokes_lease_and_closes_relay"],
+    "udp-preview.json": [
+        "real_udp_commercial_suspend_revokes_lease_and_closes_relay",
+        "real_udp_commercial_manual_cap_and_unsupported_rate_denial",
+        "real_udp_commercial_cap_tightens_operator_and_limits_payload",
+        "real_udp_commercial_plan_change_stops_old_generation",
+    ],
     "commercial.json": [
         "real_legacy_upgrade_preserves_existing_owner_data",
         "fresh_bootstrap_and_legacy_tenant_assignment",

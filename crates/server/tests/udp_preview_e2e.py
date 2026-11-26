@@ -342,9 +342,9 @@ try:
             assert_clean(lease2)
             assert call(base,lease_route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
             report["real_udp_device_lease_actual_expiry_closes_relay"]=True
-            def policy(state="active",expires_at=None):
+            def policy(state="active",expires_at=None,plan_id=None):
                 e=call(base,"commercial/entitlement",200,token=admin)["entitlement"]
-                spec={"tenant_id":e["tenant_id"],"plan_id":e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                spec={"tenant_id":e["tenant_id"],"plan_id":plan_id or e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
                 result=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
                 assert result.returncode==0,"commercial assignment failed"
             worker,agent,config_file,commercial_lease=launch_lease()
@@ -366,6 +366,66 @@ try:
             finish_agent(agent,config_file)
             assert_clean(lease3)
             report["real_udp_device_lease_revocation_closes_relay"]=True
+            # Publish actual commercial policies, never fake the policy
+            # response or replace the real guard with a test implementation.
+            def publish(version,bps):
+                plan={"code":"udp-preview","version":version,"name":"UDP fixture",
+                      "max_active_devices":64,"max_retained_devices":256,"max_mappings":4096,
+                      "max_bandwidth_bps":bps,"max_monthly_bytes":None,"max_concurrent_connections":None}
+                result=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(plan).encode(),capture_output=True,timeout=20)
+                assert result.returncode==0
+                return result.stdout.decode().strip()
+            capped=publish(1,16384)
+            too_low=publish(2,8191)
+            policy(plan_id=capped)
+            p=launch("commercial_manual")
+            manifest=json.loads((root/"commercial_manual"/"manifest.json").read_text())
+            assert manifest["commercial_bandwidth_bps"]==16384 and manifest["byte_rate"]==2048 and manifest["burst_bytes"]==1200
+            assert manifest["byte_limit_scope"]=="per_mapping_per_direction_application_payload"
+            assert exchange()
+            (root/"udp-stop-commercial_manual").touch(mode=0o600)
+            assert p.wait(timeout=15)==0
+            closed()
+            policy(plan_id=too_low)
+            rejected(command(m["revision"],"commercial_too_low"))
+            assert not (root/"commercial_too_low").exists()
+            policy(plan_id=capped)
+            report["real_udp_commercial_manual_cap_and_unsupported_rate_denial"]=True
+            queued=call(base,route+"/udp-start",202,"POST",admin,{"expected_revision":m["revision"]})
+            p=subprocess.Popen([exe,"--runtime-udp-worker",str(root),mid,str(m["revision"]),str(relay),str(internal),"commercial_rate","240000","76800"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            children.append(p)
+            line(p,"UDP_PREVIEW_READY",45)
+            manifest=json.loads((root/"commercial_rate"/"manifest.json").read_text())
+            assert manifest["request_id"]==queued["request_id"] and manifest["byte_rate"]==2048 and manifest["burst_bytes"]==1200
+            assert exchange()
+            prefix=secrets.token_bytes(16)
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sender:
+                sender.bind(("127.0.0.1",0))
+                sender.settimeout(.1)
+                start=time.monotonic()
+                for n in range(5):
+                    sender.sendto(prefix+bytes([n])+secrets.token_bytes(783),("127.0.0.1",ingress))
+                replies=set()
+                while time.monotonic()-start<.3:
+                    try:
+                        reply,addr=sender.recvfrom(65535)
+                        assert addr==("127.0.0.1",ingress) and reply.startswith(prefix) and len(reply)==800
+                        replies.add(reply[16])
+                    except socket.timeout: pass
+                elapsed=time.monotonic()-start
+                actual=sum(v.startswith(prefix) and len(v)==800 for v in seen)
+                assert 0<len(replies)<=actual<5
+                assert actual*800<=1200+2048*elapsed and len(replies)*800<=1200+2048*elapsed
+            assert exchange()
+            report["real_udp_commercial_cap_tightens_operator_and_limits_payload"]=True
+            # Any managed UDP plan change latches stop; no live policy swap.
+            policy(plan_id=too_low)
+            policy(plan_id="legacy-v1")
+            assert p.wait(timeout=15)==0
+            closed()
+            state=call(base,route+"/runtime",200,token=admin)["request"]
+            assert state["request_id"]==queued["request_id"] and state["state"]=="stopped"
+            report["real_udp_commercial_plan_change_stops_old_generation"]=True
             p=launch("udp_second")
             assert exchange()
             call(base,"devices/"+device["id"]+"/revoke",204,"POST",admin)
@@ -386,4 +446,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==13 and all(v is True for v in report.values())
+assert len(report)==16 and all(v is True for v in report.values())
