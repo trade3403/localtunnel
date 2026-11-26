@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 
 type ManagedDevice={port:number;id:string}
-type ManagedSync={id:string;name:string;revision:number;mappings:{id:string;protocol:string;local_port:number;bind_port:number;enabled:boolean}[];last_seen_at:number;heartbeat_interval_seconds:number}
+type ManagedSync={id:string;name:string;revision:number;mappings:{id:string;protocol:string;local_port:number;bind_port:number;enabled:boolean;revision:number}[];last_seen_at:number;heartbeat_interval_seconds:number}
 const managementPort=ref<number|null>(1431)
 const managementName=ref('Windows 客户端')
 const pairingCode=ref('')
@@ -21,6 +21,7 @@ async function refreshManagement(){
   try{
     const result=await invoke<{observation:ManagedSync|null;error:string|null;blocked:boolean}>('management_snapshot')
     if(generation!==managementGeneration||managementBusy.value)return
+    if(managedSync.value?.revision!==result.observation?.revision||managedSync.value?.id!==result.observation?.id){importConfirm.value=false;leaseConfirm.value=false}
     managedSync.value=result.observation
     managementBlocked.value=result.blocked
     managementError.value=result.error||''
@@ -32,6 +33,36 @@ async function refreshManagement(){
 const managementMessage=ref('')
 const managementError=ref('')
 const forgetConfirm=ref(false)
+const importConfirm=ref(false)
+const leaseConfirm=ref(false)
+const leaseError=ref('')
+async function startManagedUdp(item:ManagedSync['mappings'][number]){
+  const snapshot=managedSync.value
+  if(!snapshot||!leaseConfirm.value||locked.value||managementBusy.value||managementBlocked.value||polling)return
+  managementGeneration++;managementBusy.value=true;busy.value=true;leaseConfirm.value=false
+  leaseError.value='';managementError.value='';managementMessage.value=''
+  try{
+    status.value=await invoke<Status>('management_start_udp',{id:item.id,expectedRevision:snapshot.revision,mappingRevision:item.revision,confirmed:true})
+    if(status.value.state!=='running')throw Error(status.value.detail)
+    managementMessage.value='短期 UDP 管理进程已启动；实际转发需中转端验证，授权到期自动停止'
+  }catch(e){leaseError.value=String(e)}
+  finally{busy.value=false;managementBusy.value=false;void refresh();void refreshManagement()}
+}
+async function importManagedUdp(item:ManagedSync['mappings'][number]){
+  const snapshot=managedSync.value
+  if(!snapshot||!importConfirm.value||locked.value||managementBusy.value||managementBlocked.value||polling)return
+  const revision=snapshot.revision
+  managementGeneration++;managementBusy.value=true;busy.value=true;importConfirm.value=false
+  managementError.value='';managementMessage.value=''
+  try{
+    const draft=await invoke<{protocol:Protocol;name:string;localPort:number}>('management_import_udp',{id:item.id,expectedRevision:revision,mappingRevision:item.revision,confirmed:true})
+    if(running.value||serviceBusy.value)throw Error('隧道状态变化，未导入')
+    // Do not reuse credentials, an endpoint or an engine from a different mapping.
+    engine.value='';remote.value='';serverKey.value='';mappings.value=[{...draft,id:nextId++,token:''}]
+    managementMessage.value='UDP 草稿已导入，请填写独立中转参数及授权 Token；未启动隧道'
+  }catch(e){managementError.value=String(e);managedSync.value=null}
+  finally{busy.value=false;managementBusy.value=false;void refresh();void refreshManagement()}
+}
 async function loadManagement(){
   managementBusy.value=true
   try{
@@ -42,7 +73,7 @@ async function loadManagement(){
 }
 async function managementAction(action:'pair'|'sync'|'forget'){
   if(managementBusy.value||!managementReady.value)return
-  managementGeneration++;managementBusy.value=true;managementError.value='';managementMessage.value=''
+  managementGeneration++;managementBusy.value=true;importConfirm.value=false;leaseConfirm.value=false;leaseError.value='';managementError.value='';managementMessage.value=''
   try{
     if(action==='pair'){
       if(!Number.isInteger(managementPort.value)||Number(managementPort.value)<1024||Number(managementPort.value)>65535)throw Error('请输入 1024–65535 的管理端口')
@@ -64,9 +95,10 @@ async function managementAction(action:'pair'|'sync'|'forget'){
   finally{managementBusy.value=false;void refreshManagement()}
 }
 
-type Mapping = { id: number; name: string; localPort: number | null; token: string }
-type Profile = { engine: string; remote: string; serverKey: string; mappings: { name: string; localPort: number }[] }
-type StartRequest = Omit<Profile, 'mappings'> & { mappings: { name: string; localPort: number; token: string }[] }
+type Protocol = 'tcp' | 'udp'
+type Mapping = { id: number; protocol: Protocol; name: string; localPort: number | null; token: string }
+type Profile = { engine: string; remote: string; serverKey: string; mappings: { protocol: Protocol; name: string; localPort: number }[] }
+type StartRequest = Omit<Profile, 'mappings'> & { mappings: { protocol: Protocol; name: string; localPort: number; token: string }[] }
 type Status = { state: 'stopped' | 'running' | 'error'; detail: string; mappingCount: number }
 type Transport = { state: 'inactive' | 'unknown' | 'established' | 'not_observed'; established: number | null; matchScope: 'none' | 'ip_port' | 'port_only' }
 const transport = ref<Transport>({ state: 'inactive', established: null, matchScope: 'none' })
@@ -102,7 +134,7 @@ async function maintainService(action: 'update' | 'unregister') {
     if (action === 'update') {
       await invoke('update_service_profile', { name, confirmation: maintenanceConfirm.value, request: {
         engine: '', remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+        mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: m.localPort, token: m.token }))
       } })
       serviceActionNotice.value = '配置已更新，服务保持禁用；检查后可设为手动启动'
     } else {
@@ -133,7 +165,7 @@ async function provisionService() {
   try {
     const name = await invoke<string>('provision_service', { request: {
       engine: '', remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-      mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+      mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: m.localPort, token: m.token }))
     } })
     serviceName.value = name
     watchedService.value = name
@@ -231,7 +263,7 @@ const engine = ref('')
 const remote = ref('')
 const serverKey = ref('')
 let nextId = 2
-const mappings = ref<Mapping[]>([{ id: 1, name: 'web', localPort: 8080, token: '' }])
+const mappings = ref<Mapping[]>([{ id: 1, protocol: 'tcp', name: 'web', localPort: 8080, token: '' }])
 const status = ref<Status>({ state: 'stopped', detail: '正在获取进程状态', mappingCount: 0 })
 const busy = ref(false)
 const error = ref('')
@@ -248,6 +280,7 @@ async function refresh() {
   polling = true
   try {
     status.value = await invoke<Status>('tunnel_status')
+    if(status.value.state!=='running'&&managementMessage.value.startsWith('短期 UDP 管理进程已启动'))managementMessage.value='短期 UDP 管理进程已结束；请查看进程状态'
     ready.value = true
     try { traffic.value = await invoke<Traffic>('traffic_status') } catch { traffic.value = null }
     try {
@@ -271,7 +304,7 @@ onMounted(() => { void refresh(); void loadManagement(); timer = setInterval(() 
 onUnmounted(() => { if (timer) clearInterval(timer) })
 function add() {
   if (locked.value || mappings.value.length >= 64) return
-  mappings.value.push({ id: nextId++, name: '', localPort: 8080, token: '' })
+  mappings.value.push({ id: nextId++, protocol: 'tcp', name: '', localPort: 8080, token: '' })
 }
 function remove(id: number) {
   if (!locked.value && mappings.value.length > 1) mappings.value = mappings.value.filter(m => m.id !== id)
@@ -288,7 +321,7 @@ async function profileAction(action: 'save' | 'load') {
       }
       const profile: Profile = {
         engine: engine.value.trim(), remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: Number(m.localPort) }))
+        mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: Number(m.localPort) }))
       }
       await invoke('save_profile', { profile })
       notice.value = '配置已保存（不包含授权 Token）'
@@ -314,7 +347,7 @@ function currentRequest(): StartRequest {
   }
   return {
     engine: engine.value.trim(), remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-    mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: Number(m.localPort), token: m.token }))
+    mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: Number(m.localPort), token: m.token }))
   }
 }
 async function protectedAction(action: 'save' | 'load' | 'forget') {
@@ -344,6 +377,7 @@ async function protectedAction(action: 'save' | 'load' | 'forget') {
   } finally { busy.value = false; void refresh() }
 }
 async function probe(mapping: Mapping) {
+  if (mapping.protocol !== 'tcp') return
   if (!ready.value || busy.value || !Number.isInteger(mapping.localPort) || Number(mapping.localPort) < 1 || Number(mapping.localPort) > 65535) return
   const port = Number(mapping.localPort)
   const id = mapping.id
@@ -368,7 +402,7 @@ async function toggle() {
       }
       status.value = await invoke<Status>('start_tunnel', { request: {
         engine: engine.value.trim(), remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+        mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: m.localPort, token: m.token }))
       } })
     }
   } catch (e) {
@@ -393,7 +427,7 @@ async function toggle() {
       </div>
       <section>
         <div class="section-title"><h2>管理设备配对</h2><span>V0.4 本机控制面预览</span></div>
-        <p class="hint">仅 HTTP 127.0.0.1 本机管理服务；不会自动启动或修改现有隧道。配对后由 Rust 每30秒自动同步管理心跳与期望配置元数据，关闭窗口至托盘时仍继续。</p>
+        <p class="hint">仅 HTTP 127.0.0.1 本机管理服务；不会自动启动或修改现有隧道；短期 UDP 管理会话需要明确确认。配对后由 Rust 每30秒自动同步管理心跳与期望配置元数据，关闭窗口至托盘时仍继续。</p>
         <div v-if="!managedDevice" class="fields">
           <label>本机管理端口<input aria-label="本机管理端口" type="number" min="1024" max="65535" v-model.number="managementPort" :disabled="managementBusy||!managementReady"/></label>
           <label>设备名称<input aria-label="管理设备名称" v-model="managementName" maxlength="128" :disabled="managementBusy||!managementReady"/></label>
@@ -408,19 +442,24 @@ async function toggle() {
         <p v-if="managedDevice" class="hint">已配对 ID：{{ managedDevice.id }} · 127.0.0.1:{{ managedDevice.port }}</p>
         <p v-if="managedDevice" class="hint" data-testid="management-auto-state">{{ managementBlocked?'认证拒绝，自动同步已停止':managedSync?'自动同步已收到管理配置':managementError?'同步失败，等待重试':'等待自动同步' }}</p>
         <div v-if="managedSync" aria-live="polite">
-          <p>管理配置版本：{{managedSync.revision}} · 期望映射：{{managedSync.mappings.length}} · 管理模式：idle（未应用隧道配置）</p>
+          <p>管理配置版本：{{managedSync.revision}} · 期望映射：{{managedSync.mappings.length}} · 管理心跳：idle（元数据接收，不代表业务运行状态）</p>
           <p class="hint">最近心跳：{{new Date(managedSync.last_seen_at*1000).toLocaleString()}}；自动同步间隔约30秒（请求耗时另计）。不是实际隧道在线证明。</p>
-          <p v-for="item in managedSync.mappings" :key="item.id" class="hint">{{item.protocol.toUpperCase()}} · 本地 {{item.local_port}} → 中转 {{item.bind_port}} · {{item.enabled?'期望启用':'草稿禁用'}}</p>
+          <label v-if="managedSync.mappings.some(m=>m.protocol==='udp'&&!m.enabled)"><input type="checkbox" aria-label="确认导入 UDP 草稿" v-model="importConfirm" :disabled="locked||managementBusy"/> 确认替换当前编辑表单并清空旧连接参数及 Token（不修改已保存配置或后台服务）</label>
+          <label v-if="managedSync.mappings.some(m=>m.protocol==='udp'&&!m.enabled)"><input type="checkbox" aria-label="确认启动短期 UDP 管理会话" v-model="leaseConfirm" :disabled="locked||managementBusy"/> 确认启动短期 UDP 管理会话（仅本机中转，最长60秒，不保存授权 Token）</label>
+          <div v-for="item in managedSync.mappings" :key="item.id"><p class="hint">{{item.protocol.toUpperCase()}} · 本地 {{item.local_port}} → 中转 {{item.bind_port}} · {{item.enabled?'期望启用':'草稿禁用'}}</p>
+          <button v-if="item.protocol==='udp'&&!item.enabled" type="button" class="secondary" :disabled="locked||managementBusy||managementBlocked||!importConfirm" @click="importManagedUdp(item)">导入 UDP 草稿</button>
+          <button v-if="item.protocol==='udp'&&!item.enabled" type="button" class="secondary" :disabled="locked||managementBusy||managementBlocked||!leaseConfirm" @click="startManagedUdp(item)">启动短期 UDP 管理会话</button></div>
         </div>
         <p v-if="managementMessage" class="hint" role="status">{{managementMessage}}</p>
         <p v-if="managementError" class="error" role="alert">{{managementError}}</p>
+        <p v-if="leaseError" class="error" role="alert">{{leaseError}}</p>
       </section>
       <section>
-        <div class="section-title"><h2>桌面隧道流量</h2><span>{{ traffic?.state === 'measured' ? '实际 TCP 数据' : '未计量 / 未启动' }}</span></div>
+        <div class="section-title"><h2>桌面隧道流量</h2><span>{{ traffic?.state === 'measured' ? '实际应用数据' : '未计量 / 未启动' }}</span></div>
         <div class="summary">
           <div><small>上传速度</small><strong class="protocol">{{ formatBytes(traffic?.uploadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.uploadBytes) }}</span></div>
           <div><small>下载速度</small><strong class="protocol">{{ formatBytes(traffic?.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.downloadBytes) }}</span></div>
-          <div><small>计量范围</small><strong class="protocol">本次会话</strong><span>不含加密/TCP 开销</span></div>
+          <div><small>计量范围</small><strong class="protocol">本次会话</strong><span>不含加密及传输开销</span></div>
         </div>
         <p class="hint">以上为本次桌面会话；历史统计每 5 秒保存，正常停止时保存最终值。</p>
         <div class="summary">
@@ -428,6 +467,7 @@ async function toggle() {
           <div><small>历史累计下载</small><strong class="protocol">{{ formatBytes(trafficHistory?.saved?.downloadBytes) }}</strong><span>本机已保存</span></div>
           <div><small>最近保存</small><strong class="protocol">{{ trafficHistory?.saved ? new Date(trafficHistory.saved.savedAtMs).toLocaleTimeString() : '—' }}</strong><span>仅桌面模式</span></div>
         </div>
+        <p v-if="running && mappings.some(m=>m.protocol==='udp')" class="hint">UDP 与 TCP 合并计量；UDP 每映射最多32来源、1200字节/包，固定包速率保护。</p>
         <p v-if="historyError || trafficHistory?.writeFailed" class="error" role="alert">历史流量读取或保存失败，已保留原记录。</p>
         <p class="hint">历史包含已保存的本次会话流量，不能重复相加；异常断电可能丢失最后一段未保存数据。不包含协议开销、后台服务或计费数据。</p>
       </section>
@@ -442,7 +482,7 @@ async function toggle() {
         </div>
         <div class="profile-actions">
           <label><input type="checkbox" aria-label="确认部署新服务" v-model="provisionConfirm" :disabled="serviceBusy" /> 使用下方映射配置创建新服务，允许系统级加密保存 Token</label>
-          <button type="button" class="secondary" :disabled="locked || !provisionConfirm" @click="provisionService">一键部署新服务</button>
+          <button type="button" class="secondary" :disabled="locked || !provisionConfirm || mappings.some(m=>m.protocol!=='tcp')" @click="provisionService">一键部署新服务</button>
         </div>
         <p class="hint">需要以管理员身份运行客户端；创建全新服务，不覆盖旧配置。默认停止且手动启动。失败时保留受保护目录供检查。</p>
         <p v-if="watchedService" class="hint">监测：{{ watchedService }}</p>
@@ -457,14 +497,14 @@ async function toggle() {
           <div><small>服务下载速度</small><strong class="protocol">{{ formatBytes(serviceSnapshot.traffic.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(serviceSnapshot.traffic.downloadBytes) }}</span></div>
           <div><small>计量引擎 PID</small><strong>{{ serviceSnapshot.traffic.enginePid }}</strong><span>本次引擎会话</span></div>
         </div>
-        <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照暂不可用（权限不足、恢复中或尚未采样）。</p>
+        <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照不可用（权限不足、恢复中、尚未采样或计量器异常）。</p>
         <div v-if="serviceSnapshot?.history" class="summary">
           <div><small>服务历史累计上传</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.uploadBytes) }}</strong><span>已保存</span></div>
           <div><small>服务历史累计下载</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.downloadBytes) }}</strong><span>已保存</span></div>
           <div><small>最近保存</small><strong class="protocol">{{ new Date(serviceSnapshot.history.savedAtMs).toLocaleTimeString() }}</strong><span>独立于桌面历史</span></div>
         </div>
         <p v-else-if="serviceSnapshot" class="hint">服务历史暂无可读记录（未配置、未保存或权限不足）。</p>
-        <p v-if="serviceSnapshot?.history" class="hint">已保存历史含本次已保存增量，不与会话流量重复相加；强制结束可能丢失未保存增量。</p>
+        <p v-if="serviceSnapshot?.history" class="hint">已保存历史包含实际计量的 TCP/UDP 应用字节；不与会话流量重复相加，强制结束可能丢失未保存增量。</p>
         <div v-if="serviceSnapshot" class="profile-actions">
           <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService" @click="serviceAction('check')">检查服务配置</button>
           <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.state !== 'stopped' || serviceSnapshot.startup === 'disabled'" @click="serviceAction('start')">启动服务</button>
@@ -479,7 +519,7 @@ async function toggle() {
           <label class="wide">维护确认：完整输入当前服务名称<input v-model="maintenanceConfirm" :disabled="serviceBusy" maxlength="51" autocomplete="off" :placeholder="watchedService" /></label>
         </div>
         <div v-if="serviceSnapshot?.state === 'stopped'" class="profile-actions">
-          <button type="button" class="secondary" :disabled="serviceBusy || busy || running || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService" @click="maintainService('update')">使用下方表单更新服务配置</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || busy || running || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService || mappings.some(m=>m.protocol!=='tcp')" @click="maintainService('update')">使用下方表单更新服务配置</button>
           <button type="button" class="secondary" :disabled="serviceBusy || busy || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService" @click="maintainService('unregister')">注销服务注册</button>
         </div>
         <p v-if="serviceSnapshot?.state === 'stopped'" class="hint">更新将替换整套加密配置并保持禁用，需手动恢复启动方式；注销只删除服务注册，不删除配置或历史目录。不会读取或显示旧 Token。</p>
@@ -515,8 +555,8 @@ async function toggle() {
             <input v-model.number="mapping.localPort" :disabled="locked" aria-label="本地端口" required type="number" min="1" max="65535" />
             <input v-model="mapping.token" :disabled="locked" aria-label="映射授权 Token" required type="password" autocomplete="off" minlength="32" maxlength="128" placeholder="输入授权 Token" />
             <button type="button" class="remove" :disabled="locked || mappings.length === 1" @click="remove(mapping.id)" aria-label="删除映射">×</button>
-          </div><div class="port-actions"><button type="button" class="secondary" :disabled="busy || !ready" @click="probe(mapping)">检测本地端口</button><span role="status">{{ portNotice[mapping.id] || "未检测" }}</span></div></div>
-          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。停止隧道后可编辑配置；域名由服务端分配。</p>
+          </div><div class="port-actions"><label>协议 <select v-model="mapping.protocol" :disabled="locked" aria-label="映射协议" @change="delete portNotice[mapping.id]"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label><button type="button" class="secondary" :disabled="busy || !ready || mapping.protocol!=='tcp'" @click="probe(mapping)">检测本地端口</button><span role="status">{{ mapping.protocol==='udp' ? 'UDP 不支持 TCP 端口探测' : (portNotice[mapping.id] || "未检测") }}</span></div></div>
+          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。UDP 须与中转映射协议一致，支持桌面及后台服务；每会话最多8个 UDP 映射。停止隧道后可编辑配置；域名由服务端分配。</p>
         </section>
         <div class="actions">
           <div aria-live="polite"><strong>{{ label }}</strong><p>{{ status.detail }}</p><p v-if="error" class="error" role="alert">{{ error }}</p></div>

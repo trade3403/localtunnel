@@ -61,18 +61,24 @@ def verified_bytes(archive,target,pin):
             raise RuntimeError("wrong native Mach-O engine architecture")
     return name,binary,archive_digest,binary_digest
 
-def acquire(directory):
+def acquire(directory, archive_path=None):
     lock=json.loads(LOCK.read_text(encoding="utf-8"))
     if lock["version"]!=VERSION:
         raise RuntimeError("unexpected engine lock version")
     target=native_target()
     if target in lock.get("source_targets",{}):
+        if archive_path is not None:
+            raise ValueError("offline archive is not supported for source-built target")
         from native_source_engine import build
         return build(directory,VERSION,lock["source_targets"][target])
     pin=lock["targets"][target]
     url=f"https://github.com/rathole-org/rathole/releases/download/{VERSION}/rathole-{target}.zip"
-    with urllib.request.urlopen(url,timeout=90) as response:
-        archive=response.read(20*1024*1024+1)
+    if archive_path is None:
+        with urllib.request.urlopen(url,timeout=90) as response:
+            archive=response.read(20*1024*1024+1)
+    else:
+        with Path(archive_path).open("rb") as response:
+            archive=response.read(20*1024*1024+1)
     name,binary,archive_digest,binary_digest=verified_bytes(archive,target,pin)
     path=directory/name
     with path.open("xb") as stream:

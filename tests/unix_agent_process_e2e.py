@@ -121,6 +121,8 @@ def exercise(d, binary, cli, body, local_port, private, public, results, port, w
         if os.environ.get("LOCALTUNNEL_NATIVE_AGENT_SERVICE_E2E")=="1":
             from unix_agent_service_e2e import exercise as service_exercise
             service_exercise(root,agent_cli,url,body,relay,token,results,get)
+        from unix_agent_udp_e2e import exercise as udp_exercise
+        udp_exercise(d,binary,agent_cli,private,public,results,port,terminate)
         if os.environ.get("LOCALTUNNEL_NATIVE_AGENT_PACKAGE_E2E")=="1":
             package_report=json.loads((results/"unix-package.json").read_text(encoding="utf-8"))
             assert package_report["agent_cli_sha256"]==report["agent_cli_sha256"]

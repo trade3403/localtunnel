@@ -120,19 +120,19 @@ async function removeMapping(m:Mapping){await run(async()=>{
   await refresh();notice.value='映射已删除'
 })}
 async function addMapping(){await run(async()=>{
-  await send('/mappings','POST',{...create,domain_id:create.protocol==='tcp'?null:create.domain_id})
+  await send('/mappings','POST',{...create,domain_id:['http','https'].includes(create.protocol)?create.domain_id:null})
   await refresh();notice.value='禁用映射草稿已创建'
 })}
 async function inspectMapping(m:Mapping){await run(async()=>{selectedMapping.value=m;runtime.value=null;traffic.value=[];runtime.value=await get('/mappings/'+m.id+'/runtime');await readTraffic(m.id)})}
 async function startMapping(){await run(async()=>{
   const m=selectedMapping.value;if(!m)return
-  await send('/mappings/'+m.id+'/start','POST',{expected_revision:m.revision});runtime.value=await get('/mappings/'+m.id+'/runtime');notice.value='启动请求已提交，等待本地执行器'
+  await send('/mappings/'+m.id+(m.protocol==='udp'?'/udp-start':'/start'),'POST',{expected_revision:m.revision});runtime.value=await get('/mappings/'+m.id+'/runtime');notice.value='启动请求已提交，等待本地执行器'
 })}
 async function stopMapping(){await run(async()=>{
   const m=selectedMapping.value,r=runtime.value?.request;if(!m||!r)return
   await send('/mappings/'+m.id+'/stop','POST',{request_id:r.request_id});runtime.value=await get('/mappings/'+m.id+'/runtime');notice.value='停止请求已提交'
 })}
-const canStart=computed(()=>selectedMapping.value && !selectedMapping.value.enabled && selectedMapping.value.protocol!=='tcp' && runtime.value!==null && (!runtime.value.request||runtime.value.request.state==='stopped'||(runtime.value.request.state==='queued'&&runtime.value.request.updated_at<Math.floor(Date.now()/1000)-120)))
+const canStart=computed(()=>selectedMapping.value && !selectedMapping.value.enabled && ['http','https','udp'].includes(selectedMapping.value.protocol) && runtime.value!==null && (!runtime.value.request||runtime.value.request.state==='stopped'||(runtime.value.request.state==='queued'&&runtime.value.request.updated_at<Math.floor(Date.now()/1000)-120)))
 const canStop=computed(()=>runtime.value?.request && ['queued','starting','running','stopping'].includes(runtime.value.request.state))
 function time(v:number|null){return v?new Date(v*1000).toLocaleString('zh-CN'):'未验证'}
 function nameOf<T extends {id:string}>(rows:T[],id:string|null,field:keyof T){return rows.find(x=>x.id===id)?.[field]||id||'—'}
@@ -213,11 +213,11 @@ onBeforeUnmount(clearPair)
           <a-card title="新建映射草稿"><p class="muted">设备、节点与域名选择来自已加载列表，可在对应页面加载更多。</p><form class="mapping-form" @submit.prevent="addMapping">
             <label>设备<a-select data-testid="mapping-device" v-model:value="create.device_id" aria-label="设备" :options="devices.filter(d=>d.enabled).map(d=>({value:d.id,label:d.name}))"/></label>
             <label>节点<a-select data-testid="mapping-node" v-model:value="create.node_id" aria-label="节点" :options="nodes.filter(n=>n.enabled).map(n=>({value:n.id,label:n.name}))"/></label>
-            <label>协议<a-select v-model:value="create.protocol" aria-label="协议" :options="['http','https','tcp'].map(v=>({value:v,label:v.toUpperCase()}))"/></label>
-            <label v-if="create.protocol!=='tcp'">域名<a-select data-testid="mapping-domain" v-model:value="create.domain_id" aria-label="映射域名" :options="domains.map(d=>({value:d.id,label:d.hostname}))"/></label>
+            <label>协议<a-select data-testid="mapping-protocol" v-model:value="create.protocol" aria-label="协议" :options="['http','https','tcp','udp'].map(v=>({value:v,label:v.toUpperCase()}))"/></label>
+            <label v-if="['http','https'].includes(create.protocol)">域名<a-select data-testid="mapping-domain" v-model:value="create.domain_id" aria-label="映射域名" :options="domains.map(d=>({value:d.id,label:d.hostname}))"/></label>
             <label>本地端口<a-input-number v-model:value="create.local_port" :min="1" :max="65535"/></label>
             <label>中转端口<a-input-number v-model:value="create.bind_port" :min="20000" :max="29999"/></label>
-            <a-button type="primary" html-type="submit" :loading="busy" :disabled="!create.device_id||!create.node_id||(create.protocol!=='tcp'&&!create.domain_id)">创建草稿</a-button>
+            <a-button type="primary" html-type="submit" :loading="busy" :disabled="!create.device_id||!create.node_id||(['http','https'].includes(create.protocol)&&!create.domain_id)">创建草稿</a-button>
           </form></a-card>
           <a-card title="映射列表"><a-table :data-source="mappings" row-key="id" :pagination="{pageSize:10}" :scroll="{x:750}">
             <a-table-column title="协议" data-index="protocol"/><a-table-column title="域名"><template #default="{record}">{{nameOf(domains,record.domain_id,'hostname')}}</template></a-table-column>
@@ -233,9 +233,9 @@ onBeforeUnmount(clearPair)
               <a-space><a-button type="primary" html-type="submit" :loading="busy">保存端口</a-button><a-button aria-label="取消编辑" :disabled="busy" @click="editDraft=null">取消</a-button></a-space>
             </form>
           </a-card>
-          <a-card v-if="selectedMapping" title="运行请求详情" size="small"><p>{{selectedMapping.id}}</p><p data-testid="runtime-state">{{runtime?labels[runtime.request?.state||'']||'尚无请求':'查询中'}}</p><p class="muted">执行器最近更新：{{runtime?.worker_recent?'是':'否'}}；不是实时业务探测。</p><a-space><a-button type="primary" :disabled="busy||!canStart" @click="startMapping">请求启动</a-button><a-button danger :disabled="busy||!canStop" @click="stopMapping">请求停止</a-button><a-button :disabled="busy" @click="inspectMapping(selectedMapping)">刷新状态</a-button></a-space>
+          <a-card v-if="selectedMapping" title="运行请求详情" size="small"><p>{{selectedMapping.id}}</p><p data-testid="runtime-state">{{runtime?labels[runtime.request?.state||'']||'尚无请求':'查询中'}}</p><p v-if="selectedMapping.protocol==='udp'" class="muted">UDP 仅限可信操作员预配置的本机回显预览；请求启动不代表实际运行或公网可达。</p><p class="muted">执行器最近更新：{{runtime?.worker_recent?'是':'否'}}；不是实时业务探测。</p><a-space><a-button type="primary" :disabled="busy||!canStart" @click="startMapping">请求启动</a-button><a-button danger :disabled="busy||!canStop" @click="stopMapping">请求停止</a-button><a-button :disabled="busy" @click="inspectMapping(selectedMapping)">刷新状态</a-button></a-space>
             <a-divider/>
-            <h3>网关流量观测</h3><p class="muted">已完成的 HTTP/HTTPS 请求长度与响应发送字节，含业务探测，非加密链路总量或计费；最多最近50次运行。</p>
+            <h3>网关流量观测</h3><p v-if="selectedMapping.protocol==='udp'" class="muted">UDP 暂无网关流量统计；不显示虚构计费数据。</p><p class="muted">已完成的 HTTP/HTTPS 请求长度与响应发送字节，含业务探测，非加密链路总量或计费；最多最近50次运行。</p>
             <p v-if="!traffic.length" data-testid="traffic-empty">暂无流量观测</p>
             <a-table v-else data-testid="traffic-table" :data-source="traffic" row-key="request_id" size="small" :pagination="{pageSize:5}" :scroll="{x:600}">
               <a-table-column title="请求数" data-index="requests"/>

@@ -1,4 +1,4 @@
-LocalTunnel V0.6 native agent development preview (unsigned)
+LocalTunnel native agent development preview (unsigned)
 
 Requires Python 3 for the installer and a trusted local filesystem. Obtain
 install.py, the matching OS/architecture archive, and its expected SHA256
@@ -14,6 +14,9 @@ Using the installed localtunnel-agent executable:
   agent-config-create /absolute/store SERVER:PORT NAME 127.0.0.1:PORT
     Supply token and server public key on two lines via protected stdin;
     do not put the token on the command line or in shell history.
+  For a single UDP mapping instead, use agent-config-create-udp with the
+    same arguments and stdin format, in a NEW private store. The relay must
+    use the matching UDP mapping. Do not mix protocols in this store.
   agent-engine-install /absolute/store /absolute/install-dir/rathole
   agent-config-check /absolute/store
   agent-run /absolute/store

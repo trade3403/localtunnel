@@ -19,7 +19,7 @@ mod service_control;
 #[cfg(windows)]
 mod service_provision;
 
-use localtunnel::{client_configs, ClientMapping};
+use localtunnel::{client_mixed_configs, ClientMapping, MappingProtocol};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, net::SocketAddr, path::Path, process::{Child, Command, Stdio}, sync::Mutex};
 use tempfile::TempDir;
@@ -28,6 +28,8 @@ use tauri::Manager;
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Mapping {
+    #[serde(default = "default_protocol")]
+    protocol: String,
     name: String,
     local_port: u16,
     token: String,
@@ -50,6 +52,15 @@ struct Status {
     mapping_count: usize,
 }
 
+fn default_protocol() -> String { "tcp".into() }
+
+fn validate_service_protocols(request: &StartRequest) -> Result<(), String> {
+    if request.mappings.iter().any(|m| !matches!(m.protocol.as_str(), "tcp" | "udp")) {
+        return Err("Windows 后台服务仅支持 TCP 或 UDP 映射".into());
+    }
+    Ok(())
+}
+
 struct Running {
     child: Child,
     #[cfg(windows)]
@@ -61,6 +72,8 @@ struct Running {
     count: usize,
     relay_target: Option<transport::Target>,
     meter: Option<traffic::Meter>,
+    #[cfg(windows)]
+    managed: Option<management::LeaseSession>,
 }
 
 impl Running {
@@ -84,6 +97,8 @@ impl Running {
             count,
             relay_target: None,
             meter: None,
+            #[cfg(windows)]
+            managed: None,
         })
     }
 }
@@ -99,10 +114,16 @@ impl Drop for Running {
 struct Supervisor {
     running: Option<Running>,
     last_error: Option<String>,
+    generation: u64,
 }
 
 impl Supervisor {
     fn status(&mut self) -> Result<Status, String> {
+        #[cfg(windows)]
+        if self.managed_session().is_some_and(|s|std::time::Instant::now()>=s.deadline){
+            self.stop()?;
+            self.last_error=Some("UDP 管理授权到期，隧道已停止".into());
+        }
         if let Some(running) = &mut self.running {
             if let Some(code) = running.child.try_wait().map_err(|_| "无法读取引擎进程状态")? {
                 self.last_error = Some(format!("引擎已退出：{code}"));
@@ -135,7 +156,8 @@ impl Supervisor {
             return Err("Windows 引擎必须为 EXE 文件".into());
         }
         // Validate original configuration before allocating any listeners.
-        build_config(&request)?;
+        let _validated = build_config(&request)?;
+        if runtime_root.is_some() { validate_service_protocols(&request)?; }
         let mut builder = tempfile::Builder::new();
         builder.prefix("localtunnel-client-");
         let directory = match runtime_root {
@@ -145,11 +167,15 @@ impl Supervisor {
         let staged_engine = engine_integrity::stage(engine, directory.path())?;
         let relay_port = request.remote.rsplit_once(':').and_then(|(_,p)| p.parse::<u16>().ok())
             .ok_or("invalid relay port")?;
-        let meter = traffic::Meter::start_with_history(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port, history_dir)?;
-        let mappings = request.mappings.iter().zip(meter.ports()).map(|(m, &port)| ClientMapping {
-            name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
-        }).collect::<Vec<_>>();
-        let config = client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)?;
+        // Every configured mapping uses its own protocol-matched meter.
+        let targets = request.mappings.iter().map(|m| Ok((MappingProtocol::parse(&m.protocol)?,m.local_port)))
+            .collect::<Result<Vec<_>,&str>>().map_err(str::to_owned)?;
+        let meter = traffic::Meter::start_mixed_with_history(&targets, relay_port, history_dir)?;
+        let mappings = request.mappings.iter().zip(targets.iter()).zip(meter.ports())
+            .map(|((m,&(protocol,_)),&port)| (protocol,ClientMapping {
+                name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
+            })).collect::<Vec<_>>();
+        let config = client_mixed_configs(&request.remote,&mappings,&request.server_key).map_err(str::to_owned)?;
         let target_ports = meter.ports().to_vec();
         #[cfg(windows)]
         let telemetry = if runtime_root.is_some() {
@@ -183,10 +209,22 @@ impl Supervisor {
         #[cfg(windows)]
         { running.telemetry = telemetry; }
         self.running = Some(running);
+        self.generation=self.generation.wrapping_add(1);
         self.last_error = None;
         self.status()
     }
 
+    #[cfg(windows)]
+    fn managed_session(&self)->Option<&management::LeaseSession>{
+        self.running.as_ref().and_then(|r|r.managed.as_ref())
+    }
+    #[cfg(windows)]
+    fn start_managed(&mut self,request:StartRequest,session:management::LeaseSession,history:&Path)->Result<Status,String>{
+        if std::time::Instant::now()>=session.deadline{return Err("UDP 授权已过期".into())}
+        self.start_in_with_history(request,None,Some(history))?;
+        self.running.as_mut().ok_or("引擎不可用")?.managed=Some(session);
+        self.status()
+    }
     fn transport_status(&mut self) -> Result<transport::Observation, String> {
         if self.status()?.state != "running" {
             return Ok(transport::Observation::inactive());
@@ -199,7 +237,10 @@ impl Supervisor {
     fn traffic_status(&mut self) -> Result<traffic::Snapshot, String> {
         if self.status()?.state != "running" { return Ok(traffic::Snapshot::inactive()); }
         Ok(self.running.as_mut().and_then(|r| r.meter.as_mut())
-            .map(|m| m.snapshot()).unwrap_or_else(traffic::Snapshot::inactive))
+            .map(|m| m.snapshot()).unwrap_or_else(|| traffic::Snapshot {
+                state: "unknown", upload_bytes: None, download_bytes: None,
+                upload_bytes_per_second: None, download_bytes_per_second: None
+            }))
     }
 
     #[cfg(windows)]
@@ -218,6 +259,7 @@ impl Supervisor {
     }
 
     fn stop(&mut self) -> Result<Status, String> {
+        self.generation=self.generation.wrapping_add(1);
         if let Some(running) = &mut self.running {
             if running.child.try_wait().map_err(|_| "无法读取进程状态")?.is_none() {
                 running.child.kill().map_err(|_| "无法停止隧道引擎")?;
@@ -250,12 +292,17 @@ impl Supervisor {
 }
 
 fn build_config(request: &StartRequest) -> Result<String, String> {
-    let mappings = request.mappings.iter().map(|m| ClientMapping {
-        name: &m.name,
-        local: SocketAddr::from(([127, 0, 0, 1], m.local_port)),
-        token: &m.token,
-    }).collect::<Vec<_>>();
-    client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)
+    if request.mappings.iter().filter(|m| m.protocol=="udp").count()>8 {
+        return Err("每个客户端会话最多支持8个 UDP 映射".into());
+    }
+    let mappings = request.mappings.iter().map(|m| {
+        Ok((MappingProtocol::parse(&m.protocol)?, ClientMapping {
+            name: &m.name,
+            local: SocketAddr::from(([127, 0, 0, 1], m.local_port)),
+            token: &m.token,
+        }))
+    }).collect::<Result<Vec<_>, &str>>().map_err(str::to_owned)?;
+    client_mixed_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)
 }
 
 fn bundled_engine(resource_dir: &Path) -> Result<std::path::PathBuf, String> {
@@ -470,6 +517,33 @@ async fn management_sync(app:tauri::AppHandle)->Result<serde_json::Value,String>
     #[cfg(not(windows))]{let _=app;Err("仅 Windows 支持设备配对".into())}
 }
 #[tauri::command]
+async fn management_import_udp(app:tauri::AppHandle,id:String,expected_revision:i64,mapping_revision:i64,confirmed:bool)->Result<profile::ProfileMapping,String>{
+    #[cfg(windows)]{
+        if !confirmed{return Err("请确认替换本地编辑草稿".into())}
+        let stopped=||->Result<(),String>{
+            let state=app.state::<Mutex<Supervisor>>();
+            let mut supervisor=state.lock().map_err(|_|"隧道状态不可用")?;
+            if supervisor.status()?.state=="running"{return Err("请先停止桌面隧道".into())}
+            Ok(())
+        };
+        stopped()?;
+        let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
+        let draft=management::import_udp_draft(&dir,&id,expected_revision,mapping_revision).await?;
+        stopped()?;
+        return Ok(draft)
+    }
+    #[cfg(not(windows))]{let _=(app,id,expected_revision,mapping_revision,confirmed);Err("仅 Windows 支持设备配对".into())}
+}
+#[tauri::command]
+async fn management_start_udp(app:tauri::AppHandle,id:String,expected_revision:i64,mapping_revision:i64,confirmed:bool)->Result<Status,String>{
+    #[cfg(windows)]{
+        if !confirmed{return Err("请确认启动短期 UDP 管理会话".into())}
+        let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
+        return management::start_udp(&app,&dir,&id,expected_revision,mapping_revision).await
+    }
+    #[cfg(not(windows))]{let _=(app,id,expected_revision,mapping_revision,confirmed);Err("仅 Windows 支持管理授权会话".into())}
+}
+#[tauri::command]
 fn management_snapshot()->Result<serde_json::Value,String>{
     #[cfg(windows)]{
         return serde_json::to_value(management::snapshot()?).map_err(|_|"管理状态格式无效".into())
@@ -480,7 +554,7 @@ fn management_snapshot()->Result<serde_json::Value,String>{
 async fn management_forget(app:tauri::AppHandle)->Result<(),String>{
     #[cfg(windows)]{
         let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
-        return management::forget(&dir).await
+        return management::forget(&dir,&app).await
     }
     #[cfg(not(windows))]{let _=app;Err("仅 Windows 支持设备配对".into())}
 }
@@ -568,12 +642,23 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port,management_saved,management_enroll,management_sync,management_snapshot,management_forget])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port,management_saved,management_enroll,management_sync,management_import_udp,management_start_udp,management_snapshot,management_forget])
         .setup(|app| {
             #[cfg(windows)]
             {
                 let dir=app.path().app_config_dir()?;
-                tauri::async_runtime::spawn(management::automatic(dir));
+                tauri::async_runtime::spawn(management::automatic(dir.clone()));
+                let handle=app.handle().clone();
+                tauri::async_runtime::spawn(management::monitor(handle.clone(),dir));
+                // Independent monotonic deadline enforcement even when a
+                // management network request is pending or the UI is hidden.
+                tauri::async_runtime::spawn(async move{
+                    loop{
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        let state=handle.state::<Mutex<Supervisor>>();
+                        if let Ok(mut supervisor)=state.lock(){if supervisor.managed_session().is_some(){let _=supervisor.status();}};
+                    }
+                });
             }
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
@@ -634,7 +719,7 @@ mod tests {
     fn request() -> StartRequest {
         StartRequest { engine: String::new(), remote: "relay.example.test:2333".into(),
             server_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            mappings: vec![Mapping { name: "web".into(), local_port: 5173, token: "a".repeat(32) }] }
+            mappings: vec![Mapping { protocol: "tcp".into(), name: "web".into(), local_port: 5173, token: "a".repeat(32) }] }
     }
 
     #[test]
@@ -643,6 +728,22 @@ mod tests {
         assert!(text.contains("local_addr = \"127.0.0.1:5173\""));
         assert!(text.contains("remote_public_key"));
         assert!(text.contains("type = \"noise\""));
+    }
+
+    #[test]
+    fn desktop_udp_legacy_default_and_service_boundary() {
+        let mut req = request();
+        let mut legacy = serde_json::to_value(&req).unwrap();
+        legacy["mappings"][0].as_object_mut().unwrap().remove("protocol");
+        let decoded: StartRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.mappings[0].protocol, "tcp");
+        assert!(validate_service_protocols(&decoded).is_ok());
+        req.mappings[0].protocol = "udp".into();
+        assert!(build_config(&req).unwrap().contains("type = \"udp\""));
+        assert!(validate_service_protocols(&req).is_ok());
+        req.mappings[0].protocol = "quic".into();
+        assert!(validate_service_protocols(&req).is_err());
+        assert!(build_config(&req).is_err());
     }
 
     #[test]
@@ -727,12 +828,12 @@ mod tests {
         let error = supervisor.start(StartRequest {
             engine: tampered_path.to_string_lossy().into_owned(),
             remote: relay_addr.to_string(), server_key: public.into(),
-            mappings: vec![Mapping { name: "web".into(), local_port, token: token.clone() }],
+            mappings: vec![Mapping { protocol: "tcp".into(), name: "web".into(), local_port, token: token.clone() }],
         }).err().expect("modified engine must not launch");
         assert!(error.contains("SHA-256"));
         assert!(supervisor.running.is_none());
         assert_eq!(supervisor.start(StartRequest { engine, remote: relay_addr.to_string(), server_key: public.into(),
-            mappings: vec![Mapping { name: "web".into(), local_port, token }] }).unwrap().state, "running");
+            mappings: vec![Mapping { protocol: "tcp".into(), name: "web".into(), local_port, token }] }).unwrap().state, "running");
         let until = Instant::now() + Duration::from_secs(25);
         let mut forwarded = false;
         while Instant::now() < until {

@@ -30,12 +30,48 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y nginx openssl curl
+          sudo apt-get install -y nginx openssl curl iproute2
       - name: Real encrypted loopback E2E
         shell: bash
         env:
           LOCALTUNNEL_GATEWAY_E2E: ${{ runner.os == 'Linux' && '1' || '0' }}
+          LOCALTUNNEL_UDP_E2E: '1'
         run: python tests/e2e.py
+      - name: Experimental real QUIC reverse stream (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          python -c 'import sys, platform; assert sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 14) and sys.platform == "linux" and platform.machine() == "x86_64", "QUIC wheel lock requires Linux x86_64 CPython 3.14"'
+          python -m venv "$RUNNER_TEMP/lt-quic-venv"
+          py="$RUNNER_TEMP/lt-quic-venv/bin/python"
+          wheels="$RUNNER_TEMP/lt-quic-wheels"
+          lock="$GITHUB_WORKSPACE/tests/quic-requirements-linux-x64-py314.txt"
+          mkdir "$wheels"
+          "$py" -m pip --isolated download --no-cache-dir --index-url https://pypi.org/simple --only-binary=:all: --require-hashes --dest "$wheels" -r "$lock"
+          (cd "$wheels" && sha256sum --check "$GITHUB_WORKSPACE/tests/quic-wheel.sha256")
+          "$py" -m pip --isolated install --no-cache-dir --no-index --only-binary=:all: --require-hashes --find-links "$wheels" --report test-results/quic-dependencies.json -r "$lock"
+          "$py" -m pip check
+          "$py" tests/quic_experiment.py test-results/quic-experiment.json
+      - name: Paired real Noise TCP and QUIC benchmark (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/lt-quic-venv/bin/python" tests/quic_experiment.py test-results/quic-noise-comparison.json --compare
+      - name: Real isolated kernel netem comparison (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/lt-quic-venv/bin/python" tests/quic_netem.py test-results
+      - name: Real QUIC admission limits and UDP outage recovery (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/lt-quic-venv/bin/python" tests/quic_experiment.py test-results/quic-resilience.json --resilience
       - name: Package CLI build
         shell: bash
         run: |

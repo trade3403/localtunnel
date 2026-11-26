@@ -84,6 +84,14 @@ fn file_meta(m: &Metadata) -> Result<()> {
 }
 
 pub fn create(root: &Path, remote: &str, name: &str, local: SocketAddr, input: impl Read) -> Result<()> {
+    create_for(root, remote, name, local, input, crate::MappingProtocol::Tcp)
+}
+
+pub fn create_udp(root: &Path, remote: &str, name: &str, local: SocketAddr, input: impl Read) -> Result<()> {
+    create_for(root, remote, name, local, input, crate::MappingProtocol::Udp)
+}
+
+fn create_for(root: &Path, remote: &str, name: &str, local: SocketAddr, input: impl Read, protocol: crate::MappingProtocol) -> Result<()> {
     private_dir(root)?;
     // Two newline-separated ASCII fields, token then server public key.
     // No environment fallback, command-line secret, or diagnostic echo.
@@ -98,7 +106,10 @@ pub fn create(root: &Path, remote: &str, name: &str, local: SocketAddr, input: i
     if fields.next().is_some() {
         return Err("expected exactly two credential lines");
     }
-    let config = crate::client_config(remote, name, local, token, key)?;
+    let config = match protocol {
+        crate::MappingProtocol::Tcp => crate::client_config(remote, name, local, token, key)?,
+        crate::MappingProtocol::Udp => crate::client_udp_config(remote, name, local, token, key)?,
+    };
     let path = root.join(FILE);
     let mut file = OpenOptions::new().create_new(true).write(true).mode(0o600)
         .open(&path).map_err(|_| "cannot create new private agent configuration")?;
@@ -134,8 +145,11 @@ fn validate_config(config: &str) -> Result<()> {
     let token = value(lines.get(14), "token = \"")?;
     let local = value(lines.get(15), "local_addr = \"")?.parse()
         .map_err(|_| "invalid generated agent configuration")?;
-    let expected = crate::client_config(remote, name, local, token, key)
-        .map_err(|_| "invalid generated agent configuration")?;
+    let expected = match lines[13] {
+        "type = \"tcp\"" => crate::client_config(remote, name, local, token, key),
+        "type = \"udp\"" => crate::client_udp_config(remote, name, local, token, key),
+        _ => return Err("invalid generated agent protocol"),
+    }.map_err(|_| "invalid generated agent configuration")?;
     if expected != config {
         return Err("invalid generated agent configuration");
     }

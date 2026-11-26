@@ -18,7 +18,7 @@ const TOTAL_DEVICE_LIMIT:i64=256;
 const QUOTA:Failure=(StatusCode::CONFLICT,"device quota reached");
 
 #[derive(Clone)]
-struct DeviceState {pool:SqlitePool,budget:Arc<Mutex<(Instant,u32)>>}
+struct DeviceState {pool:SqlitePool,budget:Arc<Mutex<(Instant,u32)>>,root:std::path::PathBuf}
 #[derive(Serialize)]
 struct Pairing {pairing_code:String,expires_in:i64}
 #[derive(Deserialize)]
@@ -60,14 +60,15 @@ impl DeviceState{
         Ok(())
     }
 }
-pub fn routes(pool:SqlitePool)->Router{
-    let state=DeviceState{pool,budget:Arc::new(Mutex::new((Instant::now(),0)))};
+pub fn routes(pool:SqlitePool,root:std::path::PathBuf)->Router{
+    let state=DeviceState{pool,budget:Arc::new(Mutex::new((Instant::now(),0))),root};
     Router::new()
         .route("/api/v1/devices/pairing-code",post(issue))
         .route("/api/v1/devices/enroll",post(enroll))
         .route("/api/v1/devices",get(list))
         .route("/api/v1/devices/{id}/identity",get(identity))
         .route("/api/v1/devices/{id}/config",get(config))
+        .route("/api/v1/devices/{id}/udp-lease",post(udp_lease))
         .route("/api/v1/devices/{id}/status",get(status).post(heartbeat))
         .route("/api/v1/devices/{id}/revoke",post(revoke))
         .layer(DefaultBodyLimit::max(4096)).with_state(state)
@@ -205,4 +206,65 @@ async fn status(State(s):State<DeviceState>,Path(id):Path<String>,headers:Header
         "SELECT d.id,d.enabled,d.revision,h.last_seen_at,h.reported_revision,h.reported_state,COALESCE(d.enabled=1 AND h.last_seen_at BETWEEN unixepoch()-? AND unixepoch(),0) FROM devices d JOIN users u ON u.id=d.owner_id JOIN admin_sessions a ON a.user_id=u.id LEFT JOIN device_status h ON h.device_id=d.id WHERE d.id=? AND a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
         .bind(ONLINE_SECONDS).bind(id).bind(admin).fetch_optional(&s.pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
     Ok(auth::uncached(Json(StatusView{device_id:id,enabled,desired_revision:revision,last_seen_at:last,reported_revision:reported,reported_state:state,management_online:online,configuration_current:online&&reported==Some(revision)})))
+}
+
+
+// Same-host experimental credential delivery. Never use this loopback HTTP
+// transport on a remote network. No executable paths or arbitrary targets.
+pub(crate) const UDP_LEASE_SECONDS:i64=60;
+#[derive(Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UdpLease {
+    pub device_id:String,pub device_revision:i64,pub mapping_id:String,pub mapping_revision:i64,
+    pub request_id:String,pub relay_port:u16,pub local_port:u16,pub token:String,
+    pub server_key:String,pub expires_at:i64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseRequest {mapping_id:String,device_revision:i64,mapping_revision:i64}
+#[derive(sqlx::FromRow)]
+struct LeaseEligibility {request_id:String,local_port:i64,now:i64}
+async fn lease_eligibility(pool:&SqlitePool,id:&str,c:&LeaseRequest,token:&[u8])->Result<LeaseEligibility,Failure>{
+    sqlx::query_as("SELECT r.request_id,m.local_port,unixepoch() AS now FROM devices d JOIN users u ON u.id=d.owner_id JOIN mappings m ON m.device_id=d.id AND m.owner_id=d.owner_id JOIN nodes n ON n.id=m.node_id JOIN runtime_requests r ON r.mapping_id=m.id WHERE d.id=? AND d.credential_digest=? AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND d.revision=? AND m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND n.enabled=1 AND r.mapping_revision=m.revision AND r.state IN ('starting','running') AND r.updated_at BETWEEN unixepoch()-10 AND unixepoch()")
+        .bind(id).bind(token).bind(c.device_revision).bind(&c.mapping_id).bind(c.mapping_revision)
+        .fetch_optional(pool).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)
+}
+#[cfg(target_os="linux")]
+fn read_udp_lease(root:&std::path::Path,rid:&str)->Result<UdpLease,Failure>{
+    use std::io::Read;
+    use std::os::unix::fs::{OpenOptionsExt,PermissionsExt};
+    if !valid_id(rid){return Err(CONFLICT)}
+    let dir=root.join(format!("udp-device-{rid}"));
+    let m=std::fs::symlink_metadata(&dir).map_err(|_|CONFLICT)?;
+    if !m.is_dir()||m.permissions().mode()&0o077!=0{return Err(CONFLICT)}
+    let file=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC)
+        .open(dir.join("lease.json")).map_err(|_|CONFLICT)?;
+    let m=file.metadata().map_err(|_|CONFLICT)?;
+    if !m.is_file()||m.permissions().mode()&0o077!=0||!(1..=4096).contains(&m.len()){return Err(CONFLICT)}
+    let mut bytes=Vec::new();
+    file.take(4097).read_to_end(&mut bytes).map_err(|_|CONFLICT)?;
+    if bytes.len()>4096{return Err(CONFLICT)}
+    serde_json::from_slice(&bytes).map_err(|_|CONFLICT)
+}
+#[cfg(not(target_os="linux"))]
+fn read_udp_lease(_: &std::path::Path,_:&str)->Result<UdpLease,Failure>{Err(CONFLICT)}
+async fn udp_lease(State(s):State<DeviceState>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<LeaseRequest>)->Result<Response,Failure>{
+    if !valid_id(&id){return Err(DENIED)}
+    let token=device_bearer(&headers)?;
+    if !valid_id(&c.mapping_id)||c.device_revision<1||c.mapping_revision<1{return Err(BAD)}
+    // Authenticate separately to retain the standard 401 revocation contract.
+    let authorized=sqlx::query_scalar::<_,i64>("SELECT count(*) FROM devices d JOIN users u ON u.id=d.owner_id WHERE d.id=? AND d.credential_digest=? AND d.enabled=1 AND u.enabled=1 AND u.role='admin'")
+        .bind(&id).bind(&token).fetch_one(&s.pool).await.map_err(|_|INTERNAL)?;
+    if authorized!=1{return Err(DENIED)}
+    let row=lease_eligibility(&s.pool,&id,&c,&token).await?;
+    let lease=read_udp_lease(&s.root,&row.request_id)?;
+    // Recheck authorization, request generation and freshness after file IO.
+    let current=lease_eligibility(&s.pool,&id,&c,&token).await?;
+    if lease.device_id!=id||lease.mapping_id!=c.mapping_id||lease.device_revision!=c.device_revision
+        ||lease.mapping_revision!=c.mapping_revision||lease.request_id!=row.request_id||current.request_id!=row.request_id
+        ||i64::from(lease.local_port)!=current.local_port||lease.relay_port<30000
+        ||lease.expires_at<=current.now||lease.expires_at>current.now+UDP_LEASE_SECONDS
+        ||lease.token.len()!=64||!lease.token.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))
+        ||lease.server_key.len()!=44{return Err(CONFLICT)}
+    Ok(auth::uncached(Json(lease)))
 }

@@ -1,9 +1,11 @@
 // Real installed WebView2 UI + Rust IPC + encrypted TCP. Node >=22.
 // Test-only loopback CDP endpoint; never enable debugging in app config.
 // No saved real credentials, screenshots, or payload logs.
+import assert from 'node:assert/strict'
 import { spawn, execFileSync } from 'node:child_process'
 import { createServer as tcpServer } from 'node:net'
 import { createServer as httpServer } from 'node:http'
+import { createSocket as udpSocket } from 'node:dgram'
 import { randomBytes } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile, rm, readFile, readdir } from 'node:fs/promises'
 import { dirname, join, resolve, basename } from 'node:path'
@@ -24,7 +26,7 @@ const report = { scope: 'installed WebView2 desktop and SCM DOM controls + real 
   start_clicked: false, encrypted_http: false, traffic_visible: false,
   native_close_hides: false, hidden_tunnel_works: false, native_restore: false,
   stop_clicked: false, forwarding_stopped: false, history_visible: false }
-let app, relay, socket, fixture, policy, alternate, management
+let app, relay, socket, fixture, policy, alternate, management, udpFixture
 let managementFile, managementCreated=false
 let serviceName
 report.service_provisioned = false
@@ -260,13 +262,23 @@ try {
   const publicKey = /Public Key:\s*([A-Za-z0-9+/=]+)/.exec(keys)?.[1]
   if (!privateKey || !publicKey) throw Error('test relay key generation failed')
   const token = randomBytes(32).toString('hex')
+  const udpToken = randomBytes(32).toString('hex')
+  const bindUdp = s => new Promise((ok,fail)=>{s.once('error',fail);s.bind(0,'127.0.0.1',()=>ok(s.address().port))})
+  udpFixture=udpSocket('udp4')
+  const udpLocal=await bindUdp(udpFixture)
+  udpFixture.on('message',(data,peer)=>udpFixture.send(data,peer.port,peer.address))
+  const reservation=udpSocket('udp4')
+  const udpMapped=await bindUdp(reservation)
+  await new Promise(ok=>reservation.close(ok))
   const config = join(work, 'server.toml')
   await writeFile(config, [
     '[server]', 'bind_addr = "127.0.0.1:' + relayPort + '"', 'heartbeat_interval = 5',
     '[server.transport]', 'type = "noise"', '[server.transport.noise]',
     'pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"', 'local_private_key = "' + privateKey + '"',
     '[server.services.web]', 'type = "tcp"', 'token = "' + token + '"',
-    'bind_addr = "127.0.0.1:' + mappedPort + '"', ''
+    'bind_addr = "127.0.0.1:' + mappedPort + '"',
+    '[server.services.udp_echo]', 'type = "udp"', 'token = "' + udpToken + '"',
+    'bind_addr = "127.0.0.1:' + udpMapped + '"', ''
   ].join('\n'))
   relay = launch(engine, [config])
   installDebugPolicy(debugPort)
@@ -324,6 +336,10 @@ try {
   const created=await manage('mappings','POST',admin,{device_id:device.id,node_id:nodeId,protocol:'tcp',local_port:localPort,bind_port:24001})
   if(created.status!==201)throw Error('management draft creation failed')
   const managedMapping=await created.json()
+  const udpCreated=await manage('mappings','POST',admin,{device_id:device.id,node_id:nodeId,protocol:'udp',local_port:localPort,bind_port:24002})
+  if(udpCreated.status!==201)throw Error('UDP desired draft creation failed')
+  const udpMapping=await udpCreated.json()
+  if(udpMapping.enabled!==false||udpMapping.domain_id!==null)throw Error('UDP draft incorrectly activated')
   const managementHwnd=await until('management native HWND',windowHandle)
   windowAction(managementHwnd,'close')
   await until('management window hidden',()=>windowAction(managementHwnd,'visible')==='False')
@@ -338,6 +354,44 @@ try {
   await until('management tray restored',()=>windowAction(managementHwnd,'visible')==='True')
   await waitText('管理配置版本：'+updated.reported_revision)
   await waitText('TCP · 本地 '+managedMapping.local_port+' → 中转 '+managedMapping.bind_port+' · 草稿禁用')
+  await waitText('UDP · 本地 '+udpMapping.local_port+' → 中转 '+udpMapping.bind_port+' · 草稿禁用')
+  // Explicit import of current UDP metadata must not reuse old tunnel
+  // credentials, start a process or change the saved service profile.
+  await until('UDP import confirmation required',()=>evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="导入 UDP 草稿"&&b.disabled)'))
+  await field('input[placeholder="relay.example.com:2333"]','127.0.0.1:'+relayPort)
+  await field('input[placeholder="X25519 公钥（Base64）"]',publicKey)
+  await field('input[aria-label="映射授权 Token"]',token)
+  await until('explicit UDP import accepted',async()=>{
+    if(await has('UDP 草稿已导入，请填写独立中转参数及授权 Token；未启动隧道'))return true
+    if(await has('处理中…'))return false
+    const confirm=await evaluate('(()=>{const c=document.querySelector("input[aria-label=\\"确认导入 UDP 草稿\\"]");if(!c||c.disabled)return false;if(!c.checked)c.click();return true})()')
+    if(!confirm)return false
+    await click('导入 UDP 草稿')
+    return false
+  })
+  assert.equal(await evaluate('document.querySelectorAll(".mapping").length'),1)
+  assert.equal(await evaluate('document.querySelector("select[aria-label=\\"映射协议\\"]").value'),'udp')
+  assert.equal(await evaluate('document.querySelector("input[aria-label=\\"映射名称\\"]").value'),'m_'+udpMapping.id)
+  assert.equal(await evaluate('Number(document.querySelector("input[aria-label=\\"本地端口\\"]").value)'),udpMapping.local_port)
+  for(const selector of ['input[placeholder="relay.example.com:2333"]','input[placeholder="X25519 公钥（Base64）"]','input[aria-label="映射授权 Token"]']){
+    assert.equal(await evaluate('document.querySelector('+JSON.stringify(selector)+').value'),'')
+  }
+  assert.equal(await has('进程运行中'),false)
+  report.real_management_udp_confirmed_draft_import=true
+  // Real Windows management server has no active Linux device worker.
+  // The actual API must refuse to supply a runnable grant.
+  await until('managed start confirmation required',()=>evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="启动短期 UDP 管理会话"&&b.disabled)'))
+  await until('unissued lease denied through actual API',async()=>{
+    if(await has('管理状态冲突，请检查后台'))return true
+    if(await has('处理中…'))return false
+    const confirm=await evaluate('(()=>{const c=document.querySelector("input[aria-label=\\"确认启动短期 UDP 管理会话\\"]");if(!c||c.disabled)return false;if(!c.checked)c.click();return true})()')
+    if(!confirm)return false
+    await click('启动短期 UDP 管理会话')
+    return false
+  })
+  assert.equal(await has('进程运行中'),false)
+  assert.equal(await evaluate('document.querySelector("input[aria-label=\\"映射授权 Token\\"]").value'),'')
+  report.real_management_unissued_udp_lease_denied=true
   // Real native process restart; DPAPI saved enrollment must be restored
   // and heartbeat sent without another enrollment or manual sync.
   trayMenu('quit')
@@ -379,6 +433,7 @@ try {
   const revokedState=await revoked.json()
   if(revoked.status!==200||revokedState.enabled||revokedState.management_online||revokedState.last_seen_at!==null)throw Error('revoked device still reports online')
   if(!await evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="同步管理状态"&&b.disabled)'))throw Error('revoked sync still enabled')
+  if(await evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="导入 UDP 草稿"&&!b.disabled)'))throw Error('revoked import still enabled')
   report.native_management_revocation_stops_automatic_sync=true
   if(await has('配置元数据及管理心跳同步成功'))throw Error('stale management status survived revoke')
   await evaluate('document.querySelector("input[aria-label=\\\"确认移除管理凭据\\\"]").click()')
@@ -445,6 +500,51 @@ try {
   report.forwarding_stopped = true
   await until('history visible', () => evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="桌面隧道流量");return !!s&&[...s.querySelectorAll(".summary div")].some(e=>e.querySelector("small")?.textContent==="历史累计上传"&&/^[1-9][0-9.]* (B|KiB|MiB|GiB|TiB)$/.test(e.querySelector("strong")?.textContent.trim()))})()'))
   report.history_visible = true
+
+  // Actual installed desktop mixed TCP/UDP session via the same real form.
+  await until('desktop editable for UDP',()=>evaluate('!!document.querySelector("select[aria-label=\\"映射协议\\"]:not(:disabled)")'))
+  await click('＋ 添加映射')
+  await until('UDP mapping row',()=>evaluate('document.querySelectorAll(".mapping-group").length===2'))
+  const second='.mapping-group + .mapping-group '
+  await field(second+'input[aria-label="映射名称"]','udp_echo')
+  await field(second+'input[aria-label="本地端口"]',udpLocal)
+  await field(second+'input[aria-label="映射授权 Token"]',udpToken)
+  await field(second+'select[aria-label="映射协议"]','udp')
+  await waitText('UDP 不支持 TCP 端口探测')
+  if(!await evaluate('document.querySelectorAll(".port-actions button")[1].disabled'))throw Error('UDP misleading TCP probe enabled')
+  await until('mixed start accepted',async()=>{
+    if(await has('进程运行中'))return true
+    if(await has('处理中…'))return false
+    await click('启动隧道')
+    return false
+  })
+  async function udpRoundTrip(){
+    const client=udpSocket('udp4')
+    const nonce=randomBytes(128)
+    return new Promise(ok=>{
+      let settled=false
+      const finish=v=>{if(settled)return;settled=true;clearTimeout(timer);try{client.close()}catch{};ok(v)}
+      const timer=setTimeout(()=>finish(false),900)
+      client.on('error',()=>finish(false))
+      client.on('message',(data,peer)=>{if(peer.address==='127.0.0.1'&&peer.port===udpMapped&&data.equals(nonce))finish(true)})
+      client.send(nonce,udpMapped,'127.0.0.1',err=>{if(err)finish(false)})
+    })
+  }
+  await until('actual mixed TCP UDP forwarding',async()=>await get(url)===body&&await udpRoundTrip(),35000)
+  await waitText('UDP 与 TCP 合并计量；UDP 每映射最多32来源、1200字节/包，固定包速率保护。')
+  await until('mixed session measured',()=>evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="桌面隧道流量");const cells=[...s.querySelectorAll(".summary div")].filter(e=>["上传速度","下载速度"].includes(e.querySelector("small")?.textContent));return s?.querySelector(".section-title span")?.textContent==="实际应用数据"&&cells.length===2&&cells.every(e=>/^累计 [1-9]/.test(e.querySelector("span")?.textContent.trim()))})()'))
+  report.real_installed_desktop_mixed_udp_forward_and_measured=true
+  await until('mixed stop accepted',async()=>{
+    if(await has('已停止')&&!await has('进程运行中')&&!await has('处理中…'))return true
+    if(await has('处理中…'))return false
+    await click('停止隧道')
+    return false
+  })
+  await until('mixed actual forwarding stopped',async()=>await get(url)!==body&&!await udpRoundTrip(),15000)
+  await until('mixed editable',()=>evaluate('!document.querySelectorAll("button[aria-label=\\"删除映射\\"]")[1].disabled'))
+  await evaluate('document.querySelectorAll("button[aria-label=\\"删除映射\\"]")[1].click()')
+  await until('TCP only restored',()=>evaluate('document.querySelectorAll(".mapping").length===1&&document.querySelector("select[aria-label=\\"映射协议\\"]").value==="tcp"'))
+  report.real_installed_desktop_mixed_udp_stop_and_tcp_restore=true
 
   // The desktop tunnel has stopped. The same form now provisions a fresh
   // SCM service using the installed app's actual Vue button and Rust IPC.
@@ -589,6 +689,7 @@ try {
       }
     }
     await terminate(relay)
+    if (udpFixture) await new Promise(ok=>udpFixture.close(ok))
     if (alternate) { alternate.closeAllConnections(); await close(alternate) }
     if (fixture) { fixture.closeAllConnections(); await close(fixture) }
   } finally {

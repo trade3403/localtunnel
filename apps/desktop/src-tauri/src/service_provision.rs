@@ -105,6 +105,7 @@ fn require_scm_admin() -> Result<(), String> {
 pub fn provision(request: crate::StartRequest, resource_dir: &Path) -> Result<String, String> {
     // Validate all user configuration before creating a persistent object.
     if !request.engine.is_empty() { return Err("service requires bundled engine".into()); }
+    crate::validate_service_protocols(&request)?;
     crate::build_config(&request)?;
     let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&request).map_err(|_| "profile serialization failed")?);
     if bytes.len() > 256 * 1024 { return Err("service profile too large".into()); }

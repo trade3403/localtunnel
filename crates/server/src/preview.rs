@@ -583,3 +583,262 @@ pub async fn recover(pool:&SqlitePool,root:&Path,prefix:&str,rid:&str)->Result<(
     if updated.rows_affected()!=1{return Err("recovery result unknown")}
     Ok(())
 }
+
+// Local operator preview only. Never claims the HTTP runtime request state,
+// which is still reserved for the web gateway executor.
+#[derive(sqlx::FromRow)]
+struct UdpDraft { id:String, local_port:i64, bind_port:i64, device_id:String, device_revision:i64 }
+
+async fn checked_udp(pool:&SqlitePool,id:&str,revision:i64,rid:Option<&str>)->Result<UdpDraft>{
+    if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
+        return Err("invalid UDP mapping identity")
+    }
+    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
+        .bind(id).bind(revision).bind(rid).bind(rid).fetch_optional(pool).await.map_err(|_|"UDP draft read failed")?.ok_or("UDP preview requires current authorized draft")
+}
+
+fn udp_echo_probe(socket:&std::net::UdpSocket)->bool{
+    let Ok(nonce)=auth::random::<32>() else{return false};
+    if socket.send(&nonce).ok()!=Some(nonce.len()){return false}
+    let mut buffer=[0u8;1201];
+    let deadline=Instant::now()+Duration::from_millis(500);
+    while Instant::now()<deadline{
+        let remaining=deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()||socket.set_read_timeout(Some(remaining)).is_err(){return false}
+        match socket.recv(&mut buffer){
+            Ok(n) if n==nonce.len()&&buffer[..n]==nonce=>return true,
+            Ok(_)=>continue,
+            Err(_)=>return false,
+        }
+    }
+    false
+}
+
+/// Explicit one-shot local echo-service preview: the operator supplies trusted
+/// binaries, keys, unused ports and an actual local UDP echo fixture.
+/// No automatic registration, no public bind, no HTTP activation state.
+pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str)->Result<()>{
+    supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,None,None,None,false).await
+}
+
+/// The operator preselects the exact revision, ports and bounded byte budget.
+/// API callers cannot choose executables, ports, credentials or limit values.
+pub async fn udp_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str,rate:u32,burst:u32)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle)||relay_port<30000||internal_port<30000||relay_port==internal_port
+        || !(1024..=240000).contains(&rate)||!(1200..=76800).contains(&burst){
+        return Err("invalid UDP worker parameters")
+    }
+    private_dir(root)?;
+    let _worker_lock=acquire_lock(root,"udp-worker",id)?;
+    let deadline=Instant::now()+Duration::from_secs(60);
+    let rid=loop{
+        match crate::runtime::resident_state(pool,id,revision,"udp").await?.as_deref(){
+            None|Some("stopped")|Some("queued")=>{},
+            _=>return Err("claimed or unknown UDP request requires local inspection"),
+        }
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{break rid}
+        if Instant::now()>=deadline{return Err("no fresh UDP start request")}
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let result=supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,Some(&rid),Some((rate,burst)),None,false).await;
+    crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+    result
+}
+
+/// Resident operator-fixed UDP worker. A distinct request gets a distinct
+/// private configuration directory and random tunnel token. Never adopt an
+/// unknown claimed request, even after a process restart.
+pub async fn udp_resident(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle_base:&str,rate:u32,burst:u32)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle_base)||bundle_base.len()>30||relay_port<30000||internal_port<30000||relay_port==internal_port
+        || !(1024..=240000).contains(&rate)||!(1200..=76800).contains(&burst){
+        return Err("invalid UDP resident parameters")
+    }
+    if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
+        return Err("invalid UDP mapping identity")
+    }
+    private_dir(root)?;
+    let _worker_lock=acquire_lock(root,"udp-worker",id)?;
+    let marker=root.join(format!("udp-worker-{id}.stop"));
+    loop{
+        if stop_requested(Some(&marker))?{return Ok(())}
+        match crate::runtime::resident_state(pool,id,revision,"udp").await?.as_deref(){
+            None|Some("stopped")|Some("queued")=>{},
+            _=>return Err("claimed or unknown UDP request requires local inspection"),
+        }
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{
+            let bundle=format!("{bundle_base}-{rid}");
+            let result=supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,&bundle,Some(&rid),Some((rate,burst)),Some(&marker),false).await;
+            crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+            result?;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str,rid:Option<&str>,limits:Option<(u32,u32)>,resident_stop:Option<&Path>,device_lease:bool)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle)||relay_port<30000||internal_port<30000||relay_port==internal_port{
+        return Err("invalid UDP preview parameters")
+    }
+    private_dir(root)?;
+    let m=checked_udp(pool,id,revision,rid).await?;
+    if device_lease!=bundle.starts_with("udp-device-"){return Err("reserved UDP device bundle name")}
+    if [relay_port,internal_port,m.bind_port as u16].contains(&(m.local_port as u16)){
+        return Err("conflicting UDP preview ports")
+    }
+    let core=core()?;
+    let engine=PathBuf::from(std::env::var_os("LOCALTUNNEL_ENGINE").ok_or("set trusted engine path")?);
+    if !engine.is_absolute()||!engine.is_file(){return Err("invalid engine path")}
+    let engine=engine.canonicalize().map_err(|_|"invalid engine path")?;
+    let private=key("LOCALTUNNEL_SERVER_PRIVATE_KEY")?;
+    let public=key("LOCALTUNNEL_SERVER_PUBLIC_KEY")?;
+    let token=hex::encode(auth::random::<32>().map_err(|_|"random generation failed")?);
+    // Exclusive for this mapping even with different bundle names.
+    // Crash leaves a marker requiring offline operator inspection.
+    let _lock=acquire_lock(root,"udp-preview",id)?;
+    let stop_marker=root.join(format!("udp-stop-{bundle}"));
+    if stop_requested(Some(&stop_marker))?{return Err("UDP stop marker already exists")}
+    let relay=port(relay_port)?;
+    let internal=port(internal_port)?;
+    let ingress=port(m.bind_port as u16)?;
+    // Preflight only: trusted operator must exclusively control these ports.
+    // Actual process binds and echo verification remain mandatory.
+    {
+        // Match the engine's reusable TCP listener semantics: a previous
+        // clean session may leave TIME_WAIT sockets on this exact port.
+        // SO_REUSEADDR (not SO_REUSEPORT) still rejects an active listener.
+        let tcp=tokio::net::TcpSocket::new_v4().map_err(|_|"UDP relay preflight socket unavailable")?;
+        tcp.set_reuseaddr(true).map_err(|_|"UDP relay preflight reuse setup failed")?;
+        tcp.bind(std::net::SocketAddr::from(([127,0,0,1],relay_port))).map_err(|_|"UDP relay control port unavailable")?;
+        let _tcp=tcp.listen(1).map_err(|_|"UDP relay control listener unavailable")?;
+        let _inner=std::net::UdpSocket::bind(&internal).map_err(|_|"UDP internal port unavailable")?;
+        let _outer=std::net::UdpSocket::bind(&ingress).map_err(|_|"UDP ingress port unavailable")?;
+    }
+    let dir=root.join(bundle);
+    mkdir(&dir)?;
+    let created=(||{
+        let service=format!("m_{}",m.id);
+        invoke(&core,&["server-udp-config".into(),dir.join("server.toml").into_os_string(),relay.clone().into(),service.clone().into(),internal_port.to_string().into()],
+            &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PRIVATE_KEY",&private)])?;
+        invoke(&core,&["client-udp-config".into(),dir.join("client.toml").into_os_string(),relay.clone().into(),service.into(),format!("127.0.0.1:{}",m.local_port).into()],
+            &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PUBLIC_KEY",&public)])?;
+        use std::io::Write;
+        let mut opts=fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
+        let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"UDP manifest unavailable")?;
+        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port,"request_id":rid,"byte_rate":limits.map(|v|v.0),"burst_bytes":limits.map(|v|v.1)});
+        file.write_all(data.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"UDP manifest write failed")?;
+        Ok(())
+    })();
+    if let Err(e)=created{
+        let _=fs::remove_dir_all(&dir);
+        return Err(e)
+    }
+    // The generated client file validates the public key and endpoint, but
+    // this mode must never start a co-located agent from that file.
+    if device_lease{fs::remove_file(dir.join("client.toml")).map_err(|_|"unused client config cleanup failed")?;}
+    let mut tunnel=TunnelChildren(Vec::new());
+    let mut entrance=TunnelChildren(Vec::new());
+    let result=async{
+        let current=checked_udp(pool,id,revision,rid).await?;
+        if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
+        if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}}
+        tunnel.start(&engine,&dir.join("server.toml"))?;
+        if !device_lease{tunnel.start(&engine,&dir.join("client.toml"))?;}
+        let mut cmd=Command::new(&core);
+        if let Some((rate,burst))=limits{
+            cmd.args(["udp-guard-limited",&ingress,&internal,&rate.to_string(),&burst.to_string()]);
+        }else{
+            cmd.args(["udp-guard",&ingress,&internal]);
+        }
+        cmd.env_clear().env("PATH","/usr/bin:/bin")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        protect_child(&mut cmd)?;
+        entrance.0.push(cmd.spawn().map_err(|_|"UDP guard launch failed")?);
+        let probe=std::net::UdpSocket::bind("127.0.0.1:0").map_err(|_|"UDP probe bind failed")?;
+        probe.connect(&ingress).map_err(|_|"UDP probe connect failed")?;
+        let deadline=Instant::now()+Duration::from_secs(30);
+        let lease_deadline=Instant::now()+Duration::from_secs(crate::devices::UDP_LEASE_SECONDS as u64);
+        if device_lease{
+            let rid=rid.ok_or("missing UDP device request")?;
+            let now=sqlx::query_scalar::<_,i64>("SELECT unixepoch()").fetch_one(pool).await.map_err(|_|"lease clock unavailable")?;
+            let lease=crate::devices::UdpLease{device_id:m.device_id.clone(),device_revision:m.device_revision,
+                mapping_id:id.into(),mapping_revision:revision,request_id:rid.into(),relay_port,local_port:m.local_port as u16,
+                token:token.clone(),server_key:public.clone(),expires_at:now+crate::devices::UDP_LEASE_SECONDS};
+            use std::io::Write;
+            let mut opts=fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
+            let mut file=opts.open(dir.join("lease.pending")).map_err(|_|"lease creation failed")?;
+            let bytes=serde_json::to_vec(&lease).map_err(|_|"lease serialization failed")?;
+            file.write_all(&bytes).and_then(|_|file.sync_all()).map_err(|_|"lease write failed")?;
+            fs::rename(dir.join("lease.pending"),dir.join("lease.json")).map_err(|_|"lease publication failed")?;
+        }
+        let mut ready=false;
+        loop{
+            if device_lease&&Instant::now()>=lease_deadline{return Ok(())}
+            if stop_requested(Some(&stop_marker))?||stop_requested(resident_stop)?{return Ok(())}
+            if let Some(rid)=rid{
+                if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
+            }
+            let current=checked_udp(pool,id,revision,rid).await?;
+            if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
+            let healthy=if device_lease{tunnel.0.len()==1&&matches!(tunnel.0[0].try_wait(),Ok(None))}else{tunnel.healthy()};
+            if !healthy||!matches!(entrance.0[0].try_wait(),Ok(None)){
+                return Err("UDP preview child exited")
+            }
+            if udp_echo_probe(&probe){
+                if !ready{
+                    if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}}
+                    println!("UDP_PREVIEW_READY");
+                    use std::io::Write;
+                    std::io::stdout().flush().map_err(|_|"UDP preview output failed")?;
+                    ready=true;
+                }
+            }else if ready||Instant::now()>=deadline{
+                return Err("UDP echo probe failed")
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }.await;
+    // Close admission before relay and agent. Do not remove retained secrets
+    // or mark a preview stopped if owned children cannot be reaped.
+    let entrance_stopped=entrance.stop();
+    let tunnel_stopped=tunnel.stop();
+    if device_lease{
+        for name in ["lease.json","lease.pending"]{
+            match fs::remove_file(dir.join(name)){Ok(())=>{},Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},Err(_)=>return Err("UDP lease cleanup failed")}
+        }
+    }
+    entrance_stopped?;
+    tunnel_stopped?;
+    if device_lease{
+        fs::remove_file(dir.join("server.toml")).map_err(|_|"UDP relay configuration cleanup failed")?;
+    }
+    result
+}
+
+
+/// One-shot device-connected relay preview. The request selects a single
+/// mapping; the operator fixes all ports and resource limits. No local agent
+/// is spawned. A separate authenticated device must connect before ready.
+pub async fn udp_device_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,rate:u32,burst:u32)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(id)||id.len()!=32||revision<1||relay_port<30000||internal_port<30000||relay_port==internal_port
+        || !(1024..=240000).contains(&rate)||!(1200..=76800).contains(&burst){return Err("invalid UDP device worker parameters")}
+    private_dir(root)?;
+    let _worker_lock=acquire_lock(root,"udp-worker",id)?;
+    let deadline=Instant::now()+Duration::from_secs(60);
+    let rid=loop{
+        match crate::runtime::resident_state(pool,id,revision,"udp").await?.as_deref(){
+            None|Some("stopped")|Some("queued")=>{},
+            _=>return Err("claimed or unknown UDP request requires local inspection"),
+        }
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{break rid}
+        if Instant::now()>=deadline{return Err("no fresh UDP start request")}
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let bundle=format!("udp-device-{rid}");
+    let result=supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,&bundle,Some(&rid),Some((rate,burst)),None,true).await;
+    crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+    result
+}

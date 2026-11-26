@@ -10,7 +10,7 @@ import signal
 import subprocess
 import time
 
-def exercise(root, cli, url, body, relay, token, results, get):
+def exercise(root, cli, url, body, relay, token, results, get, report_name="unix-service.json"):
     service_id=secrets.token_hex(16)
     label="localtunnel-agent-"+service_id
     linux=platform.system()=="Linux"
@@ -138,5 +138,5 @@ def exercise(root, cli, url, body, relay, token, results, get):
     finally:
         cleanup()
         report["manager"]=manager_kind
-        (results/"unix-service.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
+        (results/report_name).write_text(json.dumps(report,indent=2),encoding="utf-8")
     assert len(report)==6 and all(v is True for k,v in report.items() if k!="manager")
