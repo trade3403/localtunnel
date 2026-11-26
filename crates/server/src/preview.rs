@@ -583,3 +583,133 @@ pub async fn recover(pool:&SqlitePool,root:&Path,prefix:&str,rid:&str)->Result<(
     if updated.rows_affected()!=1{return Err("recovery result unknown")}
     Ok(())
 }
+
+// Local operator preview only. Never claims the HTTP runtime request state,
+// which is still reserved for the web gateway executor.
+#[derive(sqlx::FromRow)]
+struct UdpDraft { id:String, local_port:i64, bind_port:i64 }
+
+async fn checked_udp(pool:&SqlitePool,id:&str,revision:i64)->Result<UdpDraft>{
+    if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
+        return Err("invalid UDP mapping identity")
+    }
+    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')")
+        .bind(id).bind(revision).fetch_optional(pool).await.map_err(|_|"UDP draft read failed")?.ok_or("UDP preview requires current authorized draft")
+}
+
+fn udp_echo_probe(socket:&std::net::UdpSocket)->bool{
+    let Ok(nonce)=auth::random::<32>() else{return false};
+    if socket.send(&nonce).ok()!=Some(nonce.len()){return false}
+    let mut buffer=[0u8;1201];
+    let deadline=Instant::now()+Duration::from_millis(500);
+    while Instant::now()<deadline{
+        let remaining=deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()||socket.set_read_timeout(Some(remaining)).is_err(){return false}
+        match socket.recv(&mut buffer){
+            Ok(n) if n==nonce.len()&&buffer[..n]==nonce=>return true,
+            Ok(_)=>continue,
+            Err(_)=>return false,
+        }
+    }
+    false
+}
+
+/// Explicit one-shot local echo-service preview: the operator supplies trusted
+/// binaries, keys, unused ports and an actual local UDP echo fixture.
+/// No automatic registration, no public bind, no HTTP activation state.
+pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle)||relay_port<30000||internal_port<30000||relay_port==internal_port{
+        return Err("invalid UDP preview parameters")
+    }
+    private_dir(root)?;
+    let m=checked_udp(pool,id,revision).await?;
+    if [relay_port,internal_port,m.bind_port as u16].contains(&(m.local_port as u16)){
+        return Err("conflicting UDP preview ports")
+    }
+    let core=core()?;
+    let engine=PathBuf::from(std::env::var_os("LOCALTUNNEL_ENGINE").ok_or("set trusted engine path")?);
+    if !engine.is_absolute()||!engine.is_file(){return Err("invalid engine path")}
+    let engine=engine.canonicalize().map_err(|_|"invalid engine path")?;
+    let private=key("LOCALTUNNEL_SERVER_PRIVATE_KEY")?;
+    let public=key("LOCALTUNNEL_SERVER_PUBLIC_KEY")?;
+    let token=hex::encode(auth::random::<32>().map_err(|_|"random generation failed")?);
+    // Exclusive for this mapping even with different bundle names.
+    // Crash leaves a marker requiring offline operator inspection.
+    let _lock=acquire_lock(root,"udp-preview",id)?;
+    let stop_marker=root.join(format!("udp-stop-{bundle}"));
+    if stop_requested(Some(&stop_marker))?{return Err("UDP stop marker already exists")}
+    let relay=port(relay_port)?;
+    let internal=port(internal_port)?;
+    let ingress=port(m.bind_port as u16)?;
+    // Preflight only: trusted operator must exclusively control these ports.
+    // Actual process binds and echo verification remain mandatory.
+    {
+        let _tcp=std::net::TcpListener::bind(&relay).map_err(|_|"UDP relay control port unavailable")?;
+        let _inner=std::net::UdpSocket::bind(&internal).map_err(|_|"UDP internal port unavailable")?;
+        let _outer=std::net::UdpSocket::bind(&ingress).map_err(|_|"UDP ingress port unavailable")?;
+    }
+    let dir=root.join(bundle);
+    mkdir(&dir)?;
+    let created=(||{
+        let service=format!("m_{}",m.id);
+        invoke(&core,&["server-udp-config".into(),dir.join("server.toml").into_os_string(),relay.clone().into(),service.clone().into(),internal_port.to_string().into()],
+            &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PRIVATE_KEY",&private)])?;
+        invoke(&core,&["client-udp-config".into(),dir.join("client.toml").into_os_string(),relay.clone().into(),service.into(),format!("127.0.0.1:{}",m.local_port).into()],
+            &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PUBLIC_KEY",&public)])?;
+        use std::io::Write;
+        let mut opts=fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
+        let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"UDP manifest unavailable")?;
+        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port});
+        file.write_all(data.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"UDP manifest write failed")?;
+        Ok(())
+    })();
+    if let Err(e)=created{
+        let _=fs::remove_dir_all(&dir);
+        return Err(e)
+    }
+    let mut tunnel=TunnelChildren(Vec::new());
+    let mut entrance=TunnelChildren(Vec::new());
+    let result=async{
+        checked_udp(pool,id,revision).await?;
+        tunnel.start(&engine,&dir.join("server.toml"))?;
+        tunnel.start(&engine,&dir.join("client.toml"))?;
+        let mut cmd=Command::new(&core);
+        cmd.args(["udp-guard",&ingress,&internal]).env_clear().env("PATH","/usr/bin:/bin")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        protect_child(&mut cmd)?;
+        entrance.0.push(cmd.spawn().map_err(|_|"UDP guard launch failed")?);
+        let probe=std::net::UdpSocket::bind("127.0.0.1:0").map_err(|_|"UDP probe bind failed")?;
+        probe.connect(&ingress).map_err(|_|"UDP probe connect failed")?;
+        let deadline=Instant::now()+Duration::from_secs(30);
+        let mut ready=false;
+        loop{
+            if stop_requested(Some(&stop_marker))?{return Ok(())}
+            if checked_udp(pool,id,revision).await.is_err(){
+                return Err("UDP draft authorization or revision changed")
+            }
+            if !tunnel.healthy()||!matches!(entrance.0[0].try_wait(),Ok(None)){
+                return Err("UDP preview child exited")
+            }
+            if udp_echo_probe(&probe){
+                if !ready{
+                    println!("UDP_PREVIEW_READY");
+                    use std::io::Write;
+                    std::io::stdout().flush().map_err(|_|"UDP preview output failed")?;
+                    ready=true;
+                }
+            }else if ready||Instant::now()>=deadline{
+                return Err("UDP echo probe failed")
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }.await;
+    // Close admission before relay and agent. Do not remove retained secrets
+    // or mark a preview stopped if owned children cannot be reaped.
+    let entrance_stopped=entrance.stop();
+    let tunnel_stopped=tunnel.stop();
+    entrance_stopped?;
+    tunnel_stopped?;
+    result
+}
