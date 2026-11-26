@@ -418,11 +418,11 @@ async function toggle() {
         <p v-if="managementError" class="error" role="alert">{{managementError}}</p>
       </section>
       <section>
-        <div class="section-title"><h2>桌面隧道流量</h2><span>{{ traffic?.state === 'measured' ? '实际 TCP 数据' : '未计量 / 未启动' }}</span></div>
+        <div class="section-title"><h2>桌面隧道流量</h2><span>{{ traffic?.state === 'measured' ? '实际应用数据' : '未计量 / 未启动' }}</span></div>
         <div class="summary">
           <div><small>上传速度</small><strong class="protocol">{{ formatBytes(traffic?.uploadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.uploadBytes) }}</span></div>
           <div><small>下载速度</small><strong class="protocol">{{ formatBytes(traffic?.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(traffic?.downloadBytes) }}</span></div>
-          <div><small>计量范围</small><strong class="protocol">本次会话</strong><span>不含加密/TCP 开销</span></div>
+          <div><small>计量范围</small><strong class="protocol">本次会话</strong><span>不含加密及传输开销</span></div>
         </div>
         <p class="hint">以上为本次桌面会话；历史统计每 5 秒保存，正常停止时保存最终值。</p>
         <div class="summary">
@@ -430,7 +430,7 @@ async function toggle() {
           <div><small>历史累计下载</small><strong class="protocol">{{ formatBytes(trafficHistory?.saved?.downloadBytes) }}</strong><span>本机已保存</span></div>
           <div><small>最近保存</small><strong class="protocol">{{ trafficHistory?.saved ? new Date(trafficHistory.saved.savedAtMs).toLocaleTimeString() : '—' }}</strong><span>仅桌面模式</span></div>
         </div>
-        <p v-if="running && mappings.some(m=>m.protocol==='udp')" class="hint">含 UDP 的会话暂不计量（包括混合会话中的 TCP）；历史仅显示已保存的 TCP 数据。</p>
+        <p v-if="running && mappings.some(m=>m.protocol==='udp')" class="hint">UDP 与 TCP 合并计量；UDP 每映射最多32来源、1200字节/包，固定包速率保护。</p>
         <p v-if="historyError || trafficHistory?.writeFailed" class="error" role="alert">历史流量读取或保存失败，已保留原记录。</p>
         <p class="hint">历史包含已保存的本次会话流量，不能重复相加；异常断电可能丢失最后一段未保存数据。不包含协议开销、后台服务或计费数据。</p>
       </section>
@@ -460,14 +460,14 @@ async function toggle() {
           <div><small>服务下载速度</small><strong class="protocol">{{ formatBytes(serviceSnapshot.traffic.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(serviceSnapshot.traffic.downloadBytes) }}</span></div>
           <div><small>计量引擎 PID</small><strong>{{ serviceSnapshot.traffic.enginePid }}</strong><span>本次引擎会话</span></div>
         </div>
-        <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照不可用（含 UDP 的会话暂不计量，或权限不足、恢复中、尚未采样）。</p>
+        <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照不可用（权限不足、恢复中、尚未采样或计量器异常）。</p>
         <div v-if="serviceSnapshot?.history" class="summary">
           <div><small>服务历史累计上传</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.uploadBytes) }}</strong><span>已保存</span></div>
           <div><small>服务历史累计下载</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.downloadBytes) }}</strong><span>已保存</span></div>
           <div><small>最近保存</small><strong class="protocol">{{ new Date(serviceSnapshot.history.savedAtMs).toLocaleTimeString() }}</strong><span>独立于桌面历史</span></div>
         </div>
         <p v-else-if="serviceSnapshot" class="hint">服务历史暂无可读记录（未配置、未保存或权限不足）。</p>
-        <p v-if="serviceSnapshot?.history" class="hint">已保存历史仅包含已计量的 TCP 会话，不包含 UDP 或混合会话；不与会话流量重复相加，强制结束可能丢失未保存增量。</p>
+        <p v-if="serviceSnapshot?.history" class="hint">已保存历史包含实际计量的 TCP/UDP 应用字节；不与会话流量重复相加，强制结束可能丢失未保存增量。</p>
         <div v-if="serviceSnapshot" class="profile-actions">
           <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService" @click="serviceAction('check')">检查服务配置</button>
           <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.state !== 'stopped' || serviceSnapshot.startup === 'disabled'" @click="serviceAction('start')">启动服务</button>
@@ -519,7 +519,7 @@ async function toggle() {
             <input v-model="mapping.token" :disabled="locked" aria-label="映射授权 Token" required type="password" autocomplete="off" minlength="32" maxlength="128" placeholder="输入授权 Token" />
             <button type="button" class="remove" :disabled="locked || mappings.length === 1" @click="remove(mapping.id)" aria-label="删除映射">×</button>
           </div><div class="port-actions"><label>协议 <select v-model="mapping.protocol" :disabled="locked" aria-label="映射协议" @change="delete portNotice[mapping.id]"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label><button type="button" class="secondary" :disabled="busy || !ready || mapping.protocol!=='tcp'" @click="probe(mapping)">检测本地端口</button><span role="status">{{ mapping.protocol==='udp' ? 'UDP 不支持 TCP 端口探测' : (portNotice[mapping.id] || "未检测") }}</span></div></div>
-          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。UDP 须与中转映射协议一致，支持桌面及后台服务；混合会话暂不计量。停止隧道后可编辑配置；域名由服务端分配。</p>
+          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。UDP 须与中转映射协议一致，支持桌面及后台服务；每会话最多8个 UDP 映射。停止隧道后可编辑配置；域名由服务端分配。</p>
         </section>
         <div class="actions">
           <div aria-live="polite"><strong>{{ label }}</strong><p>{{ status.detail }}</p><p v-if="error" class="error" role="alert">{{ error }}</p></div>

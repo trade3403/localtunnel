@@ -492,9 +492,9 @@ try {
     })
   }
   await until('actual mixed TCP UDP forwarding',async()=>await get(url)===body&&await udpRoundTrip(),35000)
-  await waitText('含 UDP 的会话暂不计量（包括混合会话中的 TCP）；历史仅显示已保存的 TCP 数据。')
-  await until('mixed session no false counters',()=>evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="桌面隧道流量");return s?.querySelector(".section-title span")?.textContent==="未计量 / 未启动"})()'))
-  report.real_installed_desktop_mixed_udp_forward_and_unmeasured=true
+  await waitText('UDP 与 TCP 合并计量；UDP 每映射最多32来源、1200字节/包，固定包速率保护。')
+  await until('mixed session measured',()=>evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="桌面隧道流量");const cells=[...s.querySelectorAll(".summary div")].filter(e=>["上传速度","下载速度"].includes(e.querySelector("small")?.textContent));return s?.querySelector(".section-title span")?.textContent==="实际应用数据"&&cells.length===2&&cells.every(e=>/^累计 [1-9]/.test(e.querySelector("span")?.textContent.trim()))})()'))
+  report.real_installed_desktop_mixed_udp_forward_and_measured=true
   await until('mixed stop accepted',async()=>{
     if(await has('已停止')&&!await has('进程运行中')&&!await has('处理中…'))return true
     if(await has('处理中…'))return false

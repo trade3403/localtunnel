@@ -85,7 +85,7 @@ def main(executable, evidence):
               "history_after_host_recovery": False, "history_after_stop": False,
               "history_preserved_unregister": False, "unsafe_history_rejected": False, "desktop_service_controls": False, "one_click_provision": False, "profile_update": False, "desktop_unregister": False,
               "mixed_service_forwarded": False, "mixed_service_recovered": False,
-              "mixed_service_unknown_traffic": False, "mixed_service_stopped": False}
+              "mixed_service_measured_traffic": False, "mixed_service_stopped": False}
     created = False
     relay = None
     fixture = None
@@ -572,20 +572,42 @@ bind_addr = "127.0.0.1:{udp_mapped}"
                                 assert service_pid(fresh) == host
                                 wait_mixed()
                                 report["mixed_service_recovered"] = True
-                                time.sleep(1.5)
-                                for _ in range(3):
-                                    snap = json.loads(run(str(source_exe), "--service-status", fresh).stdout)
-                                    assert snap["state"] == "running" and snap["traffic"] is None
-                                    assert snap["history"] == after_history
-                                    assert not (child[1] / "traffic.json").exists()
-                                    assert udp_roundtrip()
-                                    time.sleep(.3)
-                                report["mixed_service_unknown_traffic"] = True
+                                # Observe a real UDP-only increment after the mixed engine recovers.
+                                # No HTTP request is issued between the two snapshots.
+                                def sample():
+                                    deadline = time.monotonic() + 15
+                                    while time.monotonic() < deadline:
+                                        snap = json.loads(run(str(source_exe), "--service-status", fresh).stdout)
+                                        record = snap["traffic"]
+                                        if (snap["state"] == "running" and record is not None
+                                                and record["enginePid"] == child[0]
+                                                and record["uploadBytes"] >= 129 and record["downloadBytes"] >= 128):
+                                            return record
+                                        time.sleep(.25)
+                                    raise RuntimeError("mixed service traffic sample unavailable")
+                                initial = sample()
+                                assert udp_roundtrip()
+                                deadline = time.monotonic() + 15
+                                while time.monotonic() < deadline:
+                                    final = sample()
+                                    if (final["uploadBytes"] == initial["uploadBytes"] + 129
+                                            and final["downloadBytes"] == initial["downloadBytes"] + 128):
+                                        break
+                                    time.sleep(.25)
+                                else:
+                                    raise RuntimeError("UDP-only service traffic delta is not exact")
+                                assert (child[1] / "traffic.json").is_file()
+                                report["mixed_service_udp_upload_delta"] = final["uploadBytes"] - initial["uploadBytes"]
+                                report["mixed_service_udp_download_delta"] = final["downloadBytes"] - initial["downloadBytes"]
+                                report["mixed_service_measured_traffic"] = True
                                 run(str(source_exe), "--service-manage", fresh, "stop")
                                 wait_state(fresh, 1)
                                 assert not any((fresh_root / "runtime").iterdir())
                                 assert not udp_roundtrip() and e2e.get(url) != body
-                                assert json.loads(history_file.read_text(encoding="utf-8")) == after_history
+                                mixed_history = json.loads(history_file.read_text(encoding="utf-8"))
+                                assert mixed_history["uploadBytes"] >= after_history["uploadBytes"] + final["uploadBytes"]
+                                assert mixed_history["downloadBytes"] >= after_history["downloadBytes"] + final["downloadBytes"]
+                                after_history = mixed_history
                                 report["mixed_service_stopped"] = True
                             finally:
                                 stop_echo.set()

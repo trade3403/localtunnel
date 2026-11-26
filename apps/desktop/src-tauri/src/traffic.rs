@@ -1,6 +1,7 @@
 //! Session-scoped application-byte metering for managed tunnels.
 //! Only loopback endpoints; no payload logging or packet capture.
 use serde::Serialize;
+use localtunnel::{MappingProtocol, udp_guard::UdpForwarder};
 use std::{
     io, net::{SocketAddr, TcpListener as StdListener}, pin::Pin,
     sync::{Arc, atomic::{AtomicU64, Ordering}},
@@ -13,6 +14,8 @@ use tokio::{
 };
 
 const MAX_CONNECTIONS: usize = 128;
+// 8 UDP mappings x 32 sources = at most 256 upstream UDP sockets per session.
+const MAX_UDP_MAPPINGS: usize = 8;
 #[derive(Default)]
 struct Counters { up: AtomicU64, down: AtomicU64 }
 
@@ -162,13 +165,39 @@ impl Meter {
         Self::start_with_history(targets, relay_port, None)
     }
     pub fn start_with_history(targets: &[u16], relay_port: u16, history_dir: Option<&std::path::Path>) -> Result<Self, String> {
-        let store = history_dir.map(crate::history::Store::open).transpose()?;
-        if targets.is_empty() || targets.len() > 64 || targets.contains(&0) {
-            return Err("invalid metered targets".into());
+        let typed: Vec<_> = targets.iter().map(|&port| (MappingProtocol::Tcp, port)).collect();
+        Self::start_mixed_with_history(&typed, relay_port, history_dir)
+    }
+    pub fn start_mixed_with_history(targets: &[(MappingProtocol,u16)], relay_port: u16, history_dir: Option<&std::path::Path>) -> Result<Self, String> {
+        if targets.is_empty() || targets.len() > 64 || targets.iter().any(|&(_,port)| port==0)
+            || targets.iter().filter(|&&(protocol,_)| protocol==MappingProtocol::Udp).count()>MAX_UDP_MAPPINGS {
+            return Err("invalid metered targets (maximum 8 UDP mappings)".into());
         }
+        let store = history_dir.map(crate::history::Store::open).transpose()?;
+        let excluded: Vec<_> = targets.iter().map(|&(_,port)| port).collect();
         let mut ports = Vec::new();
         let mut listeners = Vec::new();
-        for &port in targets {
+        let mut udp = Vec::new();
+        for &(protocol,port) in targets {
+            let target = SocketAddr::from(([127,0,0,1],port));
+            if protocol==MappingProtocol::Udp {
+                let mut selected = None;
+                let mut rejected = Vec::new();
+                for _ in 0..32 {
+                    let forwarder = UdpForwarder::bind(SocketAddr::from(([127,0,0,1],0)), target).map_err(str::to_owned)?;
+                    let assigned = forwarder.local_addr().map_err(|_| "UDP meter address unavailable")?.port();
+                    if excluded.contains(&assigned) || ports.contains(&assigned) || assigned==relay_port {
+                        rejected.push(forwarder);
+                        continue;
+                    }
+                    selected=Some((assigned,forwarder));
+                    break;
+                }
+                let (assigned,forwarder)=selected.ok_or("no safe UDP meter port")?;
+                ports.push(assigned);
+                udp.push(forwarder);
+                continue;
+            }
             let mut selected = None;
             // Keep rejected sockets alive until a suitable port is obtained,
             // avoiding a repeated allocation of the same excluded port.
@@ -176,7 +205,7 @@ impl Meter {
             for _ in 0..32 {
                 let listener = StdListener::bind(("127.0.0.1", 0)).map_err(|_| "meter bind failed")?;
                 let assigned = listener.local_addr().map_err(|_| "meter address unavailable")?.port();
-                if targets.contains(&assigned) || assigned == relay_port {
+                if excluded.contains(&assigned) || ports.contains(&assigned) || assigned == relay_port {
                     rejected.push(listener); continue;
                 }
                 listener.set_nonblocking(true).map_err(|_| "meter nonblocking failed")?;
@@ -204,7 +233,31 @@ impl Meter {
                         tokio::spawn(accept_loop(listener, target, task_counts.clone(), slots.clone()));
                     }
                     let _ = ready.send(());
-                    let _ = stopped.await;
+                    if udp.is_empty() {
+                        let _ = stopped.await;
+                    } else {
+                        // All UDP forwarders are driven by one bounded worker.
+                        // No tokio macros or new dependency; stop checked each turn.
+                        let mut stopped = stopped;
+                        loop {
+                            match stopped.try_recv() {
+                                Ok(()) | Err(oneshot::error::TryRecvError::Closed) => break,
+                                Err(oneshot::error::TryRecvError::Empty) => (),
+                            }
+                            for forwarder in &mut udp {
+                                let before = forwarder.stats();
+                                let result = forwarder.poll();
+                                let after = forwarder.stats();
+                                // Count successful sends even if a later receive fails.
+                                let _ = task_counts.down.fetch_update(Ordering::Relaxed,Ordering::Relaxed,
+                                    |v| Some(v.saturating_add(after.to_target_bytes.saturating_sub(before.to_target_bytes))));
+                                let _ = task_counts.up.fetch_update(Ordering::Relaxed,Ordering::Relaxed,
+                                    |v| Some(v.saturating_add(after.to_source_bytes.saturating_sub(before.to_source_bytes))));
+                                result.map_err(io::Error::other)?;
+                            }
+                            tokio::time::sleep(Duration::from_millis(2)).await;
+                        }
+                    }
                     Ok(())
                 })
                 // Runtime drop cancels listeners and all in-flight socket tasks.
@@ -296,5 +349,60 @@ mod tests {
         restarted.finish().unwrap();
         assert_eq!(crate::history::read(history.path()).unwrap().unwrap(), saved);
         assert!(std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn mixed_meter_exact_totals_and_history() {
+        let tcp = StdListener::bind("127.0.0.1:0").unwrap();
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        udp.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let targets = [(MappingProtocol::Tcp,tcp.local_addr().unwrap().port()),
+                       (MappingProtocol::Udp,udp.local_addr().unwrap().port())];
+        let history=tempfile::tempdir().unwrap();
+        let mut meter=Meter::start_mixed_with_history(&targets,2333,Some(history.path())).unwrap();
+        assert_ne!(meter.ports()[0],meter.ports()[1]);
+        let tcp_worker=thread::spawn(move || {
+            let (mut stream,_)=tcp.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let mut data=Vec::new();
+            stream.read_to_end(&mut data).unwrap();
+            assert_eq!(data,vec![1;64]);
+            stream.write_all(&[2;96]).unwrap();
+        });
+        let udp_worker=thread::spawn(move || {
+            let mut buf=[0;2048];
+            let (n,peer)=udp.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..n],&[3;17]);
+            udp.send_to(&[4;31],peer).unwrap();
+        });
+        let mut conn=std::net::TcpStream::connect(("127.0.0.1",meter.ports()[0])).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        conn.write_all(&[1;64]).unwrap();
+        conn.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut data=Vec::new();
+        conn.read_to_end(&mut data).unwrap();
+        assert_eq!(data,vec![2;96]);
+        let sock=std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        sock.connect(("127.0.0.1",meter.ports()[1])).unwrap();
+        sock.send(&[3;17]).unwrap();
+        let mut buf=[0;2048];
+        let n=sock.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n],&[4;31]);
+        tcp_worker.join().unwrap();
+        udp_worker.join().unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        loop {
+            let snapshot=meter.snapshot();
+            if snapshot.download_bytes==Some(81) && snapshot.upload_bytes==Some(127) { break; }
+            assert!(Instant::now()<until,"mixed counters not exact");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let port=meter.ports()[1];
+        meter.finish().unwrap();
+        let saved=crate::history::read(history.path()).unwrap().unwrap();
+        assert_eq!((saved.upload_bytes,saved.download_bytes),(127,81));
+        assert!(std::net::UdpSocket::bind(("127.0.0.1",port)).is_ok());
+        assert!(Meter::start_mixed_with_history(&[(MappingProtocol::Udp,12345);9],2333,None).is_err());
     }
 }
