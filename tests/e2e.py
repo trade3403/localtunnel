@@ -199,6 +199,8 @@ def main():
                 if os.environ.get("LOCALTUNNEL_UDP_E2E") == "1":
                     from udp_e2e import exercise as udp_exercise
                     udp_exercise(d,binary,CLI.resolve(),private,public,RESULTS,port,terminate)
+                    from mixed_e2e import exercise as mixed_exercise
+                    mixed_exercise(d,binary,CLI.resolve(),private,public,RESULTS,port,terminate,get,body,fixture.server_port)
                 if os.environ.get("LOCALTUNNEL_NATIVE_AGENT_PROCESS_E2E") == "1":
                     from unix_agent_process_e2e import exercise
                     exercise(d,binary,CLI.resolve(),body,fixture.server_port,private,public,RESULTS,port,wait_for,get,terminate)

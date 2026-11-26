@@ -62,15 +62,33 @@ pub struct ClientMapping<'a> {
     pub token: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MappingProtocol { Tcp, Udp }
+
+impl MappingProtocol {
+    pub fn parse(value: &str) -> Result<Self, &'static str> {
+        match value {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            _ => Err("mapping protocol must be tcp or udp"),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self { Self::Tcp => "tcp", Self::Udp => "udp" }
+    }
+}
+
 fn mapping_count(count: usize) -> Result<(), &'static str> {
     if (1..=64).contains(&count) { Ok(()) } else { Err("expected 1-64 mappings") }
 }
 
 pub fn server_configs(bind: SocketAddr, mappings: &[ServerMapping<'_>], key: &str) -> Result<String, &'static str> {
-    server_configs_for(bind, mappings, key, "tcp")
+    let typed: Vec<_> = mappings.iter().map(|m| (MappingProtocol::Tcp, ServerMapping { name: m.name, port: m.port, token: m.token })).collect();
+    server_mixed_configs(bind, &typed, key)
 }
 
-fn server_configs_for(bind: SocketAddr, mappings: &[ServerMapping<'_>], key: &str, kind: &str) -> Result<String, &'static str> {
+pub fn server_mixed_configs(bind: SocketAddr, mappings: &[(MappingProtocol, ServerMapping<'_>)], key: &str) -> Result<String, &'static str> {
     use std::collections::HashSet;
     use std::fmt::Write;
     validate_key(key)?;
@@ -80,7 +98,8 @@ fn server_configs_for(bind: SocketAddr, mappings: &[ServerMapping<'_>], key: &st
     let mut ports = HashSet::new();
     let mut tokens = HashSet::new();
     let mut config = format!("[server]\nbind_addr = \"{bind}\"\nheartbeat_interval = 5\n\n[server.transport]\ntype = \"noise\"\n\n[server.transport.noise]\npattern = \"{PATTERN}\"\nlocal_private_key = \"{key}\"\n");
-    for m in mappings {
+    for (protocol, m) in mappings {
+        let kind = protocol.name();
         validate_name(m.name)?;
         validate_token(m.token)?;
         port_valid(m.port)?;
@@ -93,10 +112,11 @@ fn server_configs_for(bind: SocketAddr, mappings: &[ServerMapping<'_>], key: &st
 }
 
 pub fn client_configs(remote: &str, mappings: &[ClientMapping<'_>], key: &str) -> Result<String, &'static str> {
-    client_configs_for(remote, mappings, key, "tcp")
+    let typed: Vec<_> = mappings.iter().map(|m| (MappingProtocol::Tcp, ClientMapping { name: m.name, local: m.local, token: m.token })).collect();
+    client_mixed_configs(remote, &typed, key)
 }
 
-fn client_configs_for(remote: &str, mappings: &[ClientMapping<'_>], key: &str, kind: &str) -> Result<String, &'static str> {
+pub fn client_mixed_configs(remote: &str, mappings: &[(MappingProtocol, ClientMapping<'_>)], key: &str) -> Result<String, &'static str> {
     use std::collections::HashSet;
     use std::fmt::Write;
     validate_key(key)?;
@@ -105,7 +125,8 @@ fn client_configs_for(remote: &str, mappings: &[ClientMapping<'_>], key: &str, k
     let mut names = HashSet::new();
     let mut tokens = HashSet::new();
     let mut config = format!("[client]\nremote_addr = \"{remote}\"\nheartbeat_timeout = 15\nretry_interval = 1\n\n[client.transport]\ntype = \"noise\"\n\n[client.transport.noise]\npattern = \"{PATTERN}\"\nremote_public_key = \"{key}\"\n");
-    for m in mappings {
+    for (protocol, m) in mappings {
+        let kind = protocol.name();
         validate_name(m.name)?;
         validate_token(m.token)?;
         port_valid(m.local.port())?;
@@ -128,11 +149,11 @@ pub fn client_config(remote: &str, name: &str, local: SocketAddr, token: &str, k
 /// Experimental UDP service over the existing Noise transport (not QUIC).
 /// The relay UDP service and client destination remain loopback-only.
 pub fn server_udp_config(bind: SocketAddr, name: &str, port: u16, token: &str, key: &str) -> Result<String, &'static str> {
-    server_configs_for(bind, &[ServerMapping { name, port, token }], key, "udp")
+    server_mixed_configs(bind, &[(MappingProtocol::Udp, ServerMapping { name, port, token })], key)
 }
 
 pub fn client_udp_config(remote: &str, name: &str, local: SocketAddr, token: &str, key: &str) -> Result<String, &'static str> {
-    client_configs_for(remote, &[ClientMapping { name, local, token }], key, "udp")
+    client_mixed_configs(remote, &[(MappingProtocol::Udp, ClientMapping { name, local, token })], key)
 }
 
 #[cfg(test)]
@@ -242,5 +263,42 @@ mod multi_tests {
             assert!(server_configs(bind, &[first(), second], KEY).is_err());
         }
         assert!(server_configs(bind, &[], KEY).is_err());
+    }
+}
+
+#[cfg(test)]
+mod mixed_tests {
+    use super::*;
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    #[test]
+    fn mixed_protocols_and_global_collisions() {
+        let bind = "127.0.0.1:2333".parse().unwrap();
+        let first = || (MappingProtocol::Tcp, ServerMapping { name:"web", port:20800, token:A });
+        let second = || (MappingProtocol::Udp, ServerMapping { name:"echo", port:20801, token:B });
+        let c = server_mixed_configs(bind, &[first(),second()], KEY).unwrap();
+        assert!(c.contains("[server.services.web]\ntype = \"tcp\""));
+        assert!(c.contains("[server.services.echo]\ntype = \"udp\""));
+        for m in [
+            ServerMapping{name:"web",port:20801,token:B},
+            ServerMapping{name:"echo",port:20800,token:B},
+            ServerMapping{name:"echo",port:20801,token:A},
+            ServerMapping{name:"echo",port:2333,token:B},
+        ] {
+            assert!(server_mixed_configs(bind,&[first(),(MappingProtocol::Udp,m)],KEY).is_err());
+        }
+        assert!(MappingProtocol::parse("quic").is_err());
+        assert!(MappingProtocol::parse("UDP").is_err());
+        let local="127.0.0.1:8080".parse().unwrap();
+        let a=|| (MappingProtocol::Tcp,ClientMapping{name:"web",local,token:A});
+        let b=|| (MappingProtocol::Udp,ClientMapping{name:"echo",local,token:B});
+        let c=client_mixed_configs("localhost:2333",&[a(),b()],KEY).unwrap();
+        assert!(c.contains("[client.services.web]\ntype = \"tcp\""));
+        assert!(c.contains("[client.services.echo]\ntype = \"udp\""));
+        assert!(client_mixed_configs("localhost:2333",&[a(),(MappingProtocol::Udp,ClientMapping{name:"echo",local,token:A})],KEY).is_err());
+        assert!(client_mixed_configs("localhost:2333",&[a(),(MappingProtocol::Udp,ClientMapping{name:"web",local,token:B})],KEY).is_err());
+        assert!(client_mixed_configs("localhost:2333",&[a(),(MappingProtocol::Udp,ClientMapping{name:"echo",local:"0.0.0.0:8080".parse().unwrap(),token:B})],KEY).is_err());
     }
 }
