@@ -170,3 +170,48 @@ pub async fn release_bandwidth(pool:&SqlitePool,id:Option<&str>)->Result<(),&'st
     }
     Ok(())
 }
+
+
+#[derive(Serialize,sqlx::FromRow)]
+struct Reservation{
+    id:String,tenant_id:String,mapping_id:String,mapping_revision:i64,
+    request_id:Option<String>,rate_bytes_per_second:Option<i64>,created_at:i64,
+}
+/// Trusted local inventory, no credential material. Bounded result; use
+/// exact recovery ID rather than a broad "clear all" mutation.
+pub async fn list_bandwidth(pool:&SqlitePool)->Result<String,&'static str>{
+    let rows=sqlx::query_as::<_,Reservation>("SELECT id,tenant_id,mapping_id,mapping_revision,request_id,rate_bytes_per_second,created_at FROM bandwidth_reservations ORDER BY created_at,id LIMIT 1001")
+        .fetch_all(pool).await.map_err(|_|"bandwidth inventory unavailable")?;
+    let truncated=rows.len()>1000;
+    serde_json::to_string(&serde_json::json!({"reservations":rows.into_iter().take(1000).collect::<Vec<_>>(),"truncated":truncated})).map_err(|_|"bandwidth inventory unavailable")
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverBandwidth{
+    reservation_id:String,tenant_id:String,mapping_id:String,mapping_revision:i64,
+    request_id:Option<String>,confirmation:String,
+}
+/// Caller MUST hold the exclusive global bandwidth guard. The explicit
+/// offline assertion covers old binaries, external children and backups
+/// which cannot be proved stopped by a file lock alone.
+pub async fn recover_bandwidth(pool:&SqlitePool)->Result<String,&'static str>{
+    use std::io::Read;
+    let mut bytes=Vec::new();
+    std::io::stdin().take(4097).read_to_end(&mut bytes).map_err(|_|"commercial input unavailable")?;
+    if bytes.len()>4096{return Err("commercial input too large")}
+    let c:RecoverBandwidth=decode(&bytes)?;
+    if !hex_id(&c.reservation_id)||!hex_id(&c.tenant_id)||!hex_id(&c.mapping_id)||c.mapping_revision<1||
+        c.request_id.as_ref().is_some_and(|id|!hex_id(id))||c.confirmation!="offline_all_tunnels_stopped"{
+        return Err("invalid offline bandwidth recovery confirmation")
+    }
+    let mut tx=pool.begin().await.map_err(|_|"bandwidth recovery transaction unavailable")?;
+    let n=sqlx::query("INSERT INTO bandwidth_recovery_audit(reservation_id,tenant_id,mapping_id,mapping_revision,request_id,rate_bytes_per_second,reserved_at,confirmation) SELECT id,tenant_id,mapping_id,mapping_revision,request_id,rate_bytes_per_second,created_at,'offline_all_tunnels_stopped' FROM bandwidth_reservations WHERE id=? AND tenant_id=? AND mapping_id=? AND mapping_revision=? AND request_id IS ?")
+        .bind(&c.reservation_id).bind(&c.tenant_id).bind(&c.mapping_id).bind(c.mapping_revision).bind(&c.request_id)
+        .execute(&mut *tx).await.map_err(|_|"bandwidth recovery refused")?.rows_affected();
+    if n!=1{return Err("bandwidth reservation missing or binding changed")}
+    let n=sqlx::query("DELETE FROM bandwidth_reservations WHERE id=?").bind(&c.reservation_id)
+        .execute(&mut *tx).await.map_err(|_|"bandwidth recovery refused")?.rows_affected();
+    if n!=1{return Err("bandwidth recovery outcome unknown")}
+    tx.commit().await.map_err(|_|"bandwidth recovery outcome unknown")?;
+    Ok(c.reservation_id)
+}

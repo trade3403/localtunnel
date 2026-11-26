@@ -296,10 +296,28 @@ try:
             assert inventory()["reserved_bytes_per_second"]==65536
             with sqlite3.connect(root/"control.sqlite3") as db:
                 assert db.execute("SELECT mapping_id,request_id,rate_bytes_per_second FROM bandwidth_reservations").fetchall()==[(a["id"],crashed[1],65536)]
+            def reservations():
+                return json.loads(subprocess.check_output([exe,"--commercial-list-bandwidth",str(root)],timeout=20))["reservations"]
+            stale=reservations()
+            assert len(stale)==1 and stale[0]["mapping_id"]==a["id"] and stale[0]["request_id"]==crashed[1]
+            stale=stale[0]
+            recovery={"reservation_id":stale["id"],"tenant_id":stale["tenant_id"],"mapping_id":stale["mapping_id"],"mapping_revision":stale["mapping_revision"],"request_id":stale["request_id"],"confirmation":"offline_all_tunnels_stopped"}
+            def recover(data,success=False):
+                result=subprocess.run([exe,"--commercial-recover-bandwidth",str(root)],input=json.dumps(data).encode(),capture_output=True,timeout=20)
+                assert (result.returncode==0)==success
+                if success: assert result.stdout.decode().strip()==stale["id"]
             survivor=spawn_tcp(b,"aggregate_survivor")
             ready_tcp(survivor)
             exchange(1024,b["bind_port"])
             assert inventory()["reserved_bytes_per_second"]==131072
+            # Even a valid exact stale ID cannot be released while any
+            # current supervised worker owns the shared global guard.
+            recover(recovery)
+            assert inventory()["reserved_bytes_per_second"]==131072
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT count(*) FROM bandwidth_recovery_audit").fetchone()==(0,)
+            exchange(1024,b["bind_port"])
+            report["real_bandwidth_recovery_refuses_live_worker"]=True
             extra=new_mapping(admin,device,"tcp",local)
             denied_run=spawn_tcp(extra,"aggregate_crash_denied")
             assert denied_run[0].wait(timeout=15)!=0
@@ -308,6 +326,42 @@ try:
             assert inventory()["reserved_bytes_per_second"]==65536
             assert inventory()["bandwidth_reservations"]==1
             report["real_tenant_crash_reservation_fail_closed"]=True
+            # Check the crashed worker's known sockets have closed before
+            # the trusted operator makes the explicit offline assertion.
+            guard_port=json.loads((root/"aggregate_crash"/"manifest.json").read_text())["tcp_limiter_port"]
+            for port in (a["bind_port"],crashed[3],guard_port):
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    with socket.socket() as check:
+                        check.settimeout(.5)
+                        if check.connect_ex(("127.0.0.1",port))!=0:break
+                    time.sleep(.1)
+                else: raise AssertionError("crashed listener remained reachable")
+            recover({**recovery,"confirmation":"not_checked"})
+            recover({**recovery,"mapping_revision":recovery["mapping_revision"]+1})
+            recover({**recovery,"tenant_id":secrets.token_hex(16)})
+            assert len(reservations())==1
+            recover(recovery,True)
+            recover(recovery)
+            assert inventory()["reserved_bytes_per_second"]==0 and reservations()==[]
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                audit=db.execute("SELECT reservation_id,tenant_id,mapping_id,mapping_revision,request_id,rate_bytes_per_second,reserved_at,confirmation FROM bandwidth_recovery_audit").fetchall()
+                assert audit==[(stale["id"],stale["tenant_id"],a["id"],a["revision"],crashed[1],65536,stale["created_at"],"offline_all_tunnels_stopped")]
+            # The release must not misreport the crashed request as stopped.
+            assert call(base,crashed[2]+"/runtime",200,token=admin)["request"]["state"]=="running"
+            report["real_bandwidth_recovery_exact_binding_audit_and_no_adoption"]=True
+            recovered_a=spawn_tcp(b,"aggregate_after_recovery_a")
+            new=new_mapping(admin,device,"tcp",local)
+            recovered_b=spawn_tcp(new,"aggregate_after_recovery_b")
+            ready_tcp(recovered_a)
+            ready_tcp(recovered_b)
+            assert inventory()["reserved_bytes_per_second"]==131072
+            exchange(1024,b["bind_port"])
+            exchange(1024,new["bind_port"])
+            stop_run(recovered_a)
+            stop_run(recovered_b)
+            assert reservations()==[]
+            report["real_bandwidth_recovered_capacity_reused_by_real_workers"]=True
         finally:
             for p in reversed(children):
                 if p.poll() is None:
@@ -319,4 +373,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len([v for v in report.values() if v is True])==10
+assert len([v for v in report.values() if v is True])==13

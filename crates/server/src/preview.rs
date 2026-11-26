@@ -200,6 +200,10 @@ fn protect_child(_: &mut Command)->Result<()>{Err("Linux supervisor only")}
 // process death. A separate create_new marker retains crash evidence.
 #[cfg(target_os="linux")]
 fn guard(root:&Path,kind:&str,prefix:&str)->Result<fs::File>{
+    file_guard(root,kind,prefix,true)
+}
+#[cfg(target_os="linux")]
+fn file_guard(root:&Path,kind:&str,prefix:&str,exclusive:bool)->Result<fs::File>{
     use std::os::{fd::AsRawFd,unix::fs::{OpenOptionsExt,PermissionsExt}};
     if !safe_name(prefix){return Err("invalid guard prefix")}
     let file=fs::OpenOptions::new().read(true).write(true).create(true)
@@ -207,11 +211,21 @@ fn guard(root:&Path,kind:&str,prefix:&str)->Result<fs::File>{
         .open(root.join(format!("{kind}-{prefix}.guard"))).map_err(|_|"guard unavailable")?;
     let m=file.metadata().map_err(|_|"guard metadata unavailable")?;
     if !m.is_file()||m.permissions().mode()&0o077!=0{return Err("unsafe guard")}
-    if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err("worker or supervisor still holds guard")}
+    if unsafe{libc::flock(file.as_raw_fd(),(if exclusive{libc::LOCK_EX}else{libc::LOCK_SH})|libc::LOCK_NB)}!=0{return Err("worker or supervisor still holds guard")}
     Ok(file)
 }
 #[cfg(not(target_os="linux"))]
 fn guard(_: &Path,_:&str,_:&str)->Result<fs::File>{Err("Linux supervisor only")}
+/// All current supervised processes (including waiting residents) hold
+/// this shared lock. Exact offline release requires the exclusive form.
+/// Never unlink the persistent guard inode.
+#[cfg(target_os="linux")]
+pub fn bandwidth_guard(root:&Path,exclusive:bool)->Result<fs::File>{
+    private_dir(root)?;
+    file_guard(root,"commercial","bandwidth",exclusive)
+}
+#[cfg(not(target_os="linux"))]
+pub fn bandwidth_guard(_root:&Path,_exclusive:bool)->Result<fs::File>{Err("Linux bandwidth recovery only")}
 struct PreviewLock{path:PathBuf,_guard:fs::File}
 impl Drop for PreviewLock {fn drop(&mut self){let _=fs::remove_file(&self.path);}}
 fn acquire_lock(root:&Path,kind:&str,prefix:&str)->Result<PreviewLock>{

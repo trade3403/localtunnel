@@ -27,10 +27,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(17) => (StatusCode::OK, "ready"),
+        Ok(18) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -116,6 +116,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
         #[cfg(not(target_os = "linux"))]
         return Err("database snapshot maintenance is Linux-only".into());
     }
+    let bandwidth_list=args.first().is_some_and(|a|a=="--commercial-list-bandwidth");
+    let bandwidth_recover=args.first().is_some_and(|a|a=="--commercial-recover-bandwidth");
     let commercial_action=args.first().and_then(|a|a.to_str()).filter(|a|matches!(*a,"--commercial-create-account"|"--commercial-create-plan"|"--commercial-assign"));
     let init = args.first().is_some_and(|a| a=="--init-admin");
     let add_node = args.first().is_some_and(|a| a=="--add-node");
@@ -139,9 +141,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let prune_logs = args.first().is_some_and(|a| a=="--prune-gateway-logs");
     let expected = if prune_logs {3} else if prune_history {2} else if recover {4} else if tcp_worker {7} else if udp_device_worker {8} else if udp_worker || udp_resident {9} else if udp_supervise {7} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --commercial-create-account <data-dir> | --commercial-create-plan <data-dir> | --commercial-assign <data-dir> (each reads bounded JSON stdin) | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-tcp-worker <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <bytes-per-second> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-device-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --commercial-create-account <data-dir> | --commercial-create-plan <data-dir> | --commercial-assign <data-dir> (each reads bounded JSON stdin) | --commercial-list-bandwidth <data-dir> | --commercial-recover-bandwidth <data-dir> (reads exact reservation JSON and offline confirmation) | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-tcp-worker <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <bytes-per-second> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-device-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
     }
-    let operator = commercial_action.is_some() || init || add_node || set_node || export || gateway || supervise || udp_supervise || tcp_worker || udp_worker || udp_device_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
+    let operator = bandwidth_list || bandwidth_recover || commercial_action.is_some() || init || add_node || set_node || export || gateway || supervise || udp_supervise || tcp_worker || udp_worker || udp_device_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
@@ -160,6 +162,21 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .busy_timeout(Duration::from_secs(3)))
         .await?;
     MIGRATOR.run(&pool).await?;
+    // Hold the guard until this entire process finishes, including
+    // cleanup and DB release. Exclusive recovery cannot race a new worker.
+    let _bandwidth_guard=if bandwidth_recover{
+        Some(preview::bandwidth_guard(&root,true)?)
+    }else if supervise || supervise_tls || worker || tls_worker || resident || tls_resident || udp_supervise || udp_worker || udp_device_worker || udp_resident || tcp_worker || recover{
+        Some(preview::bandwidth_guard(&root,false)?)
+    }else{None};
+    if bandwidth_list{
+        println!("{}",commercial::list_bandwidth(&pool).await?);
+        return Ok(());
+    }
+    if bandwidth_recover{
+        println!("{}",commercial::recover_bandwidth(&pool).await?);
+        return Ok(());
+    }
     if let Some(action)=commercial_action{
         let id=commercial::operator(&pool,action).await?;
         println!("{id}");

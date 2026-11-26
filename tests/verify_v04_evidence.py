@@ -275,6 +275,9 @@ REQUIRED["management-v08"] = {
         "real_tenant_cross_protocol_over_budget_denied",
         "real_tenant_released_budget_reused_by_other_protocol",
         "real_tenant_crash_reservation_fail_closed",
+        "real_bandwidth_recovery_refuses_live_worker",
+        "real_bandwidth_recovery_exact_binding_audit_and_no_adoption",
+        "real_bandwidth_recovered_capacity_reused_by_real_workers",
     ],
     "udp-preview.json": [
         "real_udp_commercial_suspend_revokes_lease_and_closes_relay",
