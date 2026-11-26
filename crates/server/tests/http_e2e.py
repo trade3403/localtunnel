@@ -1,4 +1,5 @@
 """Real process, HTTP and SQLite integration; Linux hosted runner only."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -56,6 +57,16 @@ def reject(db, sql, args=()):
     raise AssertionError("database constraint did not reject invalid row")
 
 
+def assert_migrations(db):
+    # Exact current migration inventory and contents, not a count alone.
+    migrations = Path(__file__).resolve().parents[1] / "migrations"
+    expected = [(int(path.stem.split("_", 1)[0]), 1, hashlib.sha384(path.read_bytes()).digest())
+                for path in sorted(migrations.glob("*.sql"))]
+    assert [version for version, _, _ in expected] == list(range(1, 12))
+    actual = db.execute("SELECT version,success,checksum FROM _sqlx_migrations ORDER BY version").fetchall()
+    assert actual == expected, "database migration inventory or checksum mismatch"
+
+
 def rejected_start(directory):
     p = subprocess.run([exe, str(directory), "0"], capture_output=True, timeout=10)
     assert p.returncode == 1 and b"LISTENING" not in p.stdout
@@ -76,7 +87,7 @@ try:
             with sqlite3.connect(db_path) as db:
                 db.execute("PRAGMA foreign_keys=ON")
                 assert db.execute("PRAGMA foreign_keys").fetchone() == (1,)
-                assert db.execute("SELECT count(*) FROM _sqlx_migrations WHERE success=1").fetchone() == (10,)
+                assert_migrations(db)
                 db.executemany("INSERT INTO users(id,username,password_hash,role) VALUES (?,?,?,?)",
                                [("u1","fixture1","fixture-hash-not-a-login","admin"),
                                 ("u2","fixture2","fixture-hash-not-a-login","user")])
@@ -90,6 +101,8 @@ try:
                 reject(db, insert, ("m2","u1","d1","n1",None,"tcp",8080,20000))
                 reject(db, insert, ("m2","u1","d1","n1",None,"tcp",0,20002))
                 reject(db, insert, ("m2","u1","d1","n1",None,"http",8080,20002))
+                reject(db, insert, ("m2","u1","d1","n1","h1","udp",8080,20002))
+                reject(db, insert, ("m2","u1","d1","n1",None,"udp",8080,20000))
                 assert db.execute("SELECT enabled FROM mappings").fetchone() == (0,)
                 assert db.execute("PRAGMA foreign_key_check").fetchall() == []
                 report["migration_and_constraints"] = True
@@ -104,7 +117,7 @@ try:
             assert http(base, "/readyz") == (200, b"ready")
             with sqlite3.connect(db_path) as db:
                 assert db.execute("SELECT count(*) FROM mappings").fetchone() == (1,)
-                assert db.execute("SELECT count(*) FROM _sqlx_migrations").fetchone() == (10,)
+                assert_migrations(db)
                 # Simulate lost table: readiness must fail, liveness still responds.
                 db.execute("DROP TABLE mappings")
             assert http(base, "/readyz") == (503, b"not ready")
