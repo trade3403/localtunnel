@@ -43,13 +43,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p test-results
+          python -c 'import sys, platform; assert sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 14) and sys.platform == "linux" and platform.machine() == "x86_64", "QUIC wheel lock requires Linux x86_64 CPython 3.14"'
           python -m venv "$RUNNER_TEMP/lt-quic-venv"
           py="$RUNNER_TEMP/lt-quic-venv/bin/python"
           wheels="$RUNNER_TEMP/lt-quic-wheels"
+          lock="$GITHUB_WORKSPACE/tests/quic-requirements-linux-x64-py314.txt"
           mkdir "$wheels"
-          "$py" -m pip --isolated download --index-url https://pypi.org/simple --only-binary=:all: --dest "$wheels" aioquic==1.9.2
+          "$py" -m pip --isolated download --no-cache-dir --index-url https://pypi.org/simple --only-binary=:all: --require-hashes --dest "$wheels" -r "$lock"
           (cd "$wheels" && sha256sum --check "$GITHUB_WORKSPACE/tests/quic-wheel.sha256")
-          "$py" -m pip --isolated install --no-index --only-binary=:all: --find-links "$wheels" --report test-results/quic-dependencies.json aioquic==1.9.2
+          "$py" -m pip --isolated install --no-cache-dir --no-index --only-binary=:all: --require-hashes --find-links "$wheels" --report test-results/quic-dependencies.json -r "$lock"
           "$py" -m pip check
           "$py" tests/quic_experiment.py test-results/quic-experiment.json
       - name: Package CLI build
