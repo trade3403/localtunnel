@@ -97,7 +97,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
         if args.len()!=3{return Err("usage: --backup-db <data-dir> <new-backup-dir> | --restore-db <backup-dir> <new-data-dir>".into())}
         #[cfg(target_os = "linux")]
         {
-            backup::run(Path::new(&args[1]),Path::new(&args[2]),restore_db).await?;
+            if let Err(error) = backup::run(Path::new(&args[1]),Path::new(&args[2]),restore_db).await {
+                // Trusted local maintenance CLI only: expose fixed admission
+                // reasons, never raw SQL, paths, credentials or OS errors.
+                match error.to_string().as_str() {
+                    "source budget exceeded" => eprintln!("source budget exceeded"),
+                    "unsafe or oversized database file" => eprintln!("unsafe or oversized database file"),
+                    "destination or sidecar already exists" => eprintln!("destination or sidecar already exists"),
+                    _ => {}
+                }
+                return Err(error);
+            }
             println!("verified database snapshot published");
             return Ok(())
         }
