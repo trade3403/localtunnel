@@ -83,7 +83,9 @@ def main(executable, evidence):
               "recovery_disabled": False, "readonly_scm_status": False, "service_traffic_measured": False,
               "recovered_traffic_measured": False, "history_checkpoint": False,
               "history_after_host_recovery": False, "history_after_stop": False,
-              "history_preserved_unregister": False, "unsafe_history_rejected": False, "desktop_service_controls": False, "one_click_provision": False, "profile_update": False, "desktop_unregister": False}
+              "history_preserved_unregister": False, "unsafe_history_rejected": False, "desktop_service_controls": False, "one_click_provision": False, "profile_update": False, "desktop_unregister": False,
+              "mixed_service_forwarded": False, "mixed_service_recovered": False,
+              "mixed_service_unknown_traffic": False, "mixed_service_stopped": False}
     created = False
     relay = None
     fixture = None
@@ -176,6 +178,12 @@ def main(executable, evidence):
                     a.bind(("127.0.0.1", 0))
                     b.bind(("127.0.0.1", 0))
                     relay_port, mapped = a.getsockname()[1], b.getsockname()[1]
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                    probe.bind(("127.0.0.1", 0))
+                    udp_mapped = probe.getsockname()[1]
+                    if udp_mapped in (relay_port, mapped):
+                        raise RuntimeError("unexpected UDP mapping port collision")
+                udp_token = secrets.token_hex(32)
                 config = Path(work) / "server.toml"
                 config.write_text(f"""[server]
 bind_addr = "127.0.0.1:{relay_port}"
@@ -192,6 +200,11 @@ local_private_key = "{private}"
 type = "tcp"
 token = "{token}"
 bind_addr = "127.0.0.1:{mapped}"
+
+[server.services.datagram]
+type = "udp"
+token = "{udp_token}"
+bind_addr = "127.0.0.1:{udp_mapped}"
 """, encoding="utf-8")
                 profile = json.dumps({"engine": "", "remote": f"127.0.0.1:{relay_port}",
                                       "serverKey": public,
@@ -495,6 +508,88 @@ bind_addr = "127.0.0.1:{mapped}"
                         after_history = json.loads(history_file.read_text(encoding="utf-8"))
                         if after_history["uploadBytes"] < before_history["uploadBytes"] + len(changed_body):
                             raise RuntimeError("profile update lost saved traffic")
+                        # Update the real SCM service to mixed TCP/UDP after the
+                        # existing measured TCP lifecycle. Preserve historical data.
+                        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp_fixture:
+                            udp_fixture.bind(("127.0.0.1", 0))
+                            udp_fixture.settimeout(.2)
+                            stop_echo = threading.Event()
+                            def echo_udp():
+                                while not stop_echo.is_set():
+                                    try:
+                                        data, peer = udp_fixture.recvfrom(2048)
+                                        udp_fixture.sendto(b"U" + data, peer)
+                                    except socket.timeout:
+                                        continue
+                            echo_thread = threading.Thread(target=echo_udp, daemon=True)
+                            echo_thread.start()
+                            def udp_roundtrip():
+                                payload = secrets.token_bytes(128)
+                                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                                    sock.settimeout(.5)
+                                    sock.connect(("127.0.0.1", udp_mapped))
+                                    try:
+                                        sock.send(payload)
+                                        return sock.recv(2048) == b"U" + payload
+                                    except (socket.timeout, ConnectionResetError):
+                                        return False
+                            def wait_mixed():
+                                e2e.wait_for(url, body, [relay], seconds=35)
+                                deadline = time.monotonic() + 35
+                                while time.monotonic() < deadline:
+                                    if udp_roundtrip():
+                                        return
+                                    time.sleep(.2)
+                                raise RuntimeError("real SCM UDP echo unavailable")
+                            try:
+                                mixed = json.loads(profile)
+                                mixed["mappings"].append({"protocol": "udp", "name": "datagram",
+                                    "localPort": udp_fixture.getsockname()[1], "token": udp_token})
+                                result = update(json.dumps(mixed).encode())
+                                if result.returncode:
+                                    raise RuntimeError("mixed SCM profile update rejected")
+                                ciphertext = saved_profile.read_bytes()
+                                if token.encode() in ciphertext or udp_token.encode() in ciphertext:
+                                    raise RuntimeError("mixed profile plaintext credential")
+                                state = json.loads(run(str(source_exe), "--service-status", fresh).stdout)
+                                assert state["state"] == "stopped" and state["startup"] == "disabled"
+                                run(str(source_exe), "--service-manage", fresh, "autostart-off")
+                                run(str(source_exe), "--service-manage", fresh, "start")
+                                wait_mixed()
+                                report["mixed_service_forwarded"] = True
+                                host = service_pid(fresh)
+                                old_child = engine_child(host, fresh_root)
+                                assert old_child is not None
+                                run("taskkill.exe", "/PID", str(old_child[0]), "/F")
+                                deadline = time.monotonic() + 35
+                                while time.monotonic() < deadline:
+                                    child = engine_child(host, fresh_root)
+                                    if child is not None and child[0] != old_child[0] and not old_child[1].exists():
+                                        break
+                                    time.sleep(.25)
+                                else:
+                                    raise RuntimeError("mixed SCM child did not recover")
+                                assert service_pid(fresh) == host
+                                wait_mixed()
+                                report["mixed_service_recovered"] = True
+                                time.sleep(1.5)
+                                for _ in range(3):
+                                    snap = json.loads(run(str(source_exe), "--service-status", fresh).stdout)
+                                    assert snap["state"] == "running" and snap["traffic"] is None
+                                    assert snap["history"] == after_history
+                                    assert not (child[1] / "traffic.json").exists()
+                                    assert udp_roundtrip()
+                                    time.sleep(.3)
+                                report["mixed_service_unknown_traffic"] = True
+                                run(str(source_exe), "--service-manage", fresh, "stop")
+                                wait_state(fresh, 1)
+                                assert not any((fresh_root / "runtime").iterdir())
+                                assert not udp_roundtrip() and e2e.get(url) != body
+                                assert json.loads(history_file.read_text(encoding="utf-8")) == after_history
+                                report["mixed_service_stopped"] = True
+                            finally:
+                                stop_echo.set()
+                                echo_thread.join(timeout=2)
                         if run(str(source_exe), "--service-unregister", fresh, "wrong", check=False).returncode == 0:
                             raise RuntimeError("incorrect unregister confirmation accepted")
                         run(str(source_exe), "--service-unregister", fresh, fresh)

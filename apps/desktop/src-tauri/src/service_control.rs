@@ -338,7 +338,7 @@ fn confirmed_directory(name: &str, confirmation: &str) -> Result<std::path::Path
 pub fn update_profile(name: &str, confirmation: &str, request: crate::StartRequest) -> Result<(), String> {
     let dir = confirmed_directory(name, confirmation)?;
     if !request.engine.is_empty() { return Err("service requires bundled engine".into()); }
-    crate::require_tcp_service(&request)?;
+    crate::validate_service_protocols(&request)?;
     let _validated = zeroize::Zeroizing::new(crate::build_config(&request)?);
     let encoded = zeroize::Zeroizing::new(serde_json::to_vec(&request).map_err(|_| "profile encode failed")?);
     if encoded.len() > 256 * 1024 { return Err("service profile too large".into()); }

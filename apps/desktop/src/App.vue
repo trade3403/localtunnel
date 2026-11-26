@@ -91,7 +91,6 @@ async function maintainService(action: 'update' | 'unregister') {
   const name = watchedService.value
   if (!name || serviceName.value.trim() !== name || maintenanceConfirm.value !== name ||
       serviceSnapshot.value?.state !== 'stopped' || serviceBusy.value || busy.value) return
-  if (action === 'update' && mappings.value.some(m => m.protocol !== 'tcp')) { serviceActionError.value = '后台服务暂仅支持 TCP'; return }
   if (action === 'update' && (running.value || engine.value.trim() ||
       mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535))) {
     serviceActionError.value = '请停止桌面隧道，清空自定义引擎路径并填写有效端口'; return
@@ -124,7 +123,6 @@ async function maintainService(action: 'update' | 'unregister') {
 }
 async function provisionService() {
   if (serviceBusy.value || busy.value || running.value || !ready.value || !provisionConfirm.value) return
-  if (mappings.value.some(m => m.protocol !== 'tcp')) { serviceActionError.value = '后台服务暂仅支持 TCP'; return }
   if (engine.value.trim()) { serviceActionError.value = '后台服务只允许内置引擎，请清空自定义路径'; return }
   if (mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535)) {
     serviceActionError.value = '请填写有效本地端口'; return
@@ -462,14 +460,14 @@ async function toggle() {
           <div><small>服务下载速度</small><strong class="protocol">{{ formatBytes(serviceSnapshot.traffic.downloadBytesPerSecond, true) }}</strong><span>累计 {{ formatBytes(serviceSnapshot.traffic.downloadBytes) }}</span></div>
           <div><small>计量引擎 PID</small><strong>{{ serviceSnapshot.traffic.enginePid }}</strong><span>本次引擎会话</span></div>
         </div>
-        <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照暂不可用（权限不足、恢复中或尚未采样）。</p>
+        <p v-else-if="serviceSnapshot?.state === 'running'" class="hint">流量快照不可用（含 UDP 的会话暂不计量，或权限不足、恢复中、尚未采样）。</p>
         <div v-if="serviceSnapshot?.history" class="summary">
           <div><small>服务历史累计上传</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.uploadBytes) }}</strong><span>已保存</span></div>
           <div><small>服务历史累计下载</small><strong class="protocol">{{ formatBytes(serviceSnapshot.history.downloadBytes) }}</strong><span>已保存</span></div>
           <div><small>最近保存</small><strong class="protocol">{{ new Date(serviceSnapshot.history.savedAtMs).toLocaleTimeString() }}</strong><span>独立于桌面历史</span></div>
         </div>
         <p v-else-if="serviceSnapshot" class="hint">服务历史暂无可读记录（未配置、未保存或权限不足）。</p>
-        <p v-if="serviceSnapshot?.history" class="hint">已保存历史含本次已保存增量，不与会话流量重复相加；强制结束可能丢失未保存增量。</p>
+        <p v-if="serviceSnapshot?.history" class="hint">已保存历史仅包含已计量的 TCP 会话，不包含 UDP 或混合会话；不与会话流量重复相加，强制结束可能丢失未保存增量。</p>
         <div v-if="serviceSnapshot" class="profile-actions">
           <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService" @click="serviceAction('check')">检查服务配置</button>
           <button type="button" class="secondary" :disabled="serviceBusy || serviceName.trim() !== watchedService || serviceSnapshot.state !== 'stopped' || serviceSnapshot.startup === 'disabled'" @click="serviceAction('start')">启动服务</button>
@@ -521,7 +519,7 @@ async function toggle() {
             <input v-model="mapping.token" :disabled="locked" aria-label="映射授权 Token" required type="password" autocomplete="off" minlength="32" maxlength="128" placeholder="输入授权 Token" />
             <button type="button" class="remove" :disabled="locked || mappings.length === 1" @click="remove(mapping.id)" aria-label="删除映射">×</button>
           </div><div class="port-actions"><label>协议 <select v-model="mapping.protocol" :disabled="locked" aria-label="映射协议" @change="delete portNotice[mapping.id]"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label><button type="button" class="secondary" :disabled="busy || !ready || mapping.protocol!=='tcp'" @click="probe(mapping)">检测本地端口</button><span role="status">{{ mapping.protocol==='udp' ? 'UDP 不支持 TCP 端口探测' : (portNotice[mapping.id] || "未检测") }}</span></div></div>
-          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。UDP 须与中转映射协议一致，暂仅桌面模式。停止隧道后可编辑配置；域名由服务端分配。</p>
+          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。UDP 须与中转映射协议一致，支持桌面及后台服务；混合会话暂不计量。停止隧道后可编辑配置；域名由服务端分配。</p>
         </section>
         <div class="actions">
           <div aria-live="polite"><strong>{{ label }}</strong><p>{{ status.detail }}</p><p v-if="error" class="error" role="alert">{{ error }}</p></div>

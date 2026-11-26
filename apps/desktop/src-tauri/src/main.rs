@@ -54,9 +54,9 @@ struct Status {
 
 fn default_protocol() -> String { "tcp".into() }
 
-fn require_tcp_service(request: &StartRequest) -> Result<(), String> {
-    if request.mappings.iter().any(|m| m.protocol != "tcp") {
-        return Err("Windows 后台服务暂仅支持 TCP 映射".into());
+fn validate_service_protocols(request: &StartRequest) -> Result<(), String> {
+    if request.mappings.iter().any(|m| !matches!(m.protocol.as_str(), "tcp" | "udp")) {
+        return Err("Windows 后台服务仅支持 TCP 或 UDP 映射".into());
     }
     Ok(())
 }
@@ -147,7 +147,7 @@ impl Supervisor {
         }
         // Validate original configuration before allocating any listeners.
         let original_config = build_config(&request)?;
-        if runtime_root.is_some() { require_tcp_service(&request)?; }
+        if runtime_root.is_some() { validate_service_protocols(&request)?; }
         let has_udp = request.mappings.iter().any(|m| m.protocol == "udp");
         let mut builder = tempfile::Builder::new();
         builder.prefix("localtunnel-client-");
@@ -172,7 +172,7 @@ impl Supervisor {
             (config, ports, Some(meter))
         };
         #[cfg(windows)]
-        let telemetry = if runtime_root.is_some() {
+        let telemetry = if runtime_root.is_some() && !has_udp {
             Some(std::fs::OpenOptions::new().write(true).create_new(true)
                 .open(directory.path().join("traffic.json")).map_err(|_| "service telemetry file unavailable")?)
         } else { None };
@@ -677,11 +677,12 @@ mod tests {
         legacy["mappings"][0].as_object_mut().unwrap().remove("protocol");
         let decoded: StartRequest = serde_json::from_value(legacy).unwrap();
         assert_eq!(decoded.mappings[0].protocol, "tcp");
-        assert!(require_tcp_service(&decoded).is_ok());
+        assert!(validate_service_protocols(&decoded).is_ok());
         req.mappings[0].protocol = "udp".into();
         assert!(build_config(&req).unwrap().contains("type = \"udp\""));
-        assert!(require_tcp_service(&req).is_err());
+        assert!(validate_service_protocols(&req).is_ok());
         req.mappings[0].protocol = "quic".into();
+        assert!(validate_service_protocols(&req).is_err());
         assert!(build_config(&req).is_err());
     }
 

@@ -122,7 +122,7 @@ mod windows {
         if data.is_empty() || data.len() > LIMIT { return Err("服务配置大小无效".into()); }
         let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "服务配置格式无效")?;
         if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
-        crate::require_tcp_service(&request)?;
+        crate::validate_service_protocols(&request)?;
         validate(&request)?;
         let encrypted = transform_scoped(&data, true, true)?;
         let mut file = NamedTempFile::new_in(dir).map_err(|_| "无法创建服务凭据文件")?;
@@ -137,7 +137,7 @@ mod windows {
     // an encrypted candidate with a protected ACL before replacing old data.
     pub fn replace_service(dir: &Path, name: &str, request: &StartRequest) -> Result<(), String> {
         if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
-        crate::require_tcp_service(&request)?;
+        crate::validate_service_protocols(&request)?;
         validate(request)?;
         let data = Zeroizing::new(serde_json::to_vec(request).map_err(|_| "服务凭据序列化失败")?);
         let encrypted = transform_scoped(&data, true, true)?;
@@ -164,7 +164,7 @@ mod windows {
         let data = transform(&encrypted, false)?;
         let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "服务凭据格式无效")?;
         if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
-        crate::require_tcp_service(&request)?;
+        crate::validate_service_protocols(&request)?;
         validate(&request)?;
         Ok(request)
     }
@@ -194,16 +194,17 @@ mod windows {
             assert!(seal_service(dir.path(), serde_json::to_vec(&request).unwrap().as_slice()).is_err());
             assert!(!dir.path().join("service-profile.bin").exists());
             request.engine.clear();
-            request.mappings[0].protocol = "udp".into();
+            request.mappings[0].protocol = "quic".into();
             assert!(seal_service(dir.path(), serde_json::to_vec(&request).unwrap().as_slice()).is_err());
             assert!(!dir.path().join("service-profile.bin").exists());
-            request.mappings[0].protocol = "tcp".into();
+            request.mappings[0].protocol = "udp".into();
             let json = serde_json::to_vec(&request).unwrap();
             seal_service(dir.path(), json.as_slice()).unwrap();
             let file = dir.path().join("service-profile.bin");
             let original = fs::read(&file).unwrap();
             assert!(!original.windows(token.len()).any(|w| w == token.as_bytes()));
             assert_eq!(load_service(dir.path()).unwrap().mappings[0].token, token);
+            assert_eq!(load_service(dir.path()).unwrap().mappings[0].protocol, "udp");
             assert!(seal_service(dir.path(), json.as_slice()).is_err());
             assert_eq!(fs::read(&file).unwrap(), original);
             fs::write(file, b"not ciphertext").unwrap();
