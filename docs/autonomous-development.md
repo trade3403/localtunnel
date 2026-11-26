@@ -410,3 +410,9 @@
 - 新增 agent-service-generate <dir> <32hex-id>，验证私有配置及固定引擎、当前可信CLI路径，排他生成0600 systemd user unit或launchd plist，拒绝路径注入、非法ID、覆盖；不自动注册、运行、启用或使用root服务。仅允许ASCII字母数字及/._-的绝对路径；有空格/特殊字符的路径须另选可信目录。Linux Restart=on-failure、2s延迟/60s最多5次启动；macOS RunAtLoad/KeepAlive unsuccessful exit/2s throttle，不声称有同样重启上限。
 - Linux实际使用标准免费Runner的systemd user manager（仅CI用sudo loginctl enable-linger启动临时runner用户管理器），独立随机unit安装至用户配置、enable/start、实际HTTP正文、核对MainPID为真实引擎、SIGKILL后新PID重新转发、stop/disable/删除unit。macOS使用现有gui或user域的launchctl bootstrap/print/bootout，真实PID/正文/强杀重启/卸载。四平台强制执行，不能以plist解析代替运行。所有服务只在隔离CI、固定回环映射；证据4项，保留原测试。CI实例终止时runner被销毁，不涉及用户机器或生产。
 - 使用方法（待CI）：先用固定引擎CLI及已有agent-store-init/agent-config-create/agent-engine-install创建私有store，再显式生成定义。Linux由当前用户自行将生成unit安装至~/.config/systemd/user/，systemctl --user daemon-reload、enable --now <unit>，停止用disable --now并移除该unit、daemon-reload；macOS显式复制plist至~/Library/LaunchAgents/并以launchctl bootstrap gui/<uid> <plist>加载，停止用bootout gui/<uid>/<label>并移除plist。不要在引擎运行时替换store，不能同时手工运行。实际机器开机/登录重启、无GUI的Linux linger配置、服务注册卸载产品CLI、包分发、生产权限仍待验收；本轮不声称真实重启已测试。下一项依CI结果推进注册管理或打包。未改main、未部署公网、未正式发布。
+
+## V0.6 服务测试修复：独立安装 CLI inode（待 CI）
+- 失败提交 `9042f8d7183c31de686a69782048640c0ef67ca2`：同SHA 6/7工作流通过，Native [45763152677](https://github.com/trade3403/localtunnel/actions/runs/45763152677) 中 macOS Intel/ARM64 成功，Linux x64/ARM64失败。Linux用户管理器启动成功，失败发生在生成服务定义，两个实际job 139717654600/139717655073 的报错均为 localtunnel: untrusted agent executable，尚未进入systemd实际服务测试。
+- 现有生成器要求当前CLI为可信所有者、不可group/world写入、单硬链接、可执行的普通文件。Cargo顶层release产物可能与deps产物为硬链接；这是根据失败点推断的最可能原因，旧日志未采集inode/链接数，尚待新CI确认。
+- 测试改为从刚刚固定引擎摘要构建的CLI读取确切字节，以排他创建方式写入私有目录的独立0700安装副本，核对字节相同、不同inode、nlink=1、有效uid和权限，并记录构建产物与安装副本链接数及构建模式。前台与系统服务测试均执行该副本，归档仍为实际已验收CLI。服务E2E新增主动创建额外硬链接、实际生成命令拒绝且无残留定义、移除额外链接后成功生成的强制断言。原服务启停/强杀恢复/实际隧道均保留，报告增加1项。产品安全规则、工作流、旧测试阈值不变。
+- 复现时必须使用独立安装的CLI，而不是Cargo构建目录的硬链接文件；不通过chmod放宽权限或跳过测试。新CI若失败先查实际日志；不提前进入打包。未修改main或生产环境。

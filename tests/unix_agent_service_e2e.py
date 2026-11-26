@@ -25,6 +25,20 @@ def exercise(root, cli, url, body, relay, token, results, get):
         if ok and p.returncode!=0:
             raise RuntimeError("native service command failed: "+str(args[0])+" "+str(args[1:3])+" "+p.stderr[-500:])
         return p
+    # Exercise the exact executable metadata denial from the prior CI failure.
+    # The installed CLI is a private independent inode, but a same-owner
+    # extra hardlink must still be rejected before any definition is created.
+    suffix=".service" if linux else ".plist"
+    hardlink=cli.with_name("service-cli-hardlink")
+    os.link(cli,hardlink)
+    try:
+        assert cli.stat().st_nlink==2
+        denied=call(cli,"agent-service-generate",root,service_id,ok=False)
+        assert denied.returncode!=0 and "untrusted agent executable" in denied.stderr
+        assert not (root/(label+suffix)).exists()
+    finally:
+        hardlink.unlink()
+    assert cli.stat().st_nlink==1
     call(cli,"agent-service-generate",root,service_id)
     definition=root/(label+(".service" if linux else ".plist"))
     original=definition.read_bytes()
@@ -34,6 +48,7 @@ def exercise(root, cli, url, body, relay, token, results, get):
     assert call(cli,"agent-service-generate",root,"bad\nid",ok=False).returncode!=0
     assert definition.read_bytes()==original
     report["real_native_service_definition_and_no_overwrite"]=True
+    report["real_native_service_hardlinked_cli_denied"]=True
     installed=root/"rathole"
     def identity(pid):
         p=call("/bin/ps","-p",str(pid),"-o","command=",ok=False)
@@ -124,4 +139,4 @@ def exercise(root, cli, url, body, relay, token, results, get):
         cleanup()
         report["manager"]=manager_kind
         (results/"unix-service.json").write_text(json.dumps(report,indent=2),encoding="utf-8")
-    assert len(report)==5 and all(v is True for k,v in report.items() if k!="manager")
+    assert len(report)==6 and all(v is True for k,v in report.items() if k!="manager")

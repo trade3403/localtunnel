@@ -19,7 +19,23 @@ def exercise(d, binary, cli, body, local_port, private, public, results, port, w
     project=Path(__file__).resolve().parents[1]
     env=dict(os.environ,LOCALTUNNEL_AGENT_ENGINE_SHA256=digest,CARGO_TARGET_DIR=str(build_dir))
     subprocess.run(["cargo","build","--release","--locked"],cwd=project,env=env,check=True,timeout=120)
-    agent_cli=build_dir/"release"/"localtunnel"
+    built=build_dir/"release"/"localtunnel"
+    # Cargo can hardlink its top-level executable to a deps artifact.
+    # Model installation into a fresh inode, not execution from the build cache.
+    build_meta=built.stat()
+    built_bytes=built.read_bytes()
+    agent_cli=d/"localtunnel-agent"
+    with agent_cli.open("xb") as out:
+        out.write(built_bytes)
+    agent_cli.chmod(0o700)
+    installed_meta=agent_cli.stat()
+    assert installed_meta.st_nlink==1 and installed_meta.st_uid==os.geteuid()
+    assert installed_meta.st_mode&0o777==0o700
+    assert (build_meta.st_dev,build_meta.st_ino)!=(installed_meta.st_dev,installed_meta.st_ino)
+    assert agent_cli.read_bytes()==built_bytes
+    print("Native CLI staging: build links =",build_meta.st_nlink,
+          "build mode =",oct(build_meta.st_mode&0o777),
+          "installed links =",installed_meta.st_nlink,flush=True)
     root=d/"agent-store"
     def command(*args,data=b"",success=True,exe=agent_cli):
         p=subprocess.run([str(exe),*map(str,args)],input=data,capture_output=True,timeout=10)
