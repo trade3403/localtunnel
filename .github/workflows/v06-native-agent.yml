@@ -1,0 +1,64 @@
+name: V0.6 Native Agent CI
+on:
+  pull_request:
+    branches: ['feat/v0.5-security-stability']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native-agent:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            system: Linux
+            machine: x86_64
+            engine: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            system: Linux
+            machine: aarch64
+            engine: aarch64-unknown-linux-musl
+          - os: macos-15-intel
+            system: Darwin
+            machine: x86_64
+            engine: x86_64-apple-darwin
+          - os: macos-15
+            system: Darwin
+            machine: arm64
+            engine: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Native Rust build and tests
+        shell: bash
+        run: |
+          rustc -vV
+          cargo test --locked
+          cargo build --release --locked
+          git diff --exit-code -- Cargo.lock
+      - name: Actual native CLI architecture and private configuration
+        run: python3 tests/native_agent_e2e.py target/release/localtunnel ${{ matrix.system }} ${{ matrix.machine }} native-evidence/cli.json
+      - name: Observe upstream candidate engine without execution
+        run: python3 tests/native_engine_inventory.py ${{ matrix.engine }} native-evidence/engine-candidate.json
+      - name: Collect actual native build and digest
+        run: |
+          mkdir -p native-dist
+          cp target/release/localtunnel native-dist/
+          (cd native-dist && shasum -a 256 localtunnel > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: v06-native-cli-${{ matrix.os }}
+          path: native-dist/
+          retention-days: 7
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: v06-native-evidence-${{ matrix.os }}
+          path: native-evidence/
+          retention-days: 7
+          if-no-files-found: error
