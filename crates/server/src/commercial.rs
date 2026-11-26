@@ -1,5 +1,5 @@
 //! Owner-scoped commercial inventory plus trusted local operator mutations.
-//! HTTP is read-only; commercial policy enforcement is not yet enabled.
+//! HTTP policy is read-only; resource admission is enforced separately.
 use crate::auth;
 use axum::{extract::State,http::{HeaderMap,StatusCode},response::Response,routing::get,Json,Router};
 use serde::Serialize;
@@ -20,6 +20,7 @@ struct Entitlement {
 struct View {
     scope:&'static str,
     commercial_enforcement:bool,
+    enforced_admission:[&'static str;4],
     entitlement:Entitlement,
 }
 pub fn routes(pool:SqlitePool)->Router{
@@ -32,7 +33,8 @@ async fn current(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Respon
     let entitlement=sqlx::query_as::<_,Entitlement>(
         "SELECT t.id AS tenant_id,p.id AS plan_id,p.code AS plan_code,p.version AS plan_version,p.name AS plan_name,e.revision,e.state,e.expires_at,CASE WHEN e.state='suspended' THEN 'suspended' WHEN e.expires_at IS NOT NULL AND e.expires_at<=unixepoch() THEN 'expired' ELSE 'active' END AS effective_state,p.max_active_devices,p.max_retained_devices,p.max_mappings,p.max_bandwidth_bps,p.max_monthly_bytes,p.max_concurrent_connections,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id AND d.enabled=1) AS active_devices,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id) AS retained_devices,(SELECT count(*) FROM mappings m WHERE m.owner_id=u.id) AS mappings FROM users u JOIN admin_sessions a ON a.user_id=u.id JOIN tenants t ON t.owner_id=u.id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
         .bind(digest).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
-    Ok(auth::uncached(Json(View{scope:"owner_inventory_only",commercial_enforcement:false,entitlement})))
+    Ok(auth::uncached(Json(View{scope:"owner_inventory_only",commercial_enforcement:false,
+        enforced_admission:["active_devices","retained_devices","mappings","active_entitlement_for_creation"],entitlement})))
 }
 
 

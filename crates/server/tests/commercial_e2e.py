@@ -49,6 +49,9 @@ def call(base,path,status,method="GET",token=None,data=None):
             assert "no-store" in response.headers.get("Cache-Control","") or path=="/readyz"
     except urllib.error.HTTPError as e:
         code,raw=e.code,e.read()
+    if isinstance(status,tuple):
+        assert code in status,f"{method} {path}: expected {status}, got {code}"
+        return code,json.loads(raw) if code==201 else None
     assert code==status,f"{method} {path}: expected {status}, got {code}"
     return json.loads(raw) if code in (200,201) and path!="/readyz" else None
 
@@ -226,8 +229,92 @@ try:
             assert any(e["event"]=="commercial.account_created" for e in owner_audit)
             assert not any(e["event"].startswith("commercial.") for e in call(base,"/api/v1/audit",200,token=admin)["events"])
             report["real_committed_operator_audit_and_owner_isolation"]=True
+            # Use real operator assignment and HTTP writes on the same live DB.
+            def assign_policy(revision,state="active",expires_at=None):
+                assert success("--commercial-assign",{"tenant_id":tenant,"plan_id":pid,"expected_revision":revision,"state":state,"expires_at":expires_at})==tenant
+            assign_policy(4)
+            view=call(base,route,200,token=customer)
+            assert view["commercial_enforcement"] is False
+            assert set(view["enforced_admission"])=={"active_devices","retained_devices","mappings","active_entitlement_for_creation"}
+            def issue(token):
+                return call(base,"/api/v1/devices/pairing-code",200,"POST",token)["pairing_code"]
+            def enroll(code,status=201):
+                return call(base,"/api/v1/devices/enroll",status,"POST",data={"pairing_code":code,"name":"quota fixture"})
+            def revoke(device):
+                call(base,"/api/v1/devices/"+device["id"]+"/revoke",204,"POST",customer)
+            d1=enroll(issue(customer))
+            d2=enroll(issue(customer))
+            pending=issue(customer)
+            enroll(pending,409)
+            revoke(d1)
+            d3=enroll(pending)
+            own=call(base,route,200,token=customer)["entitlement"]
+            assert (own["active_devices"],own["retained_devices"])==(2,3)
+            report["real_dynamic_active_device_quota_and_pairing_retry"]=True
+            # Create a node via the existing trusted CLI, not a mocked API.
+            node=subprocess.run([exe,"--add-node",str(root),"quota relay"],capture_output=True,timeout=20)
+            assert node.returncode==0
+            node_id=node.stdout.decode().strip()
+            def spec(device,port):
+                return {"device_id":device["id"],"node_id":node_id,"protocol":"udp","local_port":5353,"bind_port":port}
+            def create_mapping(data,status=201,token=customer):
+                return call(base,"/api/v1/mappings",status,"POST",token,data)
+            def remove_mapping(item):
+                call(base,"/api/v1/mappings/"+item["id"]+"?expected_revision="+str(item["revision"]),204,"DELETE",customer)
+            requests=[spec(d2 if i%2==0 else d3,20010+i) for i in range(4)]
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results=list(executor.map(lambda data:create_mapping(data,(201,409)),requests))
+            assert sorted(code for code,_ in results)==[201,201,201,409]
+            items=[item for code,item in results if code==201]
+            failed=requests[next(i for i,(code,_) in enumerate(results) if code==409)]
+            assert call(base,route,200,token=customer)["entitlement"]["mappings"]==3
+            # Other owner's inventory is not charged to this tenant.
+            other_device=enroll(issue(admin))
+            other_mapping=create_mapping(spec(other_device,20020),201,admin)
+            assert other_mapping["device_id"]==other_device["id"]
+            create_mapping(spec(other_device,20021),409)
+            remove_mapping(items.pop())
+            items.append(create_mapping(failed))
+            assert call(base,route,200,token=customer)["entitlement"]["mappings"]==3
+            report["real_concurrent_tenant_mapping_quota_and_owner_isolation"]=True
+            # Free capacity before testing policy state, so the rejection
+            # cannot be attributed to a full quota or occupied relay port.
+            for item in items: remove_mapping(item)
+            revoke(d2)
+            pending=issue(customer)
+            assign_policy(5,expires_at=1)
+            enroll(pending,409)
+            create_mapping(spec(d3,20030),409)
+            assert call(base,route,200,token=customer)["entitlement"]["effective_state"]=="expired"
+            assign_policy(6,state="suspended")
+            enroll(pending,409)
+            create_mapping(spec(d3,20030),409)
+            assert call(base,route,200,token=customer)["entitlement"]["effective_state"]=="suspended"
+            assign_policy(7)
+            d4=enroll(pending)
+            restored=create_mapping(spec(d3,20030))
+            assert restored["enabled"] is False
+            report["real_expiry_suspension_and_renewal_admission"]=True
+            # Revoked rows still count toward the retained quota. Two
+            # simultaneous retries must fail without consuming the code.
+            revoke(d4)
+            final_code=issue(customer)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results=list(executor.map(lambda _:enroll(final_code,(201,409)),range(2)))
+            assert [code for code,_ in results]==[409,409]
+            with sqlite3.connect(db_path) as db:
+                owner=db.execute("SELECT owner_id FROM tenants WHERE id=?",(tenant,)).fetchone()[0]
+                assert db.execute("SELECT count(*),sum(enabled) FROM devices WHERE owner_id=?",(owner,)).fetchone()==(4,1)
+                assert db.execute("SELECT code_digest FROM device_pairings WHERE owner_id=?",(owner,)).fetchone()==(hashlib.sha256(final_code.encode()).digest(),)
+            # Keep cleanup reachable even with an expired entitlement.
+            assign_policy(8,expires_at=1)
+            remove_mapping(restored)
+            revoke(d3)
+            own=call(base,route,200,token=customer)["entitlement"]
+            assert (own["active_devices"],own["retained_devices"],own["mappings"])==(0,4,0)
+            report["real_retained_quota_concurrency_and_expired_cleanup"]=True
         finally: stop(p)
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==10 and all(value is True for value in report.values())
+assert len(report)==14 and all(value is True for value in report.values())

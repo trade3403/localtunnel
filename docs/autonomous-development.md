@@ -605,3 +605,11 @@
 - 新0013 commercial_operator_audit记录成功提交的操作类型、租户、套餐、版本/修订、状态及到期、时间；账号/授权同时写现有owner隔离审计。不是防篡改日志，不记录具体OS操作者身份、失败尝试，未新增全局审计查询HTTP或保留策略；仅可信本地数据库查看全局记录。readiness要求新增表，HTTP检查连续1-13迁移和精确SHA384；兼容原0011/0012迁移数据。
 - 商业真实测试保留原5组，新增5组：发布版本/重复/非法与不可变检查、真实账号+套餐事务及Argon2id、真实登录/跨owner隔离/拒绝HTTP写、实际并发CLI同revision仅一成功/到期/续期、提交审计/失败无多余审计及owner隔离。强制证据字段10组；本轮未本地编译或运行服务，待Hosted CI验收，不宣称已通过。
 - 下一增量：服务端设备/映射事务内动态套餐配额与到期准入；再落实运行请求/已运行隧道的授权撤销。当前仍返回commercial_enforcement=false。未修改main，未新增依赖，保持V0.9控制与数据平面解耦、兼容单机的要求。
+
+## V0.8 第三增量：服务端原子设备与映射配额、有效期创建准入（待 CI）
+- 基线 `d8e3348dc00ee0c15a5e0319f5cacdd9930d6854` 同SHA 7/7成功：[Hosted PR](https://github.com/trade3403/localtunnel/actions/runs/45895490191)/[push](https://github.com/trade3403/localtunnel/actions/runs/45895483156)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45895490265)，[Native](https://github.com/trade3403/localtunnel/actions/runs/45895490072)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45895490121)，[Management PR](https://github.com/trade3403/localtunnel/actions/runs/45895490165)/[push](https://github.com/trade3403/localtunnel/actions/runs/45895483063)。本地操作员账号、套餐版本、并发分配及审计测试已通过。
+- enroll 首条 DELETE 领取有效配对码并取得SQLite写事务；实际INSERT同时连接当前owner的tenant/entitlement/plan、校验active且未到期、活跃及全部保留设备数量低于套餐和原硬上限64/256。缺少租户或授权时拒绝；409失败回滚配对码，不产生成功设备记录或审计。配对码本身可提前申请但不预留容量，领取才强制校验。
+- mappings POST 在原同一INSERT语句中校验owner/session/device/node/domain、每设备64硬上限，以及当前租户有效授权和所有映射总量严格小于max_mappings（禁用草稿、已撤销设备上的映射也计入）；并发写入不能以旧计数超额。legacy-v1现实际执行4096租户总映射额度；不自动删除历史超额数据，降级只限制新建。继续允许经原权限验证的查询、删除、撤销及停止，避免到期锁死清理操作。无需新迁移或依赖。
+- GET /api/v1/commercial/entitlement 新增 enforced_admission 数组，准确标明 active_devices、retained_devices、mappings、active_entitlement_for_creation；commercial_enforcement仍false，明确整体商业策略尚未全部执行。当前不限制原有域名注册、配对码签发、映射编辑、运行请求或已运行隧道，不声称有效期已强制停机。
+- 商业真实HTTP/CLI测试保留原10组，新加4组：动态活跃额度与保留配对重试；两个设备四并发映射请求只允许三次成功且其他owner独立/释放额度再创建；到期暂停拒绝新设备与新映射、续期后同一未过期配对码恢复；保留设备额度并发拒绝且到期后仍可清理。14组强制证据字段，保留旧安全及跨平台门禁。待新CI运行，未本地编译或执行真实服务。
+- 下一增量：在HTTP/HTTPS/UDP运行请求领取、执行器授权复核、设备短期凭据签发路径引入套餐状态和到期限制，实际运行中的撤销和端口关闭需真实测试；随后继续带宽、流量、并发连接额度。管理与中转完全解耦、兼容单机部署的架构约束保持不变；未修改main。

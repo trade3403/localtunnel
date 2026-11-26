@@ -270,6 +270,10 @@ REQUIRED["management-v08"] = {
         "real_created_account_login_and_no_http_policy_mutation",
         "real_assignment_optimistic_concurrency_expiry_and_renewal",
         "real_committed_operator_audit_and_owner_isolation",
+        "real_dynamic_active_device_quota_and_pairing_retry",
+        "real_concurrent_tenant_mapping_quota_and_owner_isolation",
+        "real_expiry_suspension_and_renewal_admission",
+        "real_retained_quota_concurrency_and_expired_cleanup",
     ],
 }
 
