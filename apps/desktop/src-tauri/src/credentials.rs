@@ -122,6 +122,7 @@ mod windows {
         if data.is_empty() || data.len() > LIMIT { return Err("服务配置大小无效".into()); }
         let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "服务配置格式无效")?;
         if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
+        crate::require_tcp_service(&request)?;
         validate(&request)?;
         let encrypted = transform_scoped(&data, true, true)?;
         let mut file = NamedTempFile::new_in(dir).map_err(|_| "无法创建服务凭据文件")?;
@@ -136,6 +137,7 @@ mod windows {
     // an encrypted candidate with a protected ACL before replacing old data.
     pub fn replace_service(dir: &Path, name: &str, request: &StartRequest) -> Result<(), String> {
         if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
+        crate::require_tcp_service(&request)?;
         validate(request)?;
         let data = Zeroizing::new(serde_json::to_vec(request).map_err(|_| "服务凭据序列化失败")?);
         let encrypted = transform_scoped(&data, true, true)?;
@@ -162,6 +164,7 @@ mod windows {
         let data = transform(&encrypted, false)?;
         let request: StartRequest = serde_json::from_slice(&data).map_err(|_| "服务凭据格式无效")?;
         if !request.engine.is_empty() { return Err("服务只能使用内置引擎".into()); }
+        crate::require_tcp_service(&request)?;
         validate(&request)?;
         Ok(request)
     }
@@ -186,11 +189,15 @@ mod windows {
                 engine: "C:\\untrusted.exe".into(),
                 remote: "relay.example.test:2333".into(),
                 server_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-                mappings: vec![Mapping { name: "web".into(), local_port: 8080, token: token.clone() }],
+                mappings: vec![Mapping { protocol: "tcp".into(), name: "web".into(), local_port: 8080, token: token.clone() }],
             };
             assert!(seal_service(dir.path(), serde_json::to_vec(&request).unwrap().as_slice()).is_err());
             assert!(!dir.path().join("service-profile.bin").exists());
             request.engine.clear();
+            request.mappings[0].protocol = "udp".into();
+            assert!(seal_service(dir.path(), serde_json::to_vec(&request).unwrap().as_slice()).is_err());
+            assert!(!dir.path().join("service-profile.bin").exists());
+            request.mappings[0].protocol = "tcp".into();
             let json = serde_json::to_vec(&request).unwrap();
             seal_service(dir.path(), json.as_slice()).unwrap();
             let file = dir.path().join("service-profile.bin");
@@ -211,7 +218,7 @@ mod windows {
                 engine: dir.path().join("rathole.exe").to_string_lossy().into_owned(),
                 remote: "relay.example.test:2333".into(),
                 server_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-                mappings: vec![Mapping { name: "web".into(), local_port: 8080, token: token.clone() }],
+                mappings: vec![Mapping { protocol: "tcp".into(), name: "web".into(), local_port: 8080, token: token.clone() }],
             };
             assert!(load(dir.path()).unwrap().is_none());
             save(dir.path(), &request).unwrap();
@@ -220,8 +227,11 @@ mod windows {
             assert!(!bytes.windows(token.len()).any(|w| w == token.as_bytes()));
             assert_eq!(load(dir.path()).unwrap().unwrap().mappings[0].token, token);
             request.mappings[0].local_port = 5173;
+            request.mappings[0].protocol = "udp".into();
             save(dir.path(), &request).unwrap();
             assert_eq!(load(dir.path()).unwrap().unwrap().mappings[0].local_port, 5173);
+            assert_eq!(load(dir.path()).unwrap().unwrap().mappings[0].protocol, "udp");
+            assert!(!fs::read(&file).unwrap().windows(token.len()).any(|w| w == token.as_bytes()));
             fs::write(&file, b"not DPAPI ciphertext").unwrap();
             assert!(load(dir.path()).is_err());
             forget(dir.path()).unwrap();

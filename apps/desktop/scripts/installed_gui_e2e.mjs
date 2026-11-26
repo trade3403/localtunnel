@@ -4,6 +4,7 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { createServer as tcpServer } from 'node:net'
 import { createServer as httpServer } from 'node:http'
+import { createSocket as udpSocket } from 'node:dgram'
 import { randomBytes } from 'node:crypto'
 import { mkdtemp, mkdir, writeFile, rm, readFile, readdir } from 'node:fs/promises'
 import { dirname, join, resolve, basename } from 'node:path'
@@ -24,7 +25,7 @@ const report = { scope: 'installed WebView2 desktop and SCM DOM controls + real 
   start_clicked: false, encrypted_http: false, traffic_visible: false,
   native_close_hides: false, hidden_tunnel_works: false, native_restore: false,
   stop_clicked: false, forwarding_stopped: false, history_visible: false }
-let app, relay, socket, fixture, policy, alternate, management
+let app, relay, socket, fixture, policy, alternate, management, udpFixture
 let managementFile, managementCreated=false
 let serviceName
 report.service_provisioned = false
@@ -260,13 +261,23 @@ try {
   const publicKey = /Public Key:\s*([A-Za-z0-9+/=]+)/.exec(keys)?.[1]
   if (!privateKey || !publicKey) throw Error('test relay key generation failed')
   const token = randomBytes(32).toString('hex')
+  const udpToken = randomBytes(32).toString('hex')
+  const bindUdp = s => new Promise((ok,fail)=>{s.once('error',fail);s.bind(0,'127.0.0.1',()=>ok(s.address().port))})
+  udpFixture=udpSocket('udp4')
+  const udpLocal=await bindUdp(udpFixture)
+  udpFixture.on('message',(data,peer)=>udpFixture.send(data,peer.port,peer.address))
+  const reservation=udpSocket('udp4')
+  const udpMapped=await bindUdp(reservation)
+  await new Promise(ok=>reservation.close(ok))
   const config = join(work, 'server.toml')
   await writeFile(config, [
     '[server]', 'bind_addr = "127.0.0.1:' + relayPort + '"', 'heartbeat_interval = 5',
     '[server.transport]', 'type = "noise"', '[server.transport.noise]',
     'pattern = "Noise_NK_25519_ChaChaPoly_BLAKE2s"', 'local_private_key = "' + privateKey + '"',
     '[server.services.web]', 'type = "tcp"', 'token = "' + token + '"',
-    'bind_addr = "127.0.0.1:' + mappedPort + '"', ''
+    'bind_addr = "127.0.0.1:' + mappedPort + '"',
+    '[server.services.udp_echo]', 'type = "udp"', 'token = "' + udpToken + '"',
+    'bind_addr = "127.0.0.1:' + udpMapped + '"', ''
   ].join('\n'))
   relay = launch(engine, [config])
   installDebugPolicy(debugPort)
@@ -451,6 +462,51 @@ try {
   await until('history visible', () => evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="桌面隧道流量");return !!s&&[...s.querySelectorAll(".summary div")].some(e=>e.querySelector("small")?.textContent==="历史累计上传"&&/^[1-9][0-9.]* (B|KiB|MiB|GiB|TiB)$/.test(e.querySelector("strong")?.textContent.trim()))})()'))
   report.history_visible = true
 
+  // Actual installed desktop mixed TCP/UDP session via the same real form.
+  await until('desktop editable for UDP',()=>evaluate('!!document.querySelector("select[aria-label=\\"映射协议\\"]:not(:disabled)")'))
+  await click('＋ 添加映射')
+  await until('UDP mapping row',()=>evaluate('document.querySelectorAll(".mapping-group").length===2'))
+  const second='.mapping-group + .mapping-group '
+  await field(second+'input[aria-label="映射名称"]','udp_echo')
+  await field(second+'input[aria-label="本地端口"]',udpLocal)
+  await field(second+'input[aria-label="映射授权 Token"]',udpToken)
+  await field(second+'select[aria-label="映射协议"]','udp')
+  await waitText('UDP 不支持 TCP 端口探测')
+  if(!await evaluate('document.querySelectorAll(".port-actions button")[1].disabled'))throw Error('UDP misleading TCP probe enabled')
+  await until('mixed start accepted',async()=>{
+    if(await has('进程运行中'))return true
+    if(await has('处理中…'))return false
+    await click('启动隧道')
+    return false
+  })
+  async function udpRoundTrip(){
+    const client=udpSocket('udp4')
+    const nonce=randomBytes(128)
+    return new Promise(ok=>{
+      let settled=false
+      const finish=v=>{if(settled)return;settled=true;clearTimeout(timer);try{client.close()}catch{};ok(v)}
+      const timer=setTimeout(()=>finish(false),900)
+      client.on('error',()=>finish(false))
+      client.on('message',(data,peer)=>{if(peer.address==='127.0.0.1'&&peer.port===udpMapped&&data.equals(nonce))finish(true)})
+      client.send(nonce,udpMapped,'127.0.0.1',err=>{if(err)finish(false)})
+    })
+  }
+  await until('actual mixed TCP UDP forwarding',async()=>await get(url)===body&&await udpRoundTrip(),35000)
+  await waitText('含 UDP 的会话暂不计量（包括混合会话中的 TCP）；历史仅显示已保存的 TCP 数据。')
+  await until('mixed session no false counters',()=>evaluate('(()=>{const s=[...document.querySelectorAll("section")].find(e=>e.querySelector("h2")?.textContent==="桌面隧道流量");return s?.querySelector(".section-title span")?.textContent==="未计量 / 未启动"})()'))
+  report.real_installed_desktop_mixed_udp_forward_and_unmeasured=true
+  await until('mixed stop accepted',async()=>{
+    if(await has('已停止')&&!await has('进程运行中')&&!await has('处理中…'))return true
+    if(await has('处理中…'))return false
+    await click('停止隧道')
+    return false
+  })
+  await until('mixed actual forwarding stopped',async()=>await get(url)!==body&&!await udpRoundTrip(),15000)
+  await until('mixed editable',()=>evaluate('!document.querySelectorAll("button[aria-label=\\"删除映射\\"]")[1].disabled'))
+  await evaluate('document.querySelectorAll("button[aria-label=\\"删除映射\\"]")[1].click()')
+  await until('TCP only restored',()=>evaluate('document.querySelectorAll(".mapping").length===1&&document.querySelector("select[aria-label=\\"映射协议\\"]").value==="tcp"'))
+  report.real_installed_desktop_mixed_udp_stop_and_tcp_restore=true
+
   // The desktop tunnel has stopped. The same form now provisions a fresh
   // SCM service using the installed app's actual Vue button and Rust IPC.
   await until('desktop form editable', () => evaluate('!!document.querySelector("input[placeholder=\\"relay.example.com:2333\\"]:not(:disabled)")'))
@@ -594,6 +650,7 @@ try {
       }
     }
     await terminate(relay)
+    if (udpFixture) await new Promise(ok=>udpFixture.close(ok))
     if (alternate) { alternate.closeAllConnections(); await close(alternate) }
     if (fixture) { fixture.closeAllConnections(); await close(fixture) }
   } finally {

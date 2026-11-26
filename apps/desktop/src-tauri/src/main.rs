@@ -19,7 +19,7 @@ mod service_control;
 #[cfg(windows)]
 mod service_provision;
 
-use localtunnel::{client_configs, ClientMapping};
+use localtunnel::{client_mixed_configs, ClientMapping, MappingProtocol};
 use serde::{Deserialize, Serialize};
 use std::{io::Write, net::SocketAddr, path::Path, process::{Child, Command, Stdio}, sync::Mutex};
 use tempfile::TempDir;
@@ -28,6 +28,8 @@ use tauri::Manager;
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Mapping {
+    #[serde(default = "default_protocol")]
+    protocol: String,
     name: String,
     local_port: u16,
     token: String,
@@ -48,6 +50,15 @@ struct Status {
     state: &'static str,
     detail: String,
     mapping_count: usize,
+}
+
+fn default_protocol() -> String { "tcp".into() }
+
+fn require_tcp_service(request: &StartRequest) -> Result<(), String> {
+    if request.mappings.iter().any(|m| m.protocol != "tcp") {
+        return Err("Windows 后台服务暂仅支持 TCP 映射".into());
+    }
+    Ok(())
 }
 
 struct Running {
@@ -135,7 +146,9 @@ impl Supervisor {
             return Err("Windows 引擎必须为 EXE 文件".into());
         }
         // Validate original configuration before allocating any listeners.
-        build_config(&request)?;
+        let original_config = build_config(&request)?;
+        if runtime_root.is_some() { require_tcp_service(&request)?; }
+        let has_udp = request.mappings.iter().any(|m| m.protocol == "udp");
         let mut builder = tempfile::Builder::new();
         builder.prefix("localtunnel-client-");
         let directory = match runtime_root {
@@ -145,12 +158,19 @@ impl Supervisor {
         let staged_engine = engine_integrity::stage(engine, directory.path())?;
         let relay_port = request.remote.rsplit_once(':').and_then(|(_,p)| p.parse::<u16>().ok())
             .ok_or("invalid relay port")?;
-        let meter = traffic::Meter::start_with_history(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port, history_dir)?;
-        let mappings = request.mappings.iter().zip(meter.ports()).map(|(m, &port)| ClientMapping {
-            name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
-        }).collect::<Vec<_>>();
-        let config = client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)?;
-        let target_ports = meter.ports().to_vec();
+        // The existing meter proxies TCP only. Never route UDP to a TCP
+        // listener or publish partial counters as the full session total.
+        let (config, target_ports, meter) = if has_udp {
+            (original_config, request.mappings.iter().map(|m| m.local_port).collect(), None)
+        } else {
+            let meter = traffic::Meter::start_with_history(&request.mappings.iter().map(|m| m.local_port).collect::<Vec<_>>(), relay_port, history_dir)?;
+            let mappings = request.mappings.iter().zip(meter.ports()).map(|(m, &port)| (MappingProtocol::Tcp, ClientMapping {
+                name: &m.name, local: SocketAddr::from(([127,0,0,1],port)), token: &m.token,
+            })).collect::<Vec<_>>();
+            let config = client_mixed_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)?;
+            let ports = meter.ports().to_vec();
+            (config, ports, Some(meter))
+        };
         #[cfg(windows)]
         let telemetry = if runtime_root.is_some() {
             Some(std::fs::OpenOptions::new().write(true).create_new(true)
@@ -179,7 +199,7 @@ impl Supervisor {
         }
         let mut running = Running::spawn(&mut command, directory, request.mappings.len())?;
         running.relay_target = Some(relay_target);
-        running.meter = Some(meter);
+        running.meter = meter;
         #[cfg(windows)]
         { running.telemetry = telemetry; }
         self.running = Some(running);
@@ -199,7 +219,10 @@ impl Supervisor {
     fn traffic_status(&mut self) -> Result<traffic::Snapshot, String> {
         if self.status()?.state != "running" { return Ok(traffic::Snapshot::inactive()); }
         Ok(self.running.as_mut().and_then(|r| r.meter.as_mut())
-            .map(|m| m.snapshot()).unwrap_or_else(traffic::Snapshot::inactive))
+            .map(|m| m.snapshot()).unwrap_or_else(|| traffic::Snapshot {
+                state: "unknown", upload_bytes: None, download_bytes: None,
+                upload_bytes_per_second: None, download_bytes_per_second: None
+            }))
     }
 
     #[cfg(windows)]
@@ -250,12 +273,14 @@ impl Supervisor {
 }
 
 fn build_config(request: &StartRequest) -> Result<String, String> {
-    let mappings = request.mappings.iter().map(|m| ClientMapping {
-        name: &m.name,
-        local: SocketAddr::from(([127, 0, 0, 1], m.local_port)),
-        token: &m.token,
-    }).collect::<Vec<_>>();
-    client_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)
+    let mappings = request.mappings.iter().map(|m| {
+        Ok((MappingProtocol::parse(&m.protocol)?, ClientMapping {
+            name: &m.name,
+            local: SocketAddr::from(([127, 0, 0, 1], m.local_port)),
+            token: &m.token,
+        }))
+    }).collect::<Result<Vec<_>, &str>>().map_err(str::to_owned)?;
+    client_mixed_configs(&request.remote, &mappings, &request.server_key).map_err(str::to_owned)
 }
 
 fn bundled_engine(resource_dir: &Path) -> Result<std::path::PathBuf, String> {
@@ -634,7 +659,7 @@ mod tests {
     fn request() -> StartRequest {
         StartRequest { engine: String::new(), remote: "relay.example.test:2333".into(),
             server_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            mappings: vec![Mapping { name: "web".into(), local_port: 5173, token: "a".repeat(32) }] }
+            mappings: vec![Mapping { protocol: "tcp".into(), name: "web".into(), local_port: 5173, token: "a".repeat(32) }] }
     }
 
     #[test]
@@ -643,6 +668,21 @@ mod tests {
         assert!(text.contains("local_addr = \"127.0.0.1:5173\""));
         assert!(text.contains("remote_public_key"));
         assert!(text.contains("type = \"noise\""));
+    }
+
+    #[test]
+    fn desktop_udp_legacy_default_and_service_boundary() {
+        let mut req = request();
+        let mut legacy = serde_json::to_value(&req).unwrap();
+        legacy["mappings"][0].as_object_mut().unwrap().remove("protocol");
+        let decoded: StartRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.mappings[0].protocol, "tcp");
+        assert!(require_tcp_service(&decoded).is_ok());
+        req.mappings[0].protocol = "udp".into();
+        assert!(build_config(&req).unwrap().contains("type = \"udp\""));
+        assert!(require_tcp_service(&req).is_err());
+        req.mappings[0].protocol = "quic".into();
+        assert!(build_config(&req).is_err());
     }
 
     #[test]
@@ -727,12 +767,12 @@ mod tests {
         let error = supervisor.start(StartRequest {
             engine: tampered_path.to_string_lossy().into_owned(),
             remote: relay_addr.to_string(), server_key: public.into(),
-            mappings: vec![Mapping { name: "web".into(), local_port, token: token.clone() }],
+            mappings: vec![Mapping { protocol: "tcp".into(), name: "web".into(), local_port, token: token.clone() }],
         }).err().expect("modified engine must not launch");
         assert!(error.contains("SHA-256"));
         assert!(supervisor.running.is_none());
         assert_eq!(supervisor.start(StartRequest { engine, remote: relay_addr.to_string(), server_key: public.into(),
-            mappings: vec![Mapping { name: "web".into(), local_port, token }] }).unwrap().state, "running");
+            mappings: vec![Mapping { protocol: "tcp".into(), name: "web".into(), local_port, token }] }).unwrap().state, "running");
         let until = Instant::now() + Duration::from_secs(25);
         let mut forwarded = false;
         while Instant::now() < until {

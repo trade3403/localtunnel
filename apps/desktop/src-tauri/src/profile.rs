@@ -1,5 +1,5 @@
 //! Non-secret profile only. Tokens are intentionally excluded from disk.
-use localtunnel::{client_configs, ClientMapping};
+use localtunnel::{client_mixed_configs, ClientMapping, MappingProtocol};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::{Read, Write}, net::SocketAddr, path::Path};
 use tempfile::NamedTempFile;
@@ -9,6 +9,8 @@ const LIMIT: u64 = 128 * 1024;
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileMapping {
+    #[serde(default = "crate::default_protocol")]
+    pub protocol: String,
     pub name: String,
     pub local_port: u16,
 }
@@ -31,10 +33,12 @@ fn validate(profile: &Profile) -> Result<(), String> {
     }
     // Unique placeholders only for core validation, never saved or used to connect.
     let placeholders = (0..profile.mappings.len()).map(|i| format!("{i:032x}")).collect::<Vec<_>>();
-    let mappings = profile.mappings.iter().zip(&placeholders).map(|(m, token)| ClientMapping {
-        name: &m.name, local: SocketAddr::from(([127, 0, 0, 1], m.local_port)), token,
-    }).collect::<Vec<_>>();
-    client_configs(&profile.remote, &mappings, &profile.server_key).map_err(str::to_owned)?;
+    let mappings = profile.mappings.iter().zip(&placeholders).map(|(m, token)| {
+        Ok((MappingProtocol::parse(&m.protocol)?, ClientMapping {
+            name: &m.name, local: SocketAddr::from(([127, 0, 0, 1], m.local_port)), token,
+        }))
+    }).collect::<Result<Vec<_>, &str>>().map_err(str::to_owned)?;
+    client_mixed_configs(&profile.remote, &mappings, &profile.server_key).map_err(str::to_owned)?;
     Ok(())
 }
 
@@ -71,7 +75,7 @@ mod tests {
             engine: std::env::temp_dir().join("rathole.exe").to_string_lossy().into_owned(),
             remote: "relay.example.test:2333".into(),
             server_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
-            mappings: vec![ProfileMapping { name: "web".into(), local_port: 8080 }],
+            mappings: vec![ProfileMapping { protocol: "tcp".into(), name: "web".into(), local_port: 8080 }],
         }
     }
     #[test]
@@ -87,6 +91,21 @@ mod tests {
         assert!(load(d.path()).unwrap().unwrap().engine.is_empty());
         let text = fs::read_to_string(d.path().join("profile.json")).unwrap();
         assert!(!text.contains("token"));
+    }
+    #[test]
+    fn legacy_tcp_and_udp_nonsecret_profile_roundtrip() {
+        let d = tempfile::tempdir().unwrap();
+        let mut legacy = serde_json::to_value(example()).unwrap();
+        legacy["mappings"][0].as_object_mut().unwrap().remove("protocol");
+        fs::write(d.path().join("profile.json"), legacy.to_string()).unwrap();
+        let mut p = load(d.path()).unwrap().unwrap();
+        assert_eq!(p.mappings[0].protocol, "tcp");
+        p.mappings[0].protocol = "udp".into();
+        save(d.path(), &p).unwrap();
+        assert_eq!(load(d.path()).unwrap().unwrap().mappings[0].protocol, "udp");
+        assert!(!fs::read_to_string(d.path().join("profile.json")).unwrap().contains("token"));
+        p.mappings[0].protocol = "quic".into();
+        assert!(save(d.path(), &p).is_err());
     }
     #[test]
     fn rejects_invalid_and_secret_fields() {

@@ -64,9 +64,10 @@ async function managementAction(action:'pair'|'sync'|'forget'){
   finally{managementBusy.value=false;void refreshManagement()}
 }
 
-type Mapping = { id: number; name: string; localPort: number | null; token: string }
-type Profile = { engine: string; remote: string; serverKey: string; mappings: { name: string; localPort: number }[] }
-type StartRequest = Omit<Profile, 'mappings'> & { mappings: { name: string; localPort: number; token: string }[] }
+type Protocol = 'tcp' | 'udp'
+type Mapping = { id: number; protocol: Protocol; name: string; localPort: number | null; token: string }
+type Profile = { engine: string; remote: string; serverKey: string; mappings: { protocol: Protocol; name: string; localPort: number }[] }
+type StartRequest = Omit<Profile, 'mappings'> & { mappings: { protocol: Protocol; name: string; localPort: number; token: string }[] }
 type Status = { state: 'stopped' | 'running' | 'error'; detail: string; mappingCount: number }
 type Transport = { state: 'inactive' | 'unknown' | 'established' | 'not_observed'; established: number | null; matchScope: 'none' | 'ip_port' | 'port_only' }
 const transport = ref<Transport>({ state: 'inactive', established: null, matchScope: 'none' })
@@ -90,6 +91,7 @@ async function maintainService(action: 'update' | 'unregister') {
   const name = watchedService.value
   if (!name || serviceName.value.trim() !== name || maintenanceConfirm.value !== name ||
       serviceSnapshot.value?.state !== 'stopped' || serviceBusy.value || busy.value) return
+  if (action === 'update' && mappings.value.some(m => m.protocol !== 'tcp')) { serviceActionError.value = '后台服务暂仅支持 TCP'; return }
   if (action === 'update' && (running.value || engine.value.trim() ||
       mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535))) {
     serviceActionError.value = '请停止桌面隧道，清空自定义引擎路径并填写有效端口'; return
@@ -102,7 +104,7 @@ async function maintainService(action: 'update' | 'unregister') {
     if (action === 'update') {
       await invoke('update_service_profile', { name, confirmation: maintenanceConfirm.value, request: {
         engine: '', remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+        mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: m.localPort, token: m.token }))
       } })
       serviceActionNotice.value = '配置已更新，服务保持禁用；检查后可设为手动启动'
     } else {
@@ -122,6 +124,7 @@ async function maintainService(action: 'update' | 'unregister') {
 }
 async function provisionService() {
   if (serviceBusy.value || busy.value || running.value || !ready.value || !provisionConfirm.value) return
+  if (mappings.value.some(m => m.protocol !== 'tcp')) { serviceActionError.value = '后台服务暂仅支持 TCP'; return }
   if (engine.value.trim()) { serviceActionError.value = '后台服务只允许内置引擎，请清空自定义路径'; return }
   if (mappings.value.some(m => !Number.isInteger(m.localPort) || Number(m.localPort) < 1 || Number(m.localPort) > 65535)) {
     serviceActionError.value = '请填写有效本地端口'; return
@@ -133,7 +136,7 @@ async function provisionService() {
   try {
     const name = await invoke<string>('provision_service', { request: {
       engine: '', remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-      mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+      mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: m.localPort, token: m.token }))
     } })
     serviceName.value = name
     watchedService.value = name
@@ -231,7 +234,7 @@ const engine = ref('')
 const remote = ref('')
 const serverKey = ref('')
 let nextId = 2
-const mappings = ref<Mapping[]>([{ id: 1, name: 'web', localPort: 8080, token: '' }])
+const mappings = ref<Mapping[]>([{ id: 1, protocol: 'tcp', name: 'web', localPort: 8080, token: '' }])
 const status = ref<Status>({ state: 'stopped', detail: '正在获取进程状态', mappingCount: 0 })
 const busy = ref(false)
 const error = ref('')
@@ -271,7 +274,7 @@ onMounted(() => { void refresh(); void loadManagement(); timer = setInterval(() 
 onUnmounted(() => { if (timer) clearInterval(timer) })
 function add() {
   if (locked.value || mappings.value.length >= 64) return
-  mappings.value.push({ id: nextId++, name: '', localPort: 8080, token: '' })
+  mappings.value.push({ id: nextId++, protocol: 'tcp', name: '', localPort: 8080, token: '' })
 }
 function remove(id: number) {
   if (!locked.value && mappings.value.length > 1) mappings.value = mappings.value.filter(m => m.id !== id)
@@ -288,7 +291,7 @@ async function profileAction(action: 'save' | 'load') {
       }
       const profile: Profile = {
         engine: engine.value.trim(), remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: Number(m.localPort) }))
+        mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: Number(m.localPort) }))
       }
       await invoke('save_profile', { profile })
       notice.value = '配置已保存（不包含授权 Token）'
@@ -314,7 +317,7 @@ function currentRequest(): StartRequest {
   }
   return {
     engine: engine.value.trim(), remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-    mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: Number(m.localPort), token: m.token }))
+    mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: Number(m.localPort), token: m.token }))
   }
 }
 async function protectedAction(action: 'save' | 'load' | 'forget') {
@@ -344,6 +347,7 @@ async function protectedAction(action: 'save' | 'load' | 'forget') {
   } finally { busy.value = false; void refresh() }
 }
 async function probe(mapping: Mapping) {
+  if (mapping.protocol !== 'tcp') return
   if (!ready.value || busy.value || !Number.isInteger(mapping.localPort) || Number(mapping.localPort) < 1 || Number(mapping.localPort) > 65535) return
   const port = Number(mapping.localPort)
   const id = mapping.id
@@ -368,7 +372,7 @@ async function toggle() {
       }
       status.value = await invoke<Status>('start_tunnel', { request: {
         engine: engine.value.trim(), remote: remote.value.trim(), serverKey: serverKey.value.trim(),
-        mappings: mappings.value.map(m => ({ name: m.name.trim(), localPort: m.localPort, token: m.token }))
+        mappings: mappings.value.map(m => ({ protocol: m.protocol, name: m.name.trim(), localPort: m.localPort, token: m.token }))
       } })
     }
   } catch (e) {
@@ -428,6 +432,7 @@ async function toggle() {
           <div><small>历史累计下载</small><strong class="protocol">{{ formatBytes(trafficHistory?.saved?.downloadBytes) }}</strong><span>本机已保存</span></div>
           <div><small>最近保存</small><strong class="protocol">{{ trafficHistory?.saved ? new Date(trafficHistory.saved.savedAtMs).toLocaleTimeString() : '—' }}</strong><span>仅桌面模式</span></div>
         </div>
+        <p v-if="running && mappings.some(m=>m.protocol==='udp')" class="hint">含 UDP 的会话暂不计量（包括混合会话中的 TCP）；历史仅显示已保存的 TCP 数据。</p>
         <p v-if="historyError || trafficHistory?.writeFailed" class="error" role="alert">历史流量读取或保存失败，已保留原记录。</p>
         <p class="hint">历史包含已保存的本次会话流量，不能重复相加；异常断电可能丢失最后一段未保存数据。不包含协议开销、后台服务或计费数据。</p>
       </section>
@@ -442,7 +447,7 @@ async function toggle() {
         </div>
         <div class="profile-actions">
           <label><input type="checkbox" aria-label="确认部署新服务" v-model="provisionConfirm" :disabled="serviceBusy" /> 使用下方映射配置创建新服务，允许系统级加密保存 Token</label>
-          <button type="button" class="secondary" :disabled="locked || !provisionConfirm" @click="provisionService">一键部署新服务</button>
+          <button type="button" class="secondary" :disabled="locked || !provisionConfirm || mappings.some(m=>m.protocol!=='tcp')" @click="provisionService">一键部署新服务</button>
         </div>
         <p class="hint">需要以管理员身份运行客户端；创建全新服务，不覆盖旧配置。默认停止且手动启动。失败时保留受保护目录供检查。</p>
         <p v-if="watchedService" class="hint">监测：{{ watchedService }}</p>
@@ -479,7 +484,7 @@ async function toggle() {
           <label class="wide">维护确认：完整输入当前服务名称<input v-model="maintenanceConfirm" :disabled="serviceBusy" maxlength="51" autocomplete="off" :placeholder="watchedService" /></label>
         </div>
         <div v-if="serviceSnapshot?.state === 'stopped'" class="profile-actions">
-          <button type="button" class="secondary" :disabled="serviceBusy || busy || running || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService" @click="maintainService('update')">使用下方表单更新服务配置</button>
+          <button type="button" class="secondary" :disabled="serviceBusy || busy || running || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService || mappings.some(m=>m.protocol!=='tcp')" @click="maintainService('update')">使用下方表单更新服务配置</button>
           <button type="button" class="secondary" :disabled="serviceBusy || busy || serviceName.trim() !== watchedService || maintenanceConfirm !== watchedService" @click="maintainService('unregister')">注销服务注册</button>
         </div>
         <p v-if="serviceSnapshot?.state === 'stopped'" class="hint">更新将替换整套加密配置并保持禁用，需手动恢复启动方式；注销只删除服务注册，不删除配置或历史目录。不会读取或显示旧 Token。</p>
@@ -515,8 +520,8 @@ async function toggle() {
             <input v-model.number="mapping.localPort" :disabled="locked" aria-label="本地端口" required type="number" min="1" max="65535" />
             <input v-model="mapping.token" :disabled="locked" aria-label="映射授权 Token" required type="password" autocomplete="off" minlength="32" maxlength="128" placeholder="输入授权 Token" />
             <button type="button" class="remove" :disabled="locked || mappings.length === 1" @click="remove(mapping.id)" aria-label="删除映射">×</button>
-          </div><div class="port-actions"><button type="button" class="secondary" :disabled="busy || !ready" @click="probe(mapping)">检测本地端口</button><span role="status">{{ portNotice[mapping.id] || "未检测" }}</span></div></div>
-          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。停止隧道后可编辑配置；域名由服务端分配。</p>
+          </div><div class="port-actions"><label>协议 <select v-model="mapping.protocol" :disabled="locked" aria-label="映射协议" @change="delete portNotice[mapping.id]"><option value="tcp">TCP</option><option value="udp">UDP</option></select></label><button type="button" class="secondary" :disabled="busy || !ready || mapping.protocol!=='tcp'" @click="probe(mapping)">检测本地端口</button><span role="status">{{ mapping.protocol==='udp' ? 'UDP 不支持 TCP 端口探测' : (portNotice[mapping.id] || "未检测") }}</span></div></div>
+          <p class="hint">端口检测只验证本地 TCP 可达性，不代表服务端认证或公网在线。目标地址固定为 127.0.0.1。UDP 须与中转映射协议一致，暂仅桌面模式。停止隧道后可编辑配置；域名由服务端分配。</p>
         </section>
         <div class="actions">
           <div aria-live="polite"><strong>{{ label }}</strong><p>{{ status.detail }}</p><p v-if="error" class="error" role="alert">{{ error }}</p></div>

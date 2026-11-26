@@ -158,6 +158,8 @@ REQUIRED = {
             "stop_clicked",
             "forwarding_stopped",
             "history_visible",
+            "real_installed_desktop_mixed_udp_forward_and_unmeasured",
+            "real_installed_desktop_mixed_udp_stop_and_tcp_restore",
             "service_provisioned",
             "service_startup_controls",
             "service_recovery_controls",
