@@ -238,6 +238,8 @@ REQUIRED["management-v05"] = {
         "real_keepalive_idle_connection_released",
         "real_connection_cap_and_admitted_request",
         "real_transport_capacity_recovery",
+        "real_active_connection_total_lifetime",
+        "real_connection_lifetime_same_process_recovery",
     ],
 }
 

@@ -142,6 +142,63 @@ try:
             recover(port)
             assert p.poll() is None
             report["real_transport_capacity_recovery"] = True
+
+            # Keep a single actual HTTP/1 socket active, so neither the
+            # five-second header/idle deadline nor the request deadline
+            # can explain its closure. Never reconnect inside this fixture.
+            # Run at the unchanged production-preview 120 second lifetime.
+            time.sleep(.5)
+            proc_fd = Path("/proc") / str(p.pid) / "fd"
+            fd_baseline = len(list(proc_fd.iterdir()))
+            started = time.monotonic()
+            with closing(connect(port)) as long_conn:
+                long_conn.settimeout(3)
+                successes = 0
+                last_ok = 0.0
+                ended = None
+                while time.monotonic() - started < 130:
+                    try:
+                        long_conn.sendall(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        with http.client.HTTPResponse(long_conn) as response:
+                            response.begin()
+                            assert response.status == 200 and response.read() == b"ok"
+                            assert not response.will_close, "unexpected HTTP connection-close response"
+                    except (ConnectionResetError, BrokenPipeError, http.client.RemoteDisconnected):
+                        ended = time.monotonic() - started
+                        break
+                    successes += 1
+                    last_ok = time.monotonic() - started
+                    # Independent fresh connection must continue to serve.
+                    if successes % 10 == 0:
+                        assert health(port) == (200, b"ok")
+                    time.sleep(1)
+                assert ended is not None, "active connection outlived its lifetime"
+                report["connection_lifetime_measurements"] = {
+                    "successful_requests_on_same_socket": successes,
+                    "last_success_seconds": round(last_ok, 3),
+                    "disconnect_seconds": round(ended, 3),
+                    "fd_before": fd_baseline,
+                }
+                assert successes >= 100 and last_ok >= 115, "connection closed before expected lifetime"
+                assert 118 <= ended <= 125, "active connection lifetime outside tolerance"
+                assert ended - last_ok < 5, "closure not distinguishable from idle deadline"
+            report["real_active_connection_total_lifetime"] = True
+            recover(port)
+            # A new persistent socket is independently usable, and the
+            # expired socket's task/descriptor no longer consumes resources.
+            with closing(connect(port)) as fresh:
+                for _ in range(3):
+                    fresh.sendall(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    with http.client.HTTPResponse(fresh) as response:
+                        response.begin()
+                        assert response.status == 200 and response.read() == b"ok"
+                        assert not response.will_close
+            time.sleep(.5)
+            fd_after = len(list(proc_fd.iterdir()))
+            report["connection_lifetime_measurements"]["fd_after"] = fd_after
+            assert fd_after <= fd_baseline + 2, "connection descriptor growth after expiry"
+            assert p.poll() is None
+            report["real_connection_lifetime_same_process_recovery"] = True
         finally:
             for sock in sockets:
                 sock.close()
