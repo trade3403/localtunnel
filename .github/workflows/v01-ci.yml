@@ -66,6 +66,12 @@ jobs:
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/lt-quic-venv/bin/python" tests/quic_netem.py test-results
+      - name: Real QUIC admission limits and UDP outage recovery (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/lt-quic-venv/bin/python" tests/quic_experiment.py test-results/quic-resilience.json --resilience
       - name: Package CLI build
         shell: bash
         run: |

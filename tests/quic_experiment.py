@@ -29,6 +29,8 @@ MAX = 256 * 1024
 TOKEN = secrets.token_bytes(32)
 OK = b"OK"
 DENIED = b"DENIED"
+REGISTRATION_LIMIT = 4
+FORWARD_LIMIT = 8
 
 def certificates(root):
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -87,14 +89,23 @@ def cfg(client,root,hostname=HOST,ca="ca.pem",alpn=ALPN):
         config.load_cert_chain(str(root/"leaf.pem"),str(root/"leaf.key"))
     return config
 
-async def exercise(root,report,comparison=None):
+async def exercise(root,report,comparison=None,resilience=False):
     registry={"active":None}
     tasks=set()
+    registration_tasks=set()
+    forward_tasks=set()
     observed=[]
-    def schedule(coro):
+    def schedule(coro, group=None):
         task=asyncio.create_task(coro)
         tasks.add(task)
         task.add_done_callback(tasks.discard)
+        if group is not None:
+            group.add(task)
+            task.add_done_callback(group.discard)
+    async def wait_for(predicate, seconds=5):
+        async with asyncio.timeout(seconds):
+            while not predicate():
+                await asyncio.sleep(.01)
     async def echo(reader,writer):
         try:
             async with asyncio.timeout(8):
@@ -120,7 +131,11 @@ async def exercise(root,report,comparison=None):
                     registry["active"]=None
             super().quic_event_received(event)
         def incoming(self,reader,writer):
-            schedule(self.register(reader,writer))
+            if len(registration_tasks)>=REGISTRATION_LIMIT:
+                writer.write(DENIED)
+                writer.write_eof()
+                return
+            schedule(self.register(reader,writer),registration_tasks)
         async def register(self,reader,writer):
             try:
                 async with asyncio.timeout(5):
@@ -135,7 +150,7 @@ async def exercise(root,report,comparison=None):
                     writer.write_eof()
             except (TimeoutError,ValueError,ConnectionError,asyncio.IncompleteReadError):
                 self.close(error_code=1,reason_phrase="registration failed")
-    agent_slots=asyncio.Semaphore(8)
+    agent_slots=asyncio.Semaphore(FORWARD_LIMIT)
     async def forward(reader,writer):
         # Only a fixed local TCP fixture, not arbitrary relay-controlled targets.
         async with agent_slots:
@@ -151,7 +166,10 @@ async def exercise(root,report,comparison=None):
                     lw.close()
                     await lw.wait_closed()
     def inbound(reader,writer):
-        schedule(forward(reader,writer))
+        if len(forward_tasks)>=FORWARD_LIMIT:
+            writer.write_eof()
+            return
+        schedule(forward(reader,writer),forward_tasks)
     async def register(client,token):
         reader,writer=await client.create_stream()
         writer.write(token)
@@ -240,6 +258,12 @@ async def exercise(root,report,comparison=None):
             assert await register(client,TOKEN)==OK
             await reverse(secrets.token_bytes(4096))
         report["passed"].append("fresh TLS and token registration after explicit relay restart")
+        if resilience:
+            from quic_resilience import exercise as check_resilience
+            report["resilience"]={"passed":[]}
+            await check_resilience(root,port,registry,registration_tasks,forward_tasks,
+                                   observed,inbound,register,reverse,wait_for,report["resilience"],TOKEN)
+            assert len(report["resilience"]["passed"])==3
     finally:
         server.close()
         fixture.close()
@@ -248,12 +272,12 @@ async def exercise(root,report,comparison=None):
             task.cancel()
         await asyncio.gather(*list(tasks),return_exceptions=True)
 
-async def main(report,comparison=None):
+async def main(report,comparison=None,resilience=False):
     async with asyncio.timeout(110):
         with tempfile.TemporaryDirectory(prefix="lt-quic-experiment-") as d:
             root=Path(d)
             certificates(root)
-            await exercise(root,report,comparison)
+            await exercise(root,report,comparison,resilience)
 
 if __name__=="__main__":
     out=Path(sys.argv[1])
@@ -268,10 +292,13 @@ if __name__=="__main__":
                 comparison=acquire(Path(d), Path(sys.argv[3]) if len(sys.argv)==4 else None)
                 asyncio.run(main(report,comparison))
             assert len(report["comparison"]["rounds"])==4
+        elif len(sys.argv)==3 and sys.argv[2]=="--resilience":
+            asyncio.run(main(report,resilience=True))
+            assert len(report["resilience"]["passed"])==3
         elif len(sys.argv)==2:
             asyncio.run(main(report))
         else:
-            raise SystemExit("usage: quic_experiment.py REPORT [--compare [VERIFIED_ARCHIVE]]")
+            raise SystemExit("usage: quic_experiment.py REPORT [--resilience | --compare [VERIFIED_ARCHIVE]]")
         assert len(report["passed"])==6
     finally:
         out.parent.mkdir(parents=True,exist_ok=True)
