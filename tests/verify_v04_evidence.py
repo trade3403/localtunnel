@@ -150,6 +150,7 @@ REQUIRED = {
             "native_management_restart_clean_exit",
             "native_management_saved_credential_restart",
             "real_management_udp_confirmed_draft_import",
+            "real_management_unissued_udp_lease_denied",
             "native_management_revocation_stops_automatic_sync",
             "real_management_pairing_dpapi_heartbeat_and_revocation",
             "mapping_add_remove",

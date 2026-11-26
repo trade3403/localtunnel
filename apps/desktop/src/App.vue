@@ -21,7 +21,7 @@ async function refreshManagement(){
   try{
     const result=await invoke<{observation:ManagedSync|null;error:string|null;blocked:boolean}>('management_snapshot')
     if(generation!==managementGeneration||managementBusy.value)return
-    if(managedSync.value?.revision!==result.observation?.revision||managedSync.value?.id!==result.observation?.id)importConfirm.value=false
+    if(managedSync.value?.revision!==result.observation?.revision||managedSync.value?.id!==result.observation?.id){importConfirm.value=false;leaseConfirm.value=false}
     managedSync.value=result.observation
     managementBlocked.value=result.blocked
     managementError.value=result.error||''
@@ -34,6 +34,20 @@ const managementMessage=ref('')
 const managementError=ref('')
 const forgetConfirm=ref(false)
 const importConfirm=ref(false)
+const leaseConfirm=ref(false)
+const leaseError=ref('')
+async function startManagedUdp(item:ManagedSync['mappings'][number]){
+  const snapshot=managedSync.value
+  if(!snapshot||!leaseConfirm.value||locked.value||managementBusy.value||managementBlocked.value||polling)return
+  managementGeneration++;managementBusy.value=true;busy.value=true;leaseConfirm.value=false
+  leaseError.value='';managementError.value='';managementMessage.value=''
+  try{
+    status.value=await invoke<Status>('management_start_udp',{id:item.id,expectedRevision:snapshot.revision,mappingRevision:item.revision,confirmed:true})
+    if(status.value.state!=='running')throw Error(status.value.detail)
+    managementMessage.value='短期 UDP 管理进程已启动；实际转发需中转端验证，授权到期自动停止'
+  }catch(e){leaseError.value=String(e)}
+  finally{busy.value=false;managementBusy.value=false;void refresh();void refreshManagement()}
+}
 async function importManagedUdp(item:ManagedSync['mappings'][number]){
   const snapshot=managedSync.value
   if(!snapshot||!importConfirm.value||locked.value||managementBusy.value||managementBlocked.value||polling)return
@@ -59,7 +73,7 @@ async function loadManagement(){
 }
 async function managementAction(action:'pair'|'sync'|'forget'){
   if(managementBusy.value||!managementReady.value)return
-  managementGeneration++;managementBusy.value=true;importConfirm.value=false;managementError.value='';managementMessage.value=''
+  managementGeneration++;managementBusy.value=true;importConfirm.value=false;leaseConfirm.value=false;leaseError.value='';managementError.value='';managementMessage.value=''
   try{
     if(action==='pair'){
       if(!Number.isInteger(managementPort.value)||Number(managementPort.value)<1024||Number(managementPort.value)>65535)throw Error('请输入 1024–65535 的管理端口')
@@ -266,6 +280,7 @@ async function refresh() {
   polling = true
   try {
     status.value = await invoke<Status>('tunnel_status')
+    if(status.value.state!=='running'&&managementMessage.value.startsWith('短期 UDP 管理进程已启动'))managementMessage.value='短期 UDP 管理进程已结束；请查看进程状态'
     ready.value = true
     try { traffic.value = await invoke<Traffic>('traffic_status') } catch { traffic.value = null }
     try {
@@ -412,7 +427,7 @@ async function toggle() {
       </div>
       <section>
         <div class="section-title"><h2>管理设备配对</h2><span>V0.4 本机控制面预览</span></div>
-        <p class="hint">仅 HTTP 127.0.0.1 本机管理服务；不会自动启动或修改现有隧道。配对后由 Rust 每30秒自动同步管理心跳与期望配置元数据，关闭窗口至托盘时仍继续。</p>
+        <p class="hint">仅 HTTP 127.0.0.1 本机管理服务；不会自动启动或修改现有隧道；短期 UDP 管理会话需要明确确认。配对后由 Rust 每30秒自动同步管理心跳与期望配置元数据，关闭窗口至托盘时仍继续。</p>
         <div v-if="!managedDevice" class="fields">
           <label>本机管理端口<input aria-label="本机管理端口" type="number" min="1024" max="65535" v-model.number="managementPort" :disabled="managementBusy||!managementReady"/></label>
           <label>设备名称<input aria-label="管理设备名称" v-model="managementName" maxlength="128" :disabled="managementBusy||!managementReady"/></label>
@@ -427,14 +442,17 @@ async function toggle() {
         <p v-if="managedDevice" class="hint">已配对 ID：{{ managedDevice.id }} · 127.0.0.1:{{ managedDevice.port }}</p>
         <p v-if="managedDevice" class="hint" data-testid="management-auto-state">{{ managementBlocked?'认证拒绝，自动同步已停止':managedSync?'自动同步已收到管理配置':managementError?'同步失败，等待重试':'等待自动同步' }}</p>
         <div v-if="managedSync" aria-live="polite">
-          <p>管理配置版本：{{managedSync.revision}} · 期望映射：{{managedSync.mappings.length}} · 管理模式：idle（未应用隧道配置）</p>
+          <p>管理配置版本：{{managedSync.revision}} · 期望映射：{{managedSync.mappings.length}} · 管理心跳：idle（元数据接收，不代表业务运行状态）</p>
           <p class="hint">最近心跳：{{new Date(managedSync.last_seen_at*1000).toLocaleString()}}；自动同步间隔约30秒（请求耗时另计）。不是实际隧道在线证明。</p>
           <label v-if="managedSync.mappings.some(m=>m.protocol==='udp'&&!m.enabled)"><input type="checkbox" aria-label="确认导入 UDP 草稿" v-model="importConfirm" :disabled="locked||managementBusy"/> 确认替换当前编辑表单并清空旧连接参数及 Token（不修改已保存配置或后台服务）</label>
+          <label v-if="managedSync.mappings.some(m=>m.protocol==='udp'&&!m.enabled)"><input type="checkbox" aria-label="确认启动短期 UDP 管理会话" v-model="leaseConfirm" :disabled="locked||managementBusy"/> 确认启动短期 UDP 管理会话（仅本机中转，最长60秒，不保存授权 Token）</label>
           <div v-for="item in managedSync.mappings" :key="item.id"><p class="hint">{{item.protocol.toUpperCase()}} · 本地 {{item.local_port}} → 中转 {{item.bind_port}} · {{item.enabled?'期望启用':'草稿禁用'}}</p>
-          <button v-if="item.protocol==='udp'&&!item.enabled" type="button" class="secondary" :disabled="locked||managementBusy||managementBlocked||!importConfirm" @click="importManagedUdp(item)">导入 UDP 草稿</button></div>
+          <button v-if="item.protocol==='udp'&&!item.enabled" type="button" class="secondary" :disabled="locked||managementBusy||managementBlocked||!importConfirm" @click="importManagedUdp(item)">导入 UDP 草稿</button>
+          <button v-if="item.protocol==='udp'&&!item.enabled" type="button" class="secondary" :disabled="locked||managementBusy||managementBlocked||!leaseConfirm" @click="startManagedUdp(item)">启动短期 UDP 管理会话</button></div>
         </div>
         <p v-if="managementMessage" class="hint" role="status">{{managementMessage}}</p>
         <p v-if="managementError" class="error" role="alert">{{managementError}}</p>
+        <p v-if="leaseError" class="error" role="alert">{{leaseError}}</p>
       </section>
       <section>
         <div class="section-title"><h2>桌面隧道流量</h2><span>{{ traffic?.state === 'measured' ? '实际应用数据' : '未计量 / 未启动' }}</span></div>

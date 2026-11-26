@@ -378,6 +378,20 @@ try {
   }
   assert.equal(await has('进程运行中'),false)
   report.real_management_udp_confirmed_draft_import=true
+  // Real Windows management server has no active Linux device worker.
+  // The actual API must refuse to supply a runnable grant.
+  await until('managed start confirmation required',()=>evaluate('[...document.querySelectorAll("button")].some(b=>b.textContent.trim()==="启动短期 UDP 管理会话"&&b.disabled)'))
+  await until('unissued lease denied through actual API',async()=>{
+    if(await has('管理状态冲突，请检查后台'))return true
+    if(await has('处理中…'))return false
+    const confirm=await evaluate('(()=>{const c=document.querySelector("input[aria-label=\\"确认启动短期 UDP 管理会话\\"]");if(!c||c.disabled)return false;if(!c.checked)c.click();return true})()')
+    if(!confirm)return false
+    await click('启动短期 UDP 管理会话')
+    return false
+  })
+  assert.equal(await has('进程运行中'),false)
+  assert.equal(await evaluate('document.querySelector("input[aria-label=\\"映射授权 Token\\"]").value'),'')
+  report.real_management_unissued_udp_lease_denied=true
   // Real native process restart; DPAPI saved enrollment must be restored
   // and heartbeat sent without another enrollment or manual sync.
   trayMenu('quit')

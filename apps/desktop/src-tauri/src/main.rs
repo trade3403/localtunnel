@@ -72,6 +72,8 @@ struct Running {
     count: usize,
     relay_target: Option<transport::Target>,
     meter: Option<traffic::Meter>,
+    #[cfg(windows)]
+    managed: Option<management::LeaseSession>,
 }
 
 impl Running {
@@ -95,6 +97,8 @@ impl Running {
             count,
             relay_target: None,
             meter: None,
+            #[cfg(windows)]
+            managed: None,
         })
     }
 }
@@ -110,10 +114,16 @@ impl Drop for Running {
 struct Supervisor {
     running: Option<Running>,
     last_error: Option<String>,
+    generation: u64,
 }
 
 impl Supervisor {
     fn status(&mut self) -> Result<Status, String> {
+        #[cfg(windows)]
+        if self.managed_session().is_some_and(|s|std::time::Instant::now()>=s.deadline){
+            self.stop()?;
+            self.last_error=Some("UDP 管理授权到期，隧道已停止".into());
+        }
         if let Some(running) = &mut self.running {
             if let Some(code) = running.child.try_wait().map_err(|_| "无法读取引擎进程状态")? {
                 self.last_error = Some(format!("引擎已退出：{code}"));
@@ -199,10 +209,22 @@ impl Supervisor {
         #[cfg(windows)]
         { running.telemetry = telemetry; }
         self.running = Some(running);
+        self.generation=self.generation.wrapping_add(1);
         self.last_error = None;
         self.status()
     }
 
+    #[cfg(windows)]
+    fn managed_session(&self)->Option<&management::LeaseSession>{
+        self.running.as_ref().and_then(|r|r.managed.as_ref())
+    }
+    #[cfg(windows)]
+    fn start_managed(&mut self,request:StartRequest,session:management::LeaseSession,history:&Path)->Result<Status,String>{
+        if std::time::Instant::now()>=session.deadline{return Err("UDP 授权已过期".into())}
+        self.start_in_with_history(request,None,Some(history))?;
+        self.running.as_mut().ok_or("引擎不可用")?.managed=Some(session);
+        self.status()
+    }
     fn transport_status(&mut self) -> Result<transport::Observation, String> {
         if self.status()?.state != "running" {
             return Ok(transport::Observation::inactive());
@@ -237,6 +259,7 @@ impl Supervisor {
     }
 
     fn stop(&mut self) -> Result<Status, String> {
+        self.generation=self.generation.wrapping_add(1);
         if let Some(running) = &mut self.running {
             if running.child.try_wait().map_err(|_| "无法读取进程状态")?.is_none() {
                 running.child.kill().map_err(|_| "无法停止隧道引擎")?;
@@ -512,6 +535,15 @@ async fn management_import_udp(app:tauri::AppHandle,id:String,expected_revision:
     #[cfg(not(windows))]{let _=(app,id,expected_revision,mapping_revision,confirmed);Err("仅 Windows 支持设备配对".into())}
 }
 #[tauri::command]
+async fn management_start_udp(app:tauri::AppHandle,id:String,expected_revision:i64,mapping_revision:i64,confirmed:bool)->Result<Status,String>{
+    #[cfg(windows)]{
+        if !confirmed{return Err("请确认启动短期 UDP 管理会话".into())}
+        let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
+        return management::start_udp(&app,&dir,&id,expected_revision,mapping_revision).await
+    }
+    #[cfg(not(windows))]{let _=(app,id,expected_revision,mapping_revision,confirmed);Err("仅 Windows 支持管理授权会话".into())}
+}
+#[tauri::command]
 fn management_snapshot()->Result<serde_json::Value,String>{
     #[cfg(windows)]{
         return serde_json::to_value(management::snapshot()?).map_err(|_|"管理状态格式无效".into())
@@ -522,7 +554,7 @@ fn management_snapshot()->Result<serde_json::Value,String>{
 async fn management_forget(app:tauri::AppHandle)->Result<(),String>{
     #[cfg(windows)]{
         let dir=app.path().app_config_dir().map_err(|_|"无法定位管理凭据目录")?;
-        return management::forget(&dir).await
+        return management::forget(&dir,&app).await
     }
     #[cfg(not(windows))]{let _=app;Err("仅 Windows 支持设备配对".into())}
 }
@@ -610,12 +642,23 @@ fn main() {
     use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder};
     tauri::Builder::default()
         .manage(Mutex::new(Supervisor::default()))
-        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port,management_saved,management_enroll,management_sync,management_import_udp,management_snapshot,management_forget])
+        .invoke_handler(tauri::generate_handler![start_tunnel, stop_tunnel, tunnel_status, transport_status, traffic_status, traffic_history, service_status, manage_service, provision_service, update_service_profile, unregister_service, save_profile, load_profile, save_protected_profile, load_protected_profile, forget_protected_profile, check_local_port,management_saved,management_enroll,management_sync,management_import_udp,management_start_udp,management_snapshot,management_forget])
         .setup(|app| {
             #[cfg(windows)]
             {
                 let dir=app.path().app_config_dir()?;
-                tauri::async_runtime::spawn(management::automatic(dir));
+                tauri::async_runtime::spawn(management::automatic(dir.clone()));
+                let handle=app.handle().clone();
+                tauri::async_runtime::spawn(management::monitor(handle.clone(),dir));
+                // Independent monotonic deadline enforcement even when a
+                // management network request is pending or the UI is hidden.
+                tauri::async_runtime::spawn(async move{
+                    loop{
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        let state=handle.state::<Mutex<Supervisor>>();
+                        if let Ok(mut supervisor)=state.lock(){if supervisor.managed_session().is_some(){let _=supervisor.status();}};
+                    }
+                });
             }
             let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let stop = MenuItem::with_id(app, "stop", "停止隧道", true, None::<&str>)?;
