@@ -122,6 +122,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let supervise = args.first().is_some_and(|a| a=="--supervise-preview");
     let udp_supervise = args.first().is_some_and(|a| a=="--supervise-udp-preview");
     let udp_worker = args.first().is_some_and(|a| a=="--runtime-udp-worker");
+    let udp_device_worker = args.first().is_some_and(|a| a=="--runtime-udp-device-worker");
     let udp_resident = args.first().is_some_and(|a| a=="--runtime-udp-resident");
     let tls_gateway = args.first().is_some_and(|a| a=="--preview-tls-gateway");
     let supervise_tls = args.first().is_some_and(|a| a=="--supervise-tls-preview");
@@ -132,11 +133,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let recover = args.first().is_some_and(|a| a=="--recover-runtime");
     let prune_history = args.first().is_some_and(|a| a=="--prune-history");
     let prune_logs = args.first().is_some_and(|a| a=="--prune-gateway-logs");
-    let expected = if prune_logs {3} else if prune_history {2} else if recover {4} else if udp_worker || udp_resident {9} else if udp_supervise {7} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
+    let expected = if prune_logs {3} else if prune_history {2} else if recover {4} else if udp_device_worker {8} else if udp_worker || udp_resident {9} else if udp_supervise {7} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-device-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
     }
-    let operator = init || add_node || set_node || export || gateway || supervise || udp_supervise || udp_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
+    let operator = init || add_node || set_node || export || gateway || supervise || udp_supervise || udp_worker || udp_device_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
@@ -175,6 +176,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     if recover{
         preview::recover(&pool,&root,args[2].to_str().ok_or("invalid prefix")?,args[3].to_str().ok_or("invalid request id")?).await?;
+        return Ok(());
+    }
+    if udp_device_worker {
+        let arg=|i:usize|args[i].to_str().ok_or("invalid UDP device worker argument");
+        preview::udp_device_worker(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?.parse()?,arg(6)?.parse()?,arg(7)?.parse()?).await?;
         return Ok(());
     }
     if udp_resident {
@@ -231,7 +237,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .route("/readyz", get(ready))
         .with_state(pool.clone())
         .merge(auth::routes(auth))
-        .merge(devices::routes(pool.clone()))
+        .merge(devices::routes(pool.clone(),root.clone()))
         .merge(mappings::routes(pool.clone()))
         .merge(nodes::routes(pool.clone()))
         .merge(runtime::routes(pool.clone()))

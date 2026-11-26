@@ -243,6 +243,112 @@ try:
             assert call(base,route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
             report["real_udp_resident_local_stop_reaps_children"]=True
             (root/("udp-worker-"+mid+".stop")).unlink()
+            # Separate enrolled device consumes only its current request lease.
+            # Never read worker-generated client.toml to configure the agent.
+            pair2=call(base,"devices/pairing-code",200,"POST",admin)["pairing_code"]
+            d2=call(base,"devices/enroll",201,"POST",data={"pairing_code":pair2,"name":"Separate lease agent"})
+            lease_ingress=free(socket.SOCK_DGRAM,20000,29999,[local,ingress,relay,internal])
+            lm=call(base,"mappings",201,"POST",admin,{"device_id":d2["id"],"node_id":node,"protocol":"udp","local_port":local,"bind_port":lease_ingress})
+            lease_route="mappings/"+lm["id"]
+            device_route="devices/"+d2["id"]
+            cfg=call(base,device_route+"/config",200,token=d2["device_token"])
+            spec={"mapping_id":lm["id"],"mapping_revision":lm["revision"],"device_revision":cfg["revision"]}
+            endpoint=device_route+"/udp-lease"
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            def get_lease():
+                # Allow only the expected not-yet-published conflict.
+                req=urllib.request.Request(base+"/api/v1/"+endpoint,method="POST",
+                    headers={"Authorization":"Bearer "+d2["device_token"],"Content-Type":"application/json"},
+                    data=json.dumps(spec).encode())
+                deadline=time.monotonic()+20
+                while time.monotonic()<deadline:
+                    try:
+                        with urllib.request.urlopen(req,timeout=5) as response:
+                            assert response.status==200 and "no-store" in response.headers.get("Cache-Control","")
+                            return json.loads(response.read())
+                    except urllib.error.HTTPError as e:
+                        assert e.code==409
+                    time.sleep(.2)
+                raise AssertionError("device lease unavailable")
+            def lease_echo():
+                with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sock:
+                    sock.settimeout(.8)
+                    data=secrets.token_bytes(64)
+                    try:
+                        sock.sendto(data,("127.0.0.1",lease_ingress))
+                        reply,addr=sock.recvfrom(65535)
+                        return reply==data and addr==("127.0.0.1",lease_ingress)
+                    except (socket.timeout,ConnectionRefusedError,ConnectionResetError):
+                        return False
+            def lease_closed():
+                assert not lease_echo()
+                for kind,port in [(socket.SOCK_DGRAM,lease_ingress),(socket.SOCK_DGRAM,internal),(socket.SOCK_STREAM,relay)]:
+                    with socket.socket(socket.AF_INET,kind) as sock:
+                        if kind==socket.SOCK_STREAM:
+                            sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+                        sock.bind(("127.0.0.1",port))
+            def launch_lease():
+                request=call(base,lease_route+"/udp-start",202,"POST",admin,{"expected_revision":lm["revision"]})
+                rid=request["request_id"]
+                worker=subprocess.Popen([exe,"--runtime-udp-device-worker",str(root),lm["id"],str(lm["revision"]),str(relay),str(internal),"4096","1200"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                children.append(worker)
+                lease=get_lease()
+                assert lease["request_id"]==rid and lease["device_id"]==d2["id"] and lease["device_revision"]==cfg["revision"]
+                assert lease["mapping_id"]==lm["id"] and lease["mapping_revision"]==lm["revision"]
+                assert lease["relay_port"]==relay and lease["local_port"]==local and lease["server_key"]==public
+                assert 0<lease["expires_at"]-time.time()<=60
+                call(base,endpoint,401,"POST",device["device_token"],spec)
+                call(base,"devices/"+device["id"]+"/udp-lease",409,"POST",device["device_token"],{**spec,"device_revision":call(base,"devices/"+device["id"]+"/config",200,token=device["device_token"])["revision"]})
+                call(base,endpoint,409,"POST",d2["device_token"],{**spec,"device_revision":cfg["revision"]+1})
+                call(base,endpoint,409,"POST",d2["device_token"],{**spec,"mapping_revision":lm["revision"]+1})
+                call(base,endpoint,401,"POST",admin,spec)
+                assert not lease_echo()
+                # Independent process configured exclusively from the authenticated response.
+                config_file=root/("lease-agent-"+rid+".toml")
+                generated=subprocess.run([str(core_test.CLI.resolve()),"client-udp-config",str(config_file),"127.0.0.1:"+str(lease["relay_port"]),"m_"+lease["mapping_id"],"127.0.0.1:"+str(lease["local_port"])],
+                    env={**os.environ,"LOCALTUNNEL_TOKEN":lease["token"],"LOCALTUNNEL_SERVER_PUBLIC_KEY":lease["server_key"]},capture_output=True,timeout=10)
+                assert generated.returncode==0
+                agent=subprocess.Popen([str(engine),str(config_file)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                children.append(agent)
+                line(worker,"UDP_PREVIEW_READY",35)
+                assert agent.poll() is None and lease_echo()
+                state=call(base,lease_route+"/runtime",200,token=admin)
+                assert state["request"]["request_id"]==rid and state["request"]["state"]=="running"
+                return worker,agent,config_file,lease
+            def finish_agent(agent,config_file):
+                core_test.terminate(agent)
+                config_file.unlink()
+            def assert_clean(lease):
+                bundle=root/("udp-device-"+lease["request_id"])
+                assert bundle.is_dir()
+                for name in ("lease.json","lease.pending","server.toml","client.toml"):
+                    assert not (bundle/name).exists()
+                lease_closed()
+            worker,agent,config_file,lease=launch_lease()
+            report["real_udp_device_scoped_lease_and_independent_agent"]=True
+            call(base,lease_route+"/stop",202,"POST",admin,{"request_id":lease["request_id"]})
+            assert worker.wait(timeout=15)==0
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            finish_agent(agent,config_file)
+            assert_clean(lease)
+            report["real_udp_device_lease_stop_closes_relay_and_removes_secrets"]=True
+            worker,agent,config_file,lease2=launch_lease()
+            assert lease2["request_id"]!=lease["request_id"] and lease2["token"]!=lease["token"]
+            # Real expiry without changing system clocks or database timestamps.
+            assert worker.wait(timeout=70)==0
+            assert time.time()>=lease2["expires_at"]
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            finish_agent(agent,config_file)
+            assert_clean(lease2)
+            assert call(base,lease_route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
+            report["real_udp_device_lease_actual_expiry_closes_relay"]=True
+            worker,agent,config_file,lease3=launch_lease()
+            call(base,device_route+"/revoke",204,"POST",admin)
+            assert worker.wait(timeout=15)!=0
+            call(base,endpoint,401,"POST",d2["device_token"],spec)
+            finish_agent(agent,config_file)
+            assert_clean(lease3)
+            report["real_udp_device_lease_revocation_closes_relay"]=True
             p=launch("udp_second")
             assert exchange()
             call(base,"devices/"+device["id"]+"/revoke",204,"POST",admin)
@@ -263,4 +369,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==8 and all(v is True for v in report.values())
+assert len(report)==12 and all(v is True for v in report.values())
