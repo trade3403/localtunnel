@@ -30,7 +30,7 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y nginx openssl curl
+          sudo apt-get install -y nginx openssl curl iproute2
       - name: Real encrypted loopback E2E
         shell: bash
         env:
@@ -60,6 +60,12 @@ jobs:
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/lt-quic-venv/bin/python" tests/quic_experiment.py test-results/quic-noise-comparison.json --compare
+      - name: Real isolated kernel netem comparison (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/lt-quic-venv/bin/python" tests/quic_netem.py test-results
       - name: Package CLI build
         shell: bash
         run: |

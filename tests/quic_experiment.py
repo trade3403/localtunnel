@@ -262,16 +262,16 @@ if __name__=="__main__":
             "public_e2e":"BLOCKED: no public deployment"}
     try:
         assert report["aioquic"]=="1.9.2"
-        if len(sys.argv)==3 and sys.argv[2]=="--compare":
+        if len(sys.argv) in (3,4) and sys.argv[2]=="--compare":
             from pinned_engine import acquire
             with tempfile.TemporaryDirectory(prefix="lt-paired-engine-") as d:
-                comparison=acquire(Path(d))
+                comparison=acquire(Path(d), Path(sys.argv[3]) if len(sys.argv)==4 else None)
                 asyncio.run(main(report,comparison))
             assert len(report["comparison"]["rounds"])==4
         elif len(sys.argv)==2:
             asyncio.run(main(report))
         else:
-            raise SystemExit("usage: quic_experiment.py REPORT [--compare]")
+            raise SystemExit("usage: quic_experiment.py REPORT [--compare [VERIFIED_ARCHIVE]]")
         assert len(report["passed"])==6
     finally:
         out.parent.mkdir(parents=True,exist_ok=True)
