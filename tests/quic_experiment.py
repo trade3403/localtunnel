@@ -244,12 +244,13 @@ async def exercise(root,report,comparison=None,resilience=False):
                 binary, engine_report = comparison
                 report["comparison"] = await compare(root,binary,engine_report,local,reverse,observed)
                 assert len(report["comparison"]["passed"]) == 3
-        # Client close must remove the authenticated registration. No automatic
-        # restart, migration or resumption is claimed in this experiment.
-        for _ in range(50):
-            if registry["active"] is None:
-                break
-            await asyncio.sleep(.1)
+        # CONNECTION_CLOSE is not guaranteed to arrive under packet loss.
+        # The server must remove registration via actual termination or its
+        # configured 10-second idle expiry, with a bounded scheduling margin.
+        # Never clear the registry from the test or restart the relay early.
+        close_observed_at=time.monotonic()
+        await wait_for(lambda: registry["active"] is None,15)
+        report["registration_cleanup_wait_seconds"]=round(time.monotonic()-close_observed_at,6)
         assert registry["active"] is None
         server.close()
         await asyncio.sleep(.2)

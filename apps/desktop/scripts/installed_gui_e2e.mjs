@@ -1,6 +1,7 @@
 // Real installed WebView2 UI + Rust IPC + encrypted TCP. Node >=22.
 // Test-only loopback CDP endpoint; never enable debugging in app config.
 // No saved real credentials, screenshots, or payload logs.
+import assert from 'node:assert/strict'
 import { spawn, execFileSync } from 'node:child_process'
 import { createServer as tcpServer } from 'node:net'
 import { createServer as httpServer } from 'node:http'
