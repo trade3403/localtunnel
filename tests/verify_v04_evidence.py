@@ -226,6 +226,11 @@ REQUIRED["management-v05"] = {
         "restored_runtime_and_domain_authority_cleared",
         "snapshot_size_and_sidecar_admission_recovery",
     ],
+    "load.json": [
+        "real_sustained_mixed_management_workload",
+        "real_load_process_resources_sampled_and_recovered",
+        "real_post_load_heartbeat_readiness_and_auth",
+    ],
     "transport.json": [
         "real_incomplete_header_absolute_deadline",
         "real_keepalive_idle_connection_released",
@@ -289,7 +294,7 @@ class EvidenceGateTests(unittest.TestCase):
                 (root / filename).write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
             self.assertFalse(validate("management", root)[1])
             self.assertTrue(validate("management-v05", root)[1])
-            for name in ("http.json", "auth.json", "devices.json", "preview.json", "tls-preview.json", "protection.json", "transport.json", "backup.json"):
+            for name in ("http.json", "auth.json", "devices.json", "preview.json", "tls-preview.json", "protection.json", "transport.json", "backup.json", "load.json"):
                 filename = root / name
                 keys = REQUIRED["management-v05"][name]
                 filename.write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")

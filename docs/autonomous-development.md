@@ -344,3 +344,9 @@
 - 使用私有稀疏文件检查主库+sidecar 超256MiB、单快照超256MiB及快照sidecar拒绝，确认无目标/暂存泄漏及移除不合格测试库存后真实备份/恢复成功。验证逻辑长度准入而非真实磁盘满、写入中硬配额或在线轮转。新增2项强制管理证据至79；无产品阈值、依赖或迁移变化，原有测试不放宽。
 - 待新CI全绿后进入实际性能及负载专项。未改main、未部署公网、未开启定时任务。
 - 已验收基线工件：管理 https://github.com/trade3403/localtunnel/actions/runs/45689127053/artifacts/15057648649 ，Windows https://github.com/trade3403/localtunnel/actions/runs/45689126978/artifacts/15059595146 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45689126978/artifacts/15058193235 。
+
+## V0.5 实际管理 API 负载基线（待 CI）
+- 上一提交 `256f395e3be7fae085f24343fe9299652d626fa2` 同 SHA 六项 CI 全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45728223119)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45728231378)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45728231332)、[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45728231348)、Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45728223049)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45728231322)。备份容量拒绝诊断仅输出固定允许列表，真实备份专项及79项证据门禁通过。
+- 新增 Linux 实际回环管理负载：真实管理员登录、设备配对，8个工作者100轮（800次请求，目标约40请求/秒，20秒），含健康、就绪、认证、设备库存/身份/配置/状态及真实SQLite心跳写入。验证每个响应语义，不自动重试、不累积任务队列、不向公网发送请求。
+- 输出实测完成速率、p50/p95/p99/max延迟、分操作p95、Linux /proc RSS与FD基线/采样最大/结束值；门禁要求800次成功、19–45秒、结束FD增长不超过8、RSS增长不超过64MiB、负载后真实心跳/就绪/认证仍正常。阈值为宽松CI回归保护，不是生产SLA、实际极限吞吐、内存峰值或长期无泄漏证明。所有数值待真实CI生成。
+- 新增3项强制管理证据至82；不改产品、阈值、依赖或旧验收门禁。后续再做持续过载恢复、连接总寿命、真实加密隧道吞吐与更长时间稳定性。未改main、未部署公网、未开启定时任务。
