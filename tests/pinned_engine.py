@@ -20,6 +20,7 @@ TARGETS = {
     ("Linux","x86_64"):"x86_64-unknown-linux-gnu",
     ("Linux","aarch64"):"aarch64-unknown-linux-musl",
     ("Darwin","x86_64"):"x86_64-apple-darwin",
+    ("Darwin","arm64"):"aarch64-apple-darwin",
 }
 
 def native_target():
@@ -65,6 +66,9 @@ def acquire(directory):
     if lock["version"]!=VERSION:
         raise RuntimeError("unexpected engine lock version")
     target=native_target()
+    if target in lock.get("source_targets",{}):
+        from native_source_engine import build
+        return build(directory,VERSION,lock["source_targets"][target])
     pin=lock["targets"][target]
     url=f"https://github.com/rathole-org/rathole/releases/download/{VERSION}/rathole-{target}.zip"
     with urllib.request.urlopen(url,timeout=90) as response:

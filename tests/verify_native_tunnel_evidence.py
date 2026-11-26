@@ -8,7 +8,6 @@ target=sys.argv[2]
 report=json.loads((root/"report.json").read_text(encoding="utf-8"))
 engine=json.loads((root/"engine.json").read_text(encoding="utf-8"))
 lock=json.loads(Path(__file__).with_name("rathole-assets.lock.json").read_text(encoding="utf-8"))
-pin=lock["targets"][target]
 assert report["scope"]=="single-host real encrypted tunnel"
 assert report["public_e2e"].startswith("BLOCKED")
 assert report["passed"]==[
@@ -21,7 +20,18 @@ assert report["passed"]==[
     "32 concurrent/interleaved HTTP requests across two mappings",
 ]
 assert engine["version"]==lock["version"] and engine["target"]==target
-assert engine["pinned_archive_and_binary_verified"] is True
-assert engine["archive_sha256"]==pin["archive_sha256"]
-assert engine["binary_sha256"]==pin["binary_sha256"]
-print("Verified seven actual native tunnel assertions and locked engine digests")
+if target in lock.get("source_targets",{}):
+    pin=lock["source_targets"][target]
+    assert engine["pinned_source_and_lock_native_build_verified"] is True
+    for field,key in (("source","repository"),("source_commit","commit"),("source_tree","tree"),
+                      ("cargo_lock_blob","cargo_lock_blob"),("rust_toolchain","rust_toolchain"),
+                      ("features","features")):
+        assert engine[field]==pin[key]
+    assert 0<engine["binary_bytes"]<=64*1024*1024
+    assert len(engine["binary_sha256"])==64 and all(c in "0123456789abcdef" for c in engine["binary_sha256"])
+else:
+    pin=lock["targets"][target]
+    assert engine["pinned_archive_and_binary_verified"] is True
+    assert engine["archive_sha256"]==pin["archive_sha256"]
+    assert engine["binary_sha256"]==pin["binary_sha256"]
+print("Verified seven actual native tunnel assertions and locked engine provenance")

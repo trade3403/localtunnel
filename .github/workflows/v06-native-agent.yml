@@ -44,13 +44,14 @@ jobs:
         run: python3 tests/native_agent_e2e.py target/release/localtunnel ${{ matrix.system }} ${{ matrix.machine }} native-evidence/cli.json
       - name: Observe upstream candidate engine without execution
         run: python3 tests/native_engine_inventory.py ${{ matrix.engine }} native-evidence/engine-candidate.json
+      - name: Install fixed upstream source build compiler
+        if: matrix.engine == 'aarch64-apple-darwin'
+        run: rustup toolchain install 1.79.0-aarch64-apple-darwin --profile minimal
       - name: Real native encrypted tunnel E2E with pinned engine
-        if: matrix.engine != 'aarch64-apple-darwin'
         env:
           LOCALTUNNEL_GATEWAY_E2E: '0'
         run: python3 tests/e2e.py
       - name: Require actual native tunnel evidence and pinned digests
-        if: matrix.engine != 'aarch64-apple-darwin'
         run: python3 tests/verify_native_tunnel_evidence.py test-results ${{ matrix.engine }}
       - name: Preserve native tunnel logs and results
         if: always()

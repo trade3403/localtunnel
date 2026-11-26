@@ -25,5 +25,15 @@
       "binary_bytes": 4093040,
       "binary_sha256": "c24775737af27e0d9c49ce707a5868c6eaa4afa8e00442bec2fcfb2fab3a054c"
     }
+  },
+  "source_targets": {
+    "aarch64-apple-darwin": {
+      "repository": "https://github.com/rathole-org/rathole.git",
+      "commit": "ebb764ae53d7ffe4fcb45f83f7563bec5c74199d",
+      "tree": "61526b8ba37439ab0f1c28adc65e61b44d2994a3",
+      "cargo_lock_blob": "6856445f5a0a006fa2d425c97214219e5202541d",
+      "rust_toolchain": "1.79.0-aarch64-apple-darwin",
+      "features": "server,client,noise"
+    }
   }
 }
