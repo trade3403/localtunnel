@@ -127,6 +127,19 @@ try:
                         s.bind(("127.0.0.1",p))
             rejected(command(m["revision"]+1,"stale"))
             assert not (root/"stale").exists()
+            # SO_REUSEADDR permits TIME_WAIT reuse, never an existing listener.
+            with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as occupied:
+                occupied.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+                occupied.bind(("127.0.0.1",relay))
+                occupied.listen(1)
+                rejected(command(m["revision"],"occupied"))
+                assert not (root/"occupied").exists()
+                with socket.create_connection(("127.0.0.1",relay),timeout=2) as client:
+                    conn,_=occupied.accept()
+                    with conn:
+                        client.sendall(b"owned")
+                        assert conn.recv(5)==b"owned"
+            report["real_udp_preflight_rejects_live_tcp_listener"]=True
             p=launch("udp_first")
             assert exchange()
             rejected(command(m["revision"],"duplicate"))
@@ -185,14 +198,18 @@ try:
             report["real_udp_api_stop_reaps_children_and_closes_ports"]=True
             # One resident process handles independent requests with new credentials.
             resident=[exe,"--runtime-udp-resident",str(root),mid,str(m["revision"]),str(relay),str(internal),"udp_res","4096","1200"]
-            p=subprocess.Popen(resident,env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            p=subprocess.Popen(resident,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             children.append(p)
             def request_start():
                 queued=call(base,route+"/udp-start",202,"POST",admin,{"expected_revision":m["revision"]})
                 rid=queued["request_id"]
                 deadline=time.monotonic()+40
                 while time.monotonic()<deadline:
-                    assert p.poll() is None
+                    if p.poll() is not None:
+                        # Product resident emits only a static reason; do not
+                        # dump child configuration, credentials or paths.
+                        diagnostic=p.stderr.read(1024)
+                        raise AssertionError("resident exited: "+diagnostic.strip())
                     s=call(base,route+"/runtime",200,token=admin)
                     if s["request"]["state"]=="running" and s["request"]["request_id"]==rid:
                         assert s["worker_recent"] and exchange()
@@ -246,4 +263,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==7 and all(v is True for v in report.values())
+assert len(report)==8 and all(v is True for v in report.values())

@@ -179,7 +179,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     if udp_resident {
         let arg=|i:usize|args[i].to_str().ok_or("invalid UDP resident argument");
-        preview::udp_resident(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?.parse()?,arg(6)?,arg(7)?.parse()?,arg(8)?.parse()?).await?;
+        preview::udp_resident(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?.parse()?,arg(6)?,arg(7)?.parse()?,arg(8)?.parse()?).await.map_err(|reason|{
+            // preview returns only static, non-secret diagnostics.
+            eprintln!("UDP resident stopped: {reason}");
+            reason
+        })?;
         return Ok(());
     }
     if udp_worker {

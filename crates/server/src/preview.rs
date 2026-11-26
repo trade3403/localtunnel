@@ -702,7 +702,13 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     // Preflight only: trusted operator must exclusively control these ports.
     // Actual process binds and echo verification remain mandatory.
     {
-        let _tcp=std::net::TcpListener::bind(&relay).map_err(|_|"UDP relay control port unavailable")?;
+        // Match the engine's reusable TCP listener semantics: a previous
+        // clean session may leave TIME_WAIT sockets on this exact port.
+        // SO_REUSEADDR (not SO_REUSEPORT) still rejects an active listener.
+        let tcp=tokio::net::TcpSocket::new_v4().map_err(|_|"UDP relay preflight socket unavailable")?;
+        tcp.set_reuseaddr(true).map_err(|_|"UDP relay preflight reuse setup failed")?;
+        tcp.bind(std::net::SocketAddr::from(([127,0,0,1],relay_port))).map_err(|_|"UDP relay control port unavailable")?;
+        let _tcp=tcp.listen(1).map_err(|_|"UDP relay control listener unavailable")?;
         let _inner=std::net::UdpSocket::bind(&internal).map_err(|_|"UDP internal port unavailable")?;
         let _outer=std::net::UdpSocket::bind(&ingress).map_err(|_|"UDP ingress port unavailable")?;
     }

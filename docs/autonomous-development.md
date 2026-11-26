@@ -550,3 +550,7 @@
 - Web后台UDP启用请求启动按钮，发向专用/udp-start，复用原stop、状态刷新和请求版本约束；标记本机回显预览，非公网可达证据；UDP无HTTP网关流量统计，不冒充计费。真实Chromium浏览器测试新增UDP启动排队、按钮禁用、取消后stopped，并保留原HTTP实际转发及审计门禁。
 - 原真实UDP预览E2E五组保留，新加同一常驻进程两次独立请求、实际Noise转发、第一次API停止后端口释放、第二次新bundle/token、本地紧急停止回收全部端口，共7组强制断言。新提交尚未通过CI。
 - 仍为可信本地操作员固定参数的Linux回环回显预览，不是任意UDP业务探活、动态全节点调度、客户端远程应用、公网或商业计费。异常/未知状态需本地核查，不自动恢复；运行证据待CI。下一增量为客户端安全配置应用，随后V0.7最终验收。未修改main、未增加依赖。
+
+### 第十五增量 CI 修复 1：重复启动 TCP TIME_WAIT 兼容（待 CI）
+- 基线 `3b5846cf5fbf8a1377b8387d7de6a377e57069a3` 6/7 成功；[Management PR 失败](https://github.com/trade3403/localtunnel/actions/runs/45869126950)，同SHA [Management push 成功](https://github.com/trade3403/localtunnel/actions/runs/45869119681)。失败实际日志：job 140079621672，udp_preview_e2e.py 第213行首次resident request_start，第195行 p.poll() is None 断言失败，resident提前退出；未输出原始错误，故具体退出原因未确认。
+- 本地Linux独立真实socket实验复现：SO_REUSEADDR监听器主动关闭连接后，原端口无reuseaddr重绑 EADDRINUSE(98)，启用reuseaddr重绑成功。推测是连续启动预检与引擎端口复用语义不一致导致的偶发问题。修复UDP relay预检采用 Tokio TcpSocket IPv4，SO_REUSEADDR后bind并listen，仍拒绝现存监听器，不使用SO_REUSEPORT，不取消UDP端口预检，不修改探活、授权、状态机及停止回收门禁。现有两次常驻启动测试保留，新增真实占用监听器拒绝且原连接可用的测试（8组）。新增resident静态脱敏错误诊断，失败测试读取有限stderr。未确认CI根因，待新CI验证；如仍失败按新日志修复，不降低测试门槛。
