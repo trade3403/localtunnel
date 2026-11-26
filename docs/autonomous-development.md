@@ -361,3 +361,9 @@
 - 上一提交 `6e9f91242798e7c0e471192698945aaf91311f38` 同SHA六项CI全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45738416789)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45738422997)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45738423029)、[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45738423097)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45738416808)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45738423235)。
 - 原有连接上限/慢头/空闲超时与恢复测试保留。新增实际同一个HTTP/1 TCP连接每秒一次健康请求、不自动重连，期间独立连接也须成功；至少100次真实响应、最后一次成功不早于115秒、118–125秒观察连接关闭，距最后成功小于5秒，以区别于空闲超时。记录实测时长及请求数，随后同进程新长连接连续请求、Linux FD回落检查。新增2项强制管理证据至86。
 - 保留真实120秒阈值，无假时钟、产品代码或依赖变更。容许CI调度误差，非慢响应写入专项或生产长期无泄漏保证。仅在已有本地测试进程执行，不部署公网。下一步实际加密隧道吞吐量专项。未改main、未开启定时任务。
+
+## V0.5 真实 Noise 隧道 HTTP/HTTPS 双向吞吐量专项（待 CI）
+- 上一提交 `705586c97e35b30e6e8bf545bf3082ae439acff6` 六项同SHA CI全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45739805050)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45739811657)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45739811693)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45739811752)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45739805032)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45739811677)。管理86项门禁通过，真实120秒连接寿命专项验收完成。
+- 复用原有真实 DNS TXT 验证、管理导出、锁定 Rathole Noise 引擎与 Nginx HTTP/HTTPS 网关进程。每种协议4个并行工作者、4轮、16个独立真实连接；每个发送256KiB独立随机数据、接收后端回显并比较实际字节与SHA256。每种协议4MiB上传+4MiB下载，总16MiB双向有效载荷。HTTPS继续验证测试CA及主机名，不关闭TLS验证；测试后正常业务、错误Host或错误CA拒绝仍须成立。
+- 输出每种协议真实总耗时、已验证双向字节数、合计应用层有效吞吐Mbps及事务延迟p50/p95/max，要求16次成功、60秒内完成、网关和隧道子进程持续存活。该宽松完成门禁非生产SLA；不宣称链路峰值带宽、广域网或跨主机吞吐，不包含管理面认证性能。全部测量待CI。新增2项强制管理证据至88，旧86项不放宽。
+- Echo仅在隔离回环测试夹具中使用，无产品接口、依赖、阈值变更，不改main、不部署公网、未开启定时任务。下一步长时间稳定性专项。

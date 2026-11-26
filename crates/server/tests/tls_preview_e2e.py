@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import http.server
+from tunnel_load_fixture import EchoFixture, transfer
 import re
 import socket
 import ssl
@@ -178,7 +179,7 @@ try:
             body=secrets.token_hex(24).encode()
             hostname="secure.example.test"
             probe_requests=[]
-            class Web(http.server.BaseHTTPRequestHandler):
+            class Web(EchoFixture, http.server.BaseHTTPRequestHandler):
                 def do_GET(self):
                     probe_requests.append(self.headers.get("Host"))
                     self.send_response(200)
@@ -276,6 +277,10 @@ try:
             rejects(gp,"wrong.example.test",ca)
             assert tls_request(gp,"wrong.example.test",ca,sni=hostname)[0]==421
             report["real_tls_certificate_and_noise_http_body"]=True
+            report["https_tunnel_measurements"]=transfer(gp,hostname,processes,ca)
+            assert tls_request(gp,hostname,ca)==(200,body)
+            rejects(gp,hostname,wrongca)
+            report["real_https_noise_concurrent_bidirectional_payload_integrity"]=True
             old=(prefix/"nginx.conf").read_bytes()
             expected.write_bytes(b"wrong expected response")
             prior=len(probe_requests)

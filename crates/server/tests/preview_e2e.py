@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import http.server
+from tunnel_load_fixture import EchoFixture, transfer
 import re
 import socket
 import time
@@ -159,7 +160,7 @@ try:
             db_path=root/"control.sqlite3"
             body=secrets.token_hex(24).encode()
             probe_requests=[]
-            class Web(http.server.BaseHTTPRequestHandler):
+            class Web(EchoFixture, http.server.BaseHTTPRequestHandler):
                 def do_GET(self):
                     probe_requests.append(self.headers.get("Host"))
                     self.send_response(200)
@@ -276,6 +277,10 @@ try:
             await_body(gp,"preview.example.test",(200,body),processes)
             backup.unlink()
             report["actual_gateway_apply_and_failed_apply_preserves_live_route"]=True
+            report["http_tunnel_measurements"]=transfer(gp,"preview.example.test",processes)
+            assert request(gp,"preview.example.test")== (200,body)
+            assert request(gp,"wrong.example.test")[0]==421
+            report["real_http_noise_concurrent_bidirectional_payload_integrity"]=True
             p,base=launch(root)
             try:
                 expect(call(base,"devices/"+device["id"]+"/revoke","POST",admin),204)
