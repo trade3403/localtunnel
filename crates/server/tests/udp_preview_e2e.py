@@ -342,6 +342,23 @@ try:
             assert_clean(lease2)
             assert call(base,lease_route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
             report["real_udp_device_lease_actual_expiry_closes_relay"]=True
+            def policy(state="active",expires_at=None):
+                e=call(base,"commercial/entitlement",200,token=admin)["entitlement"]
+                spec={"tenant_id":e["tenant_id"],"plan_id":e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                result=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
+                assert result.returncode==0,"commercial assignment failed"
+            worker,agent,config_file,commercial_lease=launch_lease()
+            policy("suspended")
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            call(base,lease_route+"/udp-start",409,"POST",admin,{"expected_revision":lm["revision"]})
+            assert worker.wait(timeout=15)==0
+            finish_agent(agent,config_file)
+            assert_clean(commercial_lease)
+            assert call(base,lease_route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
+            rejected(command(m["revision"],"commercial_suspended"))
+            policy()
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            report["real_udp_commercial_suspend_revokes_lease_and_closes_relay"]=True
             worker,agent,config_file,lease3=launch_lease()
             call(base,device_route+"/revoke",204,"POST",admin)
             assert worker.wait(timeout=15)!=0
@@ -369,4 +386,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==12 and all(v is True for v in report.values())
+assert len(report)==13 and all(v is True for v in report.values())

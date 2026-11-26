@@ -400,6 +400,38 @@ try:
                 assert last["sampling_state"]=="partial" and last["requests"]>=rows[0]["requests"]
                 report["real_gateway_observed_bytes_and_owner_isolation"]=True
                 report["api_start_stop_scoped_request_real_worker"]=True
+                def policy(state="active",expires_at=None):
+                    e=expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
+                    spec={"tenant_id":e["tenant_id"],"plan_id":e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                    p=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
+                    assert p.returncode==0,"commercial assignment failed"
+                # A pending request cannot be revived by suspend/renew.
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                policy("suspended")
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["state"]=="stopped"
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),409)
+                policy()
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["request_id"]==queued["request_id"]
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"commercial_expiry","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    state=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                    if state["state"]=="running":break
+                    time.sleep(.2)
+                else: raise AssertionError("commercial HTTP worker not running")
+                # Actual wall-clock expiry, no DB timestamp mutation or stop API.
+                expiry=int(time.time())+8
+                policy(expires_at=expiry)
+                assert request(gp,"preview.example.test")== (200,body)
+                assert supervisor.wait(timeout=40)==0 and time.time()>=expiry
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["state"]=="stopped"
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),409)
+                policy()
+                report["real_http_commercial_expiry_and_queued_cancellation"]=True
                 # Resident owns a single fixed mapping, but accepts multiple
                 # independently authorized requests without operator relaunch.
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)

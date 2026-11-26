@@ -383,6 +383,33 @@ try:
                 assert request(bp,hostname) is None
                 assert request(probe,"localtunnel-probe.invalid")[0]==421
                 report["real_https_runtime_api_start_stop"]=True
+                def policy(state="active",expires_at=None):
+                    e=expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
+                    spec={"tenant_id":e["tenant_id"],"plan_id":e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                    p=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
+                    assert p.returncode==0,"commercial assignment failed"
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                queued=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-tls-worker",str(root),mid3,"1",str(rp),"commercial_suspend","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                end=time.monotonic()+45
+                while time.monotonic()<end:
+                    assert supervisor.poll() is None
+                    state=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                    try:
+                        if state["state"]=="running" and tls_request(gp,hostname,ca2)==(200,body):break
+                    except (OSError,http.client.HTTPException):pass
+                    time.sleep(.25)
+                else: raise AssertionError("commercial HTTPS worker not running")
+                policy("suspended")
+                expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),409)
+                policy() # Rapid renewal cannot cancel the already latched stop.
+                assert supervisor.wait(timeout=40)==0
+                state=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                assert state["state"]=="stopped" and state["request_id"]==queued["request_id"]
+                rejects(gp,hostname,ca2)
+                assert request(bp,hostname) is None
+                assert request(probe,"localtunnel-probe.invalid")[0]==421
+                report["real_https_commercial_suspend_latches_stop_across_renewal"]=True
                 # Exercise the shared recovery mechanism with actual HTTPS,
                 # a verified certificate and two owned encrypted tunnel children.
                 import signal
