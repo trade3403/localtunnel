@@ -15,7 +15,6 @@ import tempfile
 import threading
 import time
 import urllib.request
-import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "test-results"
@@ -26,23 +25,9 @@ CLI = ROOT / "target" / "release" / ("localtunnel" + EXE)
 ENGINE_VERSION = "v0.5.0"
 
 def engine(directory):
-    target = "x86_64-pc-windows-msvc" if WINDOWS else "x86_64-unknown-linux-gnu"
-    filename = f"rathole-{target}.zip"
-    url = f"https://github.com/rathole-org/rathole/releases/download/{ENGINE_VERSION}/{filename}"
-    with urllib.request.urlopen(url, timeout=90) as response:
-        archive = response.read(20 * 1024 * 1024 + 1)
-    if len(archive) > 20 * 1024 * 1024:
-        raise RuntimeError("engine download exceeds limit")
-    digest = hashlib.sha256(archive).hexdigest()
-    if WINDOWS and digest != "2f3b4900a63d32a14e1578b2de68f78daad89b7c47b9388c26d922962faef430":
-        raise RuntimeError("unexpected Windows engine archive SHA-256")
-    import io
-    with zipfile.ZipFile(io.BytesIO(archive)) as zipped:
-        member = next(n for n in zipped.namelist() if Path(n).name == "rathole" + EXE)
-        binary = directory / ("rathole" + EXE)
-        binary.write_bytes(zipped.read(member))
-    binary.chmod(0o700)
-    (RESULTS / "engine.json").write_text(json.dumps({"version": ENGINE_VERSION, "archive_sha256": digest, "source": url}))
+    from pinned_engine import acquire
+    binary, report = acquire(directory)
+    (RESULTS / "engine.json").write_text(json.dumps(report, indent=2))
     return binary
 
 def port():

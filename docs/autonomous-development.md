@@ -381,3 +381,8 @@
 
 ## V0.6 第一批原生跨平台增量（待 CI）
 - V0.5 最终文档提交 `135b8f2b5118fa0025e4a55b9cbf116aa0e5ff3d` 六项 CI 全绿。创建 feat/v0.6-cross-platform，继承 V0.5，保持草稿 PR。新增四平台原生 CLI 真实测试与引擎候选观察，明确 macOS ARM64 upstream 归档缺失，未执行未锁定候选。详细范围、基线 CI 链接、限制及下一步见 [V0.6](v0.6.md)。无公网部署/main合并/正式发布。
+
+## V0.6 第二增量：锁定上游字节与三平台真实加密隧道（待 CI）
+- 上一提交 `d1e3752e081dc96cc16aa4d3a62f7e2f1c740b1b` 七项同SHA CI全部通过：[Native 四平台](https://github.com/trade3403/localtunnel/actions/runs/45749619538)，Management [push](https://github.com/trade3403/localtunnel/actions/runs/45749612131)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45749619414)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45749619539)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45749620308)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45749612127)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45749619401)。四平台实际原生 Rust/架构/配置安全门禁均成功。
+- 从四平台原始 job 日志 139673986885（Intel Mac）、139673987106（Linux ARM64）、139673987246（Apple Silicon 缺资产）、139673987293（Linux x64）取得真实观测 SHA256 和大小。新增 tests/rathole-assets.lock.json 锁定三份 Unix release 与既有 Windows 归档及二进制摘要。上游 v0.5.0 没有独立 digest/签名证明；这是首次观测字节锁定（TOFU），不是官方签名验证。新 CI 必须重新下载并双重匹配才写入可执行文件；无未知架构回退、无未锁定执行。保留原候选观察，不删除既有 Windows 固定哈希校验。
+- 共享 E2E 下载器同时保护原有 Linux/Windows Gateway、管理及桌面引擎测试。新增三平台原生真实 Noise 7项验收（配置、错误令牌拒绝、实际正文、重复请求、relay重启重连、双映射隔离、32次并发请求）；验证证据与对应锁定目标。原有 Linux 网关及管理/Windows门禁不放宽。Apple Silicon 仍仅通过CLI，明确保留缺原生发行包阻塞，下一增量审查固定源码和 Cargo.lock 原生构建，不使用 Rosetta。无公网、签名、正式发行、main变更。

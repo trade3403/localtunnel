@@ -1,0 +1,29 @@
+{
+  "version": "v0.5.0",
+  "provenance": "Windows previously pinned and executed in desktop CI; three Unix asset digests observed on official upstream release downloads in V0.6 Native Agent CI 45749619538; trust on first observation, not an independent publisher signature.",
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "archive_bytes": 1644348,
+      "archive_sha256": "2f3b4900a63d32a14e1578b2de68f78daad89b7c47b9388c26d922962faef430",
+      "binary_sha256": "a91717eb37b3dc25c9d2391aca6a1b1f8edde9a3de626264718811ff8113e55b"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "archive_bytes": 1275184,
+      "archive_sha256": "3e7d0d0f365120cd3cd351d147d1a12ee960c8068b464d4dd533a3821873b80e",
+      "binary_bytes": 1276052,
+      "binary_sha256": "d2202f2aa3a432135bddbe1c6104600c6577cd4507a70e77c08741c7ad879926"
+    },
+    "aarch64-unknown-linux-musl": {
+      "archive_bytes": 1025661,
+      "archive_sha256": "fa4a6fc63d86f8f1faa7c103a845e4715ce79a048455c0eec897b27237576564",
+      "binary_bytes": 1026216,
+      "binary_sha256": "c95474d2ecdc031b3bb20c495595a0d6c6440c1ff7748f594d7ecd5315d36e8f"
+    },
+    "x86_64-apple-darwin": {
+      "archive_bytes": 1724482,
+      "archive_sha256": "768789bf3298d6ebcd03995ad1a0af4de83af5d894030c67e70edc229f61bd75",
+      "binary_bytes": 4093040,
+      "binary_sha256": "c24775737af27e0d9c49ce707a5868c6eaa4afa8e00442bec2fcfb2fab3a054c"
+    }
+  }
+}

@@ -44,6 +44,20 @@ jobs:
         run: python3 tests/native_agent_e2e.py target/release/localtunnel ${{ matrix.system }} ${{ matrix.machine }} native-evidence/cli.json
       - name: Observe upstream candidate engine without execution
         run: python3 tests/native_engine_inventory.py ${{ matrix.engine }} native-evidence/engine-candidate.json
+      - name: Real native encrypted tunnel E2E with pinned engine
+        if: matrix.engine != 'aarch64-apple-darwin'
+        env:
+          LOCALTUNNEL_GATEWAY_E2E: '0'
+        run: python3 tests/e2e.py
+      - name: Require actual native tunnel evidence and pinned digests
+        if: matrix.engine != 'aarch64-apple-darwin'
+        run: python3 tests/verify_native_tunnel_evidence.py test-results ${{ matrix.engine }}
+      - name: Preserve native tunnel logs and results
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p native-evidence
+          if test -d test-results; then cp -R test-results native-evidence/tunnel; fi
       - name: Collect actual native build and digest
         run: |
           mkdir -p native-dist
