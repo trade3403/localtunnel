@@ -153,18 +153,29 @@ with sqlite3.connect(sys.argv[1]) as db:
   assert.equal(udp.enabled,false)
   await page.getByRole('button',{name:'运行详情'}).click()
   await page.getByText('UDP 仅限可信操作员预配置的本机回显预览；请求启动不代表实际运行或公网可达。',{exact:true}).waitFor()
-  assert.equal(await page.getByRole('button',{name:'请求启动'}).isDisabled(),false)
+  // The card and its static UDP hint render before the real runtime and
+  // traffic requests finish. Wait for the actual settled state and enabled
+  // control, not just the card's presence. Keep the original assertion.
+  await page.getByTestId('runtime-state').filter({hasText:/^尚无请求$/}).waitFor({timeout:10000})
+  const udpStartButton=page.getByRole('button',{name:'请求启动',exact:true})
+  await udpStartButton.and(page.locator('button:enabled')).waitFor({timeout:10000})
+  assert.equal(await udpStartButton.isDisabled(),false)
   const udpPath='/api/v1/mappings/'+udp.id
   const udpStarted=page.waitForResponse(r=>r.url().endsWith(udpPath+'/udp-start')&&r.status()===202)
   await page.getByRole('button',{name:'请求启动'}).click()
   const udpRequest=await (await udpStarted).json()
   assert.equal(udpRequest.state,'queued')
   await page.getByTestId('runtime-state').filter({hasText:/^等待执行器$/}).waitFor()
-  assert.equal(await page.getByRole('button',{name:'请求启动'}).isDisabled(),true)
+  // Enabled stop control proves the mutation's busy state has cleared;
+  // the start button must still be disabled by the queued request itself.
+  await page.getByRole('button',{name:'请求停止',exact:true}).and(page.locator('button:enabled')).waitFor({timeout:10000})
+  assert.equal(await udpStartButton.isDisabled(),true)
   const udpStopped=page.waitForResponse(r=>r.url().endsWith(udpPath+'/stop')&&r.status()===202)
   await page.getByRole('button',{name:'请求停止'}).click()
   assert.equal((await (await udpStopped).json()).state,'stopped')
   await page.getByTestId('runtime-state').filter({hasText:/^已停止$/}).waitFor()
+  await udpStartButton.and(page.locator('button:enabled')).waitFor({timeout:10000})
+  assert.equal(await udpStartButton.isDisabled(),false)
   report.real_browser_udp_request_and_cancel=true
   await page.getByRole('button',{name:'删除映射',exact:true}).click()
   await page.locator('.ant-popover:visible').getByRole('button',{name:'确认删除',exact:true}).click()

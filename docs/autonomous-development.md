@@ -590,3 +590,8 @@
 - GET /api/v1/commercial/entitlement 使用原管理员认证，在同一SQL查询中验证session/owner并读取本租户套餐、状态及实际设备/映射数量，no-store，不接受任意租户ID，无密码、设备凭据或跨租户资源信息。返回 commercial_enforcement=false 和 owner_inventory_only，明确不是已执行套餐配额。到期状态为数据库时钟计算结果，不自动停止已有隧道。暂不开放商业写API；用户创建及多成员租户授权也未开发。
 - 新真实E2E构造旧1-11迁移数据库，以真实服务SQLx升级到12，验证原数据/审计/版本不变、外键和完整性、初次管理员和旧账号默认套餐、两独立管理员实际资源计数隔离、政策状态及退出后拒绝、重启持久化和缺表readiness失败。增加5个强制证据字段，继承V0.5完整证据门禁，保留原V0.7各测试。更新HTTP迁移清单至1-12且继续逐SHA384校验，扩展Management push及Native PR分支触发，继续标准免费runner。
 - 当前仅数据模型及只读库存，未实现商业套餐写入、分配、用户管理、事务内动态配额、到期停止、带宽/流量/并发强制执行、商业UI或真正多成员租户。下一增量先实现可信操作员的账户与套餐管理及审计，再实现原子准入及撤销。V0.9继续用户确认的控制面/数据面解耦和单机兼容架构。新提交待CI，未修改main、未部署、未新增依赖。
+
+### 第一增量 CI 修复 1：等待真实浏览器运行详情完成
+- 基线 `384bd819b3a978aa7241e7a47db46560310ff76c` 6/7通过。[Management push](https://github.com/trade3403/localtunnel/actions/runs/45890033896) job 140150141661 的 Real browser admin login and API-backed management 步骤失败；同SHA [Management PR](https://github.com/trade3403/localtunnel/actions/runs/45890050643) 成功。实际日志为 browser.mjs:156、UDP desired draft form，isDisabled() 返回true而预期false。此前商业库存升级及owner隔离步骤通过。
+- 代码核查：inspectMapping在设置selectedMapping后异步请求/runtime和流量，run在finally才清除busy，静态UDP提示出现不能证明按钮应已启用。修复测试等待真实“尚无请求”及按钮enabled（10秒上限），保持原启用断言；queued后等待stop按钮enabled再断言start仍disabled，防止busy状态造成假阳性；取消后等待stopped并额外断言start重新启用。所有真实HTTP 201/202、请求ID/状态、删除及后续生命周期断言保留。不修改产品禁用逻辑、不使用固定睡眠/force点击/跳过测试。
+- 原CI未记录失败时具体DOM和网络时序，异步竞态为基于真实日志及源代码的判断，待新CI验证。未推进账户或套餐写入，未修改main。
