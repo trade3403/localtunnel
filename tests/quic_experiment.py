@@ -87,7 +87,7 @@ def cfg(client,root,hostname=HOST,ca="ca.pem",alpn=ALPN):
         config.load_cert_chain(str(root/"leaf.pem"),str(root/"leaf.key"))
     return config
 
-async def exercise(root,report):
+async def exercise(root,report,comparison=None):
     registry={"active":None}
     tasks=set()
     observed=[]
@@ -221,6 +221,11 @@ async def exercise(root,report):
                 "elapsed_seconds":round(elapsed,6),
                 "combined_application_goodput_mbps":round(2*16*64*1024*8/elapsed/1e6,3)}
             report["passed"].append("16 sequential and 16 concurrent binary reverse round trips")
+            if comparison is not None:
+                from quic_noise_benchmark import compare
+                binary, engine_report = comparison
+                report["comparison"] = await compare(root,binary,engine_report,local,reverse,observed)
+                assert len(report["comparison"]["passed"]) == 3
         # Client close must remove the authenticated registration. No automatic
         # restart, migration or resumption is claimed in this experiment.
         for _ in range(50):
@@ -243,12 +248,12 @@ async def exercise(root,report):
             task.cancel()
         await asyncio.gather(*list(tasks),return_exceptions=True)
 
-async def main(report):
+async def main(report,comparison=None):
     async with asyncio.timeout(110):
         with tempfile.TemporaryDirectory(prefix="lt-quic-experiment-") as d:
             root=Path(d)
             certificates(root)
-            await exercise(root,report)
+            await exercise(root,report,comparison)
 
 if __name__=="__main__":
     out=Path(sys.argv[1])
@@ -257,7 +262,16 @@ if __name__=="__main__":
             "public_e2e":"BLOCKED: no public deployment"}
     try:
         assert report["aioquic"]=="1.9.2"
-        asyncio.run(main(report))
+        if len(sys.argv)==3 and sys.argv[2]=="--compare":
+            from pinned_engine import acquire
+            with tempfile.TemporaryDirectory(prefix="lt-paired-engine-") as d:
+                comparison=acquire(Path(d))
+                asyncio.run(main(report,comparison))
+            assert len(report["comparison"]["rounds"])==4
+        elif len(sys.argv)==2:
+            asyncio.run(main(report))
+        else:
+            raise SystemExit("usage: quic_experiment.py REPORT [--compare]")
         assert len(report["passed"])==6
     finally:
         out.parent.mkdir(parents=True,exist_ok=True)

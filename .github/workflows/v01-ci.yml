@@ -54,6 +54,12 @@ jobs:
           "$py" -m pip --isolated install --no-cache-dir --no-index --only-binary=:all: --require-hashes --find-links "$wheels" --report test-results/quic-dependencies.json -r "$lock"
           "$py" -m pip check
           "$py" tests/quic_experiment.py test-results/quic-experiment.json
+      - name: Paired real Noise TCP and QUIC benchmark (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/lt-quic-venv/bin/python" tests/quic_experiment.py test-results/quic-noise-comparison.json --compare
       - name: Package CLI build
         shell: bash
         run: |
