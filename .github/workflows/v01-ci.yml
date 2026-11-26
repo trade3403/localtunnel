@@ -37,6 +37,21 @@ jobs:
           LOCALTUNNEL_GATEWAY_E2E: ${{ runner.os == 'Linux' && '1' || '0' }}
           LOCALTUNNEL_UDP_E2E: '1'
         run: python tests/e2e.py
+      - name: Experimental real QUIC reverse stream (Linux only)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p test-results
+          python -m venv "$RUNNER_TEMP/lt-quic-venv"
+          py="$RUNNER_TEMP/lt-quic-venv/bin/python"
+          wheels="$RUNNER_TEMP/lt-quic-wheels"
+          mkdir "$wheels"
+          "$py" -m pip --isolated download --index-url https://pypi.org/simple --only-binary=:all: --dest "$wheels" aioquic==1.9.2
+          (cd "$wheels" && sha256sum --check "$GITHUB_WORKSPACE/tests/quic-wheel.sha256")
+          "$py" -m pip --isolated install --no-index --only-binary=:all: --find-links "$wheels" --report test-results/quic-dependencies.json aioquic==1.9.2
+          "$py" -m pip check
+          "$py" tests/quic_experiment.py test-results/quic-experiment.json
       - name: Package CLI build
         shell: bash
         run: |
