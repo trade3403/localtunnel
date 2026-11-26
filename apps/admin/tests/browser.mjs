@@ -138,6 +138,31 @@ with sqlite3.connect(sys.argv[1]) as db:
   await page.getByText('域名已删除',{exact:true}).waitFor()
   await page.getByRole('cell',{name:'browser.example.test',exact:true}).waitFor({state:'hidden'})
   report.real_edit_delete_and_domain_reference_guard=true
+  stage='UDP desired draft form'
+  await menu('映射管理').click()
+  for(const [id,option] of [['mapping-device','Browser fixture'],['mapping-node','Local relay'],['mapping-protocol','UDP']]){
+    await page.getByTestId(id).click()
+    await page.locator('.ant-select-dropdown:visible').getByText(option,{exact:true}).click()
+  }
+  await page.getByTestId('mapping-domain').waitFor({state:'hidden'})
+  const udpCreated=page.waitForResponse(r=>r.url().endsWith('/api/v1/mappings')&&r.request().method()==='POST'&&r.status()===201)
+  await page.getByRole('button',{name:'创建草稿'}).click()
+  const udp=await (await udpCreated).json()
+  assert.equal(udp.protocol,'udp')
+  assert.equal(udp.domain_id,null)
+  assert.equal(udp.enabled,false)
+  await page.getByRole('button',{name:'运行详情'}).click()
+  await page.getByText('UDP 仅期望配置草稿，尚未接入管理执行器，不代表隧道运行。',{exact:true}).waitFor()
+  assert.equal(await page.getByRole('button',{name:'请求启动'}).isDisabled(),true)
+  await page.getByRole('button',{name:'删除映射',exact:true}).click()
+  await page.locator('.ant-popover:visible').getByRole('button',{name:'确认删除',exact:true}).click()
+  await page.getByText('映射已删除',{exact:true}).waitFor()
+  await page.getByRole('button',{name:'运行详情'}).waitFor({state:'hidden'})
+  await menu('域名管理').click()
+  await menu('映射管理').click()
+  await page.getByTestId('mapping-protocol').click()
+  await page.locator('.ant-select-dropdown:visible').getByText('HTTP',{exact:true}).click()
+  await menu('域名管理').click()
   stage='real browser worker lifecycle'
   // Create a new domain through the actual UI, extract only its public TXT
   // challenge from the actual HTTP response, and answer via real TCP DNS.

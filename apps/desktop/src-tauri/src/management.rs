@@ -123,7 +123,7 @@ async fn sync_saved(s:Saved)->Result<SyncResult,String>{
     if identity.id!=s.id||!identity.enabled||identity.revision<1{return Err("设备身份不一致".into())}
     let config:Config=json(c.get(format!("{base}/config")).bearer_auth(&s.device_token),200).await?;
     if config.device_id!=s.id||config.scope!="desired_metadata_only"||config.revision<identity.revision||config.mappings.len()>64||
-        config.mappings.iter().any(|m|!hex(&m.id,32)||!matches!(m.protocol.as_str(),"http"|"https"|"tcp")||m.local_host!="127.0.0.1"||m.local_port==0||!(20000..=29999).contains(&m.bind_port)||m.revision<1){
+        config.mappings.iter().any(|m|!hex(&m.id,32)||!matches!(m.protocol.as_str(),"http"|"https"|"tcp"|"udp")||(matches!(m.protocol.as_str(),"tcp"|"udp")&&m.domain_id.is_some())||m.local_host!="127.0.0.1"||m.local_port==0||!(20000..=29999).contains(&m.bind_port)||m.revision<1){
         return Err("管理配置元数据无效".into())
     }
     // No managed data-plane has been applied. Report only receipt of the

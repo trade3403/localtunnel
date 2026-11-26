@@ -77,7 +77,7 @@ async fn create(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Cre
     let owner=auth::identify(&pool,&token).await?.id;
     if !valid_id(&c.device_id)||!valid_reference(&c.node_id)||!local_port(c.local_port)||!bind_port(c.bind_port){return Err(BAD)}
     match (c.protocol.as_str(),c.domain_id.as_deref()){
-        ("tcp",None)=>{},
+        ("tcp"|"udp",None)=>{},
         ("http"|"https",Some(d)) if valid_reference(d)=>{},
         _=>return Err(BAD),
     }

@@ -324,6 +324,10 @@ try {
   const created=await manage('mappings','POST',admin,{device_id:device.id,node_id:nodeId,protocol:'tcp',local_port:localPort,bind_port:24001})
   if(created.status!==201)throw Error('management draft creation failed')
   const managedMapping=await created.json()
+  const udpCreated=await manage('mappings','POST',admin,{device_id:device.id,node_id:nodeId,protocol:'udp',local_port:localPort,bind_port:24002})
+  if(udpCreated.status!==201)throw Error('UDP desired draft creation failed')
+  const udpMapping=await udpCreated.json()
+  if(udpMapping.enabled!==false||udpMapping.domain_id!==null)throw Error('UDP draft incorrectly activated')
   const managementHwnd=await until('management native HWND',windowHandle)
   windowAction(managementHwnd,'close')
   await until('management window hidden',()=>windowAction(managementHwnd,'visible')==='False')
@@ -338,6 +342,7 @@ try {
   await until('management tray restored',()=>windowAction(managementHwnd,'visible')==='True')
   await waitText('管理配置版本：'+updated.reported_revision)
   await waitText('TCP · 本地 '+managedMapping.local_port+' → 中转 '+managedMapping.bind_port+' · 草稿禁用')
+  await waitText('UDP · 本地 '+udpMapping.local_port+' → 中转 '+udpMapping.bind_port+' · 草稿禁用')
   // Real native process restart; DPAPI saved enrollment must be restored
   // and heartbeat sent without another enrollment or manual sync.
   trayMenu('quit')

@@ -444,3 +444,9 @@
 - 新增独立前台 udp-guard <127.0.0.1:listen> <127.0.0.1:relay>，可选单映射入口；只允许IPv4精确回环及不同非零端口。单线程非阻塞、最多32活跃来源socket、65秒滑动窗口最多32个新来源、65秒无成功入站转发回收、1200字节上限（拒绝空数据报和超长，不截断）、全局双向分别200包/s burst64、每来源双向分别40包/s burst8，连接UDP上游socket、每轮有限读取、无应用待发队列。不新增依赖/公网监听、不改既有TCP/UDP默认配置。
 - 六原生job新增确定性桶/窗口单元测试及实际guard+固定引擎+本地echo测试，覆盖非法端点、真实二进制/超长拒绝、32来源/第33拒绝、256包过载实测本地fixture收到的次数、其他来源仍转发、真实66秒等待后回收并重新准入。独立udp-guard.json证据（5组），不减旧测试。保守预览参数，不宣称生产性能。由于echo测试额外加1字节标记，最大往返请求验证1199字节。
 - 仅限制经过guard的来源和流量，直接访问原relay映射端口、恶意已认证对端、引擎内部队列/重连代际、其他进程和全部用户级资源不在保护范围；不能把32会话宣传成引擎全局上限。入口不是防火墙、不是租户认证或公网保护；当前客户端目标和映射仅回环。后续检查真实资源证据并考虑受控引擎或统一入口集成，再推进管理及QUIC实验。未部署公网或合并main。
+
+## V0.7 第四增量：UDP 管理元数据与兼容迁移（待 CI）
+- 上一提交 `98b2cd6a8e50b7c2b305c4ab6c4cc19499bc32fa` 七项同SHA全绿：[Native](https://github.com/trade3403/localtunnel/actions/runs/45778653328)、[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45778653361)、[Windows](https://github.com/trade3403/localtunnel/actions/runs/45778653336)、Management [PR](https://github.com/trade3403/localtunnel/actions/runs/45778653316)/[push](https://github.com/trade3403/localtunnel/actions/runs/45778646378)、Hosted [PR](https://github.com/trade3403/localtunnel/actions/runs/45778653326)/[push](https://github.com/trade3403/localtunnel/actions/runs/45778646382)。UDP入口资源真实测试通过。
+- 新增0011迁移，不修改既有迁移摘要。SQLx同事务、外键保持开启，先临时保存mappings及CASCADE子表runtime_requests/mapping_traffic，再按依赖顺序重建表、复制数据、恢复原索引与revision/audit触发器，避免复制触发虚假审计/版本增长；新增udp且domain_id必须NULL，原全局端口约束保留。升级前应离线备份，暂不支持原地降级。
+- 管理API允许UDP禁用草稿CRUD、现有设备配置快照同步及owner隔离；明确保留仅HTTP/HTTPS执行器启动门禁，禁止UDP直接enabled=true。管理Vue真实协议选择、隐藏域名、启动按钮禁用和明确草稿说明；Windows设备metadata接收UDP并校验TCP/UDP无域名，不自动应用。
+- 新真实升级测试使用精确旧1-10迁移文件和SQLx SHA384历史构造旧数据库、实际新服务启动迁移，核对旧映射、运行请求、流量、审计及设备版本全等、FK/integrity、API CRUD/owner/端口/域名/启用拒绝、设备修订及重启。管理CI强制执行独立udp-metadata.json四组；浏览器真实创建UDP草稿/禁用启动/删除，Windows已安装客户端真实后台同步TCP+UDP并显示草稿。原测试门禁保留。未实现管理自动启动UDP、Windows手工UDP运行/Unix私有store UDP、guard强制联接、QUIC或公网。下一轮先查新迁移和浏览器/Windows CI。未改main、未部署公网。
