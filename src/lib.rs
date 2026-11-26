@@ -3,6 +3,8 @@ pub mod certificates;
 pub mod gateway;
 #[cfg(unix)]
 pub mod unix_agent_store;
+#[cfg(unix)]
+pub mod unix_agent_process;
 use std::net::SocketAddr;
 
 const PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";

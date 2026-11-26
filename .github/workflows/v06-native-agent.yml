@@ -52,6 +52,7 @@ jobs:
       - name: Real native encrypted tunnel E2E with pinned engine
         env:
           LOCALTUNNEL_GATEWAY_E2E: '0'
+          LOCALTUNNEL_NATIVE_AGENT_PROCESS_E2E: '1'
         run: python3 tests/e2e.py
       - name: Require actual native tunnel evidence and pinned digests
         run: python3 tests/verify_native_tunnel_evidence.py test-results ${{ matrix.engine }}
@@ -65,7 +66,7 @@ jobs:
         run: |
           mkdir -p native-dist
           cp target/release/localtunnel native-dist/
-          (cd native-dist && shasum -a 256 localtunnel > SHA256SUMS)
+          (cd native-dist && shasum -a 256 localtunnel localtunnel-agent > SHA256SUMS)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: v06-native-cli-${{ matrix.os }}

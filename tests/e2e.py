@@ -196,6 +196,9 @@ def main():
                     if not all(pool.map(verify, pairs)):
                         raise RuntimeError("concurrent mappings returned incorrect data")
                 result["passed"].append("32 concurrent/interleaved HTTP requests across two mappings")
+                if os.environ.get("LOCALTUNNEL_NATIVE_AGENT_PROCESS_E2E") == "1":
+                    from unix_agent_process_e2e import exercise
+                    exercise(d,binary,CLI.resolve(),body,fixture.server_port,private,public,RESULTS,port,wait_for,get,terminate)
                 if os.environ.get("LOCALTUNNEL_GATEWAY_E2E") == "1":
                     from gateway_e2e import check_gateway
                     check_gateway(d, CLI, (b, c), (body, body2), port, result["passed"], RESULTS)

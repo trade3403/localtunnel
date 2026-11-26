@@ -14,7 +14,7 @@ type Result<T> = std::result::Result<T, &'static str>;
 extern "C" {
     fn geteuid() -> u32;
 }
-fn uid() -> u32 {
+pub(crate) fn uid() -> u32 {
     // POSIX uid_t is u32 on the supported Linux and macOS targets.
     unsafe { geteuid() }
 }
@@ -23,7 +23,7 @@ fn meta(path: &Path) -> Result<Metadata> {
     fs::symlink_metadata(path).map_err(|_| "agent store path unavailable")
 }
 
-fn trusted_path(path: &Path) -> Result<()> {
+pub(crate) fn trusted_path(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         return Err("agent store requires an absolute path");
     }
@@ -48,7 +48,7 @@ fn trusted_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn private_dir(root: &Path) -> Result<()> {
+pub(crate) fn private_dir(root: &Path) -> Result<()> {
     trusted_path(root)?;
     let m = meta(root)?;
     if m.uid() != uid() || m.mode() & 0o7777 != 0o700 {
