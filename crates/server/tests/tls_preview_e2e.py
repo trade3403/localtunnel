@@ -446,16 +446,121 @@ try:
                 supervisor=resident("tls_resident")
                 ready()
                 assert operator("--runtime-tls-resident",mid3,1,rp,"competing_resident","tls_gateway",gp,"expected_body",probe,"cert_v2").returncode!=0
-                for _ in range(2):
+                def owned_engines(bundle):
+                    children=set()
+                    for task in (Path("/proc")/str(supervisor.pid)/"task").iterdir():
+                        try:
+                            candidates=(task/"children").read_text().split()
+                        except FileNotFoundError:
+                            continue
+                        for child in candidates:
+                            try:
+                                proc=Path("/proc")/child
+                                if (proc/"exe").resolve()==engine.resolve() and str(bundle).encode() in (proc/"cmdline").read_bytes():
+                                    children.add(int(child))
+                            except FileNotFoundError:
+                                pass
+                    assert len(children)==2,"expected two live owned Noise engines"
+                    return children
+
+                def resource_sample(pid):
+                    proc=Path("/proc")/str(pid)
+                    fields=(proc/"stat").read_text().rsplit(")",1)[1].split()
+                    rss=next(int(line.split()[1]) for line in (proc/"status").read_text().splitlines()
+                             if line.startswith("VmRSS:"))
+                    return {"start_ticks":int(fields[19]),"rss_kib":rss,
+                            "fd_count":len(list((proc/"fd").iterdir()))}
+
+                for cycle in range(2):
+                    if cycle==1:
+                        expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
                     rid=start_run()
                     recovery_record(rid)
-                    assert (root/("tls_resident-"+rid)/"client.toml").is_file()
+                    active_bundle=root/("tls_resident-"+rid)
+                    assert (active_bundle/"client.toml").is_file()
+                    if cycle==1:
+                        # Five-minute real managed HTTPS soak with the same
+                        # request, supervisor, API, gateway and Noise engines.
+                        # Refresh the real TXT proof before the 300s expiry.
+                        engine_ids=owned_engines(active_bundle)
+                        tracked={"api":p.pid,"resident":supervisor.pid,
+                                 "gateway":processes[0].pid,
+                                 "engine_a":min(engine_ids),"engine_b":max(engine_ids)}
+                        assert len(set(tracked.values()))==5
+                        for _ in range(3):
+                            assert tls_request(gp,hostname,ca2)==(200,body)
+                        time.sleep(.5)
+                        initial={name:resource_sample(pid) for name,pid in tracked.items()}
+                        peaks={name:{key:sample[key] for key in ("rss_kib","fd_count")}
+                               for name,sample in initial.items()}
+                        timings=[]
+                        started=time.monotonic()
+                        first_update=None
+                        last_update=None
+                        renewals=0
+                        for index in range(150):
+                            tick=time.monotonic()
+                            assert supervisor.poll() is None and p.poll() is None
+                            assert all(proc.poll() is None for proc in processes)
+                            if index in (60,120):
+                                expect(call(base,"domains/verify","POST",admin,
+                                            {"domain_id":domain["id"]}),200)
+                                renewals+=1
+                            before=time.monotonic()
+                            assert tls_request(gp,hostname,ca2)==(200,body)
+                            timings.append((time.monotonic()-before)*1000)
+                            observed=expect(call(base,path+"/runtime",token=admin),200)
+                            current=observed["request"]
+                            assert current["request_id"]==rid and current["state"]=="running"
+                            assert current["mapping_revision"]==1 and observed["worker_recent"] is True
+                            if first_update is None:
+                                first_update=current["updated_at"]
+                            assert last_update is None or current["updated_at"]>=last_update
+                            last_update=current["updated_at"]
+                            if index%15==0 or index==149:
+                                assert owned_engines(active_bundle)==engine_ids
+                                for name,pid in tracked.items():
+                                    sample=resource_sample(pid)
+                                    assert sample["start_ticks"]==initial[name]["start_ticks"]
+                                    for key in ("rss_kib","fd_count"):
+                                        peaks[name][key]=max(peaks[name][key],sample[key])
+                            # No catch-up burst, hidden reconnect of the
+                            # tunnel engines, or retry of a failed transaction.
+                            time.sleep(max(0,2-(time.monotonic()-tick)))
+                        elapsed=time.monotonic()-started
+                        assert 299<=elapsed<=345 and len(timings)==150 and renewals==2
+                        assert last_update-first_update>=285,"worker heartbeat did not progress"
+                        assert owned_engines(active_bundle)==engine_ids
+                        settled={name:resource_sample(pid) for name,pid in tracked.items()}
+                        for name,sample in settled.items():
+                            assert sample["start_ticks"]==initial[name]["start_ticks"]
+                            assert sample["fd_count"]<=initial[name]["fd_count"]+12
+                            assert sample["rss_kib"]<=initial[name]["rss_kib"]+65536
+                        ordered=sorted(timings)
+                        # Only numerical resource measurements, never PID,
+                        # tokens, private paths, domains or response payloads.
+                        def public_samples(samples):
+                            return {name:{key:sample[key] for key in ("rss_kib","fd_count")}
+                                    for name,sample in samples.items()}
+                        report["https_soak_measurements"]={
+                            "seconds":round(elapsed,3),"verified_https_requests":len(timings),
+                            "verified_runtime_reads":150,"dns_proof_refreshes":renewals,
+                            "worker_timestamp_advance_seconds":last_update-first_update,
+                            "latency_ms":{"p50":round(ordered[74],3),
+                                          "p95":round(ordered[142],3),
+                                          "max":round(ordered[-1],3)},
+                            "baseline":public_samples(initial),"sampled_max":peaks,
+                            "settled":public_samples(settled),
+                        }
+                        report["real_https_five_minute_resident_soak_and_resource_bounds"]=True
                     expect(call(base,path+"/stop","POST",admin,{"request_id":rid}),202)
                     wait_state("stopped",rid)
                     closed_tunnel()
                     empty_gateway()
                     assert not (root/("tls_resident-"+rid)).exists()
                     assert supervisor.poll() is None
+                assert report["real_https_five_minute_resident_soak_and_resource_bounds"] is True
+                report["real_https_soak_clean_stop_and_listener_release"]=True
                 report["real_https_resident_multiple_start_stop"]=True
                 # Fail one direct engine child only after identifying the exact
                 # test executable and private per-request configuration.

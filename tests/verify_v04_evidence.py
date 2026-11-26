@@ -213,6 +213,8 @@ REQUIRED["management-v05"] = {
         "real_https_aggregate_log_quota_stops_and_recovers",
         "real_https_log_generation_isolation_after_quota_recovery",
         "real_https_noise_concurrent_bidirectional_payload_integrity",
+        "real_https_five_minute_resident_soak_and_resource_bounds",
+        "real_https_soak_clean_stop_and_listener_release",
     ],
     "protection.json": [
         "real_request_bounds_and_response_headers",

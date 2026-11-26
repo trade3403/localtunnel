@@ -367,3 +367,9 @@
 - 复用原有真实 DNS TXT 验证、管理导出、锁定 Rathole Noise 引擎与 Nginx HTTP/HTTPS 网关进程。每种协议4个并行工作者、4轮、16个独立真实连接；每个发送256KiB独立随机数据、接收后端回显并比较实际字节与SHA256。每种协议4MiB上传+4MiB下载，总16MiB双向有效载荷。HTTPS继续验证测试CA及主机名，不关闭TLS验证；测试后正常业务、错误Host或错误CA拒绝仍须成立。
 - 输出每种协议真实总耗时、已验证双向字节数、合计应用层有效吞吐Mbps及事务延迟p50/p95/max，要求16次成功、60秒内完成、网关和隧道子进程持续存活。该宽松完成门禁非生产SLA；不宣称链路峰值带宽、广域网或跨主机吞吐，不包含管理面认证性能。全部测量待CI。新增2项强制管理证据至88，旧86项不放宽。
 - Echo仅在隔离回环测试夹具中使用，无产品接口、依赖、阈值变更，不改main、不部署公网、未开启定时任务。下一步长时间稳定性专项。
+
+## V0.5 五分钟真实 HTTPS 常驻稳定性专项（待 CI）
+- 上一提交 `2917e747c8714e04a721e094268366a64a140dcd` 同SHA六项CI全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45742497250)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45742503754)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45742503864)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45742503765)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45742497100)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45742503820)。管理实际88项证据通过、HTTP/HTTPS双向有效载荷完整性专项完成；不捏造未读取的吞吐数值。
+- 在现有真实HTTPS常驻生命周期第二次运行中持续约300秒，150次实际TLS业务正文验证和150次已认证运行状态读取，每2秒一轮，不重试失败请求；在约120/240秒实际刷新DNS TXT证明，保留300秒有效期及全部原有安全策略。要求相同运行请求、版本、worker心跳前进，API/常驻监督器/Nginx/两Noise引擎进程存活，抽查PID启动时刻一致。
+- 记录实测时间、HTTPS事务延迟、五个进程RSS/FD基线、采样最大及结束值，不输出PID或凭据。每进程结束FD增量<=12、RSS增量<=64MiB，宽松CI回归门禁而非内存峰值或长时间无泄漏保证。完成后实际正常停止、双隧道监听关闭、HTTPS拒绝及bundle清理，保留旧的故障恢复与日志容量专项。新增2项强制管理证据至90。
+- 原管理CI约6分20秒，增加约5分钟保持现有20分钟上限；实际耗时待CI。不是24小时/7天老化、公网跨主机、证书到期或生产SLA验收。无产品代码、依赖、阈值变化，不改main、不部署公网、未开启定时任务。通过后进入V0.5阶段验收与后续明确未完成项。
