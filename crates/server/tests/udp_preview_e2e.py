@@ -183,6 +183,49 @@ try:
             state=call(base,route+"/runtime",200,token=admin)
             assert state["request"]["state"]=="stopped" and not state["worker_recent"]
             report["real_udp_api_stop_reaps_children_and_closes_ports"]=True
+            # One resident process handles independent requests with new credentials.
+            resident=[exe,"--runtime-udp-resident",str(root),mid,str(m["revision"]),str(relay),str(internal),"udp_res","4096","1200"]
+            p=subprocess.Popen(resident,env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            children.append(p)
+            def request_start():
+                queued=call(base,route+"/udp-start",202,"POST",admin,{"expected_revision":m["revision"]})
+                rid=queued["request_id"]
+                deadline=time.monotonic()+40
+                while time.monotonic()<deadline:
+                    assert p.poll() is None
+                    s=call(base,route+"/runtime",200,token=admin)
+                    if s["request"]["state"]=="running" and s["request"]["request_id"]==rid:
+                        assert s["worker_recent"] and exchange()
+                        return rid
+                    time.sleep(.25)
+                raise AssertionError("resident did not start")
+            def request_stop(rid):
+                call(base,route+"/stop",202,"POST",admin,{"request_id":rid})
+                deadline=time.monotonic()+15
+                while time.monotonic()<deadline:
+                    s=call(base,route+"/runtime",200,token=admin)
+                    if s["request"]["state"]=="stopped":
+                        assert p.poll() is None
+                        closed()
+                        return
+                    time.sleep(.25)
+                raise AssertionError("resident did not stop")
+            first=request_start()
+            request_stop(first)
+            second=request_start()
+            assert first!=second
+            first_dir=root/("udp_res-"+first)
+            second_dir=root/("udp_res-"+second)
+            assert first_dir.is_dir() and second_dir.is_dir()
+            assert (first_dir/"client.toml").read_bytes()!=(second_dir/"client.toml").read_bytes()
+            report["real_udp_resident_two_independent_requests"]=True
+            # Local emergency stop during active forwarding reaps children.
+            (root/("udp-worker-"+mid+".stop")).touch(mode=0o600)
+            assert p.wait(timeout=15)==0
+            closed()
+            assert call(base,route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
+            report["real_udp_resident_local_stop_reaps_children"]=True
+            (root/("udp-worker-"+mid+".stop")).unlink()
             p=launch("udp_second")
             assert exchange()
             call(base,"devices/"+device["id"]+"/revoke",204,"POST",admin)
@@ -203,4 +246,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==5 and all(v is True for v in report.values())
+assert len(report)==7 and all(v is True for v in report.values())

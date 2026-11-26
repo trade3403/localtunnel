@@ -77,6 +77,7 @@ REQUIRED = {
             "real_node_device_pairing_domain",
             "real_mapping_and_unverified_activation_denied",
             "real_edit_delete_and_domain_reference_guard",
+            "real_browser_udp_request_and_cancel",
             "real_gateway_traffic_visible_in_browser",
             "real_browser_start_stop_noise_gateway",
             "real_committed_audit_visible_in_browser",

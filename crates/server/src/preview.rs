@@ -618,7 +618,7 @@ fn udp_echo_probe(socket:&std::net::UdpSocket)->bool{
 /// binaries, keys, unused ports and an actual local UDP echo fixture.
 /// No automatic registration, no public bind, no HTTP activation state.
 pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str)->Result<()>{
-    supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,None,None).await
+    supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,None,None,None).await
 }
 
 /// The operator preselects the exact revision, ports and bounded byte budget.
@@ -640,12 +640,42 @@ pub async fn udp_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_p
         if Instant::now()>=deadline{return Err("no fresh UDP start request")}
         tokio::time::sleep(Duration::from_millis(250)).await;
     };
-    let result=supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,Some(&rid),Some((rate,burst))).await;
+    let result=supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,Some(&rid),Some((rate,burst)),None).await;
     crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
     result
 }
 
-async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str,rid:Option<&str>,limits:Option<(u32,u32)>)->Result<()>{
+/// Resident operator-fixed UDP worker. A distinct request gets a distinct
+/// private configuration directory and random tunnel token. Never adopt an
+/// unknown claimed request, even after a process restart.
+pub async fn udp_resident(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle_base:&str,rate:u32,burst:u32)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle_base)||bundle_base.len()>30||relay_port<30000||internal_port<30000||relay_port==internal_port
+        || !(1024..=240000).contains(&rate)||!(1200..=76800).contains(&burst){
+        return Err("invalid UDP resident parameters")
+    }
+    if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
+        return Err("invalid UDP mapping identity")
+    }
+    private_dir(root)?;
+    let _worker_lock=acquire_lock(root,"udp-worker",id)?;
+    let marker=root.join(format!("udp-worker-{id}.stop"));
+    loop{
+        if stop_requested(Some(&marker))?{return Ok(())}
+        match crate::runtime::resident_state(pool,id,revision,"udp").await?.as_deref(){
+            None|Some("stopped")|Some("queued")=>{},
+            _=>return Err("claimed or unknown UDP request requires local inspection"),
+        }
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{
+            let bundle=format!("{bundle_base}-{rid}");
+            let result=supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,&bundle,Some(&rid),Some((rate,burst)),Some(&marker)).await;
+            crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+            result?;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str,rid:Option<&str>,limits:Option<(u32,u32)>,resident_stop:Option<&Path>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(bundle)||relay_port<30000||internal_port<30000||relay_port==internal_port{
         return Err("invalid UDP preview parameters")
     }
@@ -719,7 +749,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
         let deadline=Instant::now()+Duration::from_secs(30);
         let mut ready=false;
         loop{
-            if stop_requested(Some(&stop_marker))?{return Ok(())}
+            if stop_requested(Some(&stop_marker))?||stop_requested(resident_stop)?{return Ok(())}
             if let Some(rid)=rid{
                 if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
             }
