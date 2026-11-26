@@ -7,6 +7,10 @@ mod preview;
 mod runtime;
 mod traffic;
 mod audit;
+mod protection;
+mod transport;
+#[cfg(target_os = "linux")]
+mod backup;
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use sqlx::{sqlite::{SqliteConnectOptions, SqlitePoolOptions}, SqlitePool};
@@ -29,6 +33,24 @@ async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn secure_sqlite_file(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    // The parent is private and trusted. Open without following links, then
+    // inspect and tighten the exact descriptor rather than chmod a pathname.
+    let file = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)?;
+    let m = file.metadata()?;
+    if !m.is_file() || m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe SQLite ownership or link count"));
+    }
+    if m.permissions().mode() & 0o7777 != 0o600 {
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn data_path(dir: &Path) -> io::Result<PathBuf> {
     let metadata = std::fs::symlink_metadata(dir)?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -41,6 +63,13 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "data directory must be private (0700)"));
         }
     }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "data directory must belong to runtime user"));
+        }
+    }
     let dir = dir.canonicalize()?;
     let path = dir.join("control.sqlite3");
     // Reject non-regular files and symlinks including SQLite sidecars.
@@ -49,7 +78,10 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
             Ok(m) if !m.is_file() || m.file_type().is_symlink() => {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsafe SQLite file"));
             }
-            Ok(_) => {}
+            Ok(_) => {
+                #[cfg(target_os = "linux")]
+                secure_sqlite_file(&dir.join(name))?;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -59,6 +91,29 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
 
 async fn run() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let backup_db = args.first().is_some_and(|a| a=="--backup-db");
+    let restore_db = args.first().is_some_and(|a| a=="--restore-db");
+    if backup_db || restore_db {
+        if args.len()!=3{return Err("usage: --backup-db <data-dir> <new-backup-dir> | --restore-db <backup-dir> <new-data-dir>".into())}
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(error) = backup::run(Path::new(&args[1]),Path::new(&args[2]),restore_db).await {
+                // Trusted local maintenance CLI only: expose fixed admission
+                // reasons, never raw SQL, paths, credentials or OS errors.
+                match error.to_string().as_str() {
+                    "source budget exceeded" => eprintln!("source budget exceeded"),
+                    "unsafe or oversized database file" => eprintln!("unsafe or oversized database file"),
+                    "destination or sidecar already exists" => eprintln!("destination or sidecar already exists"),
+                    _ => {}
+                }
+                return Err(error);
+            }
+            println!("verified database snapshot published");
+            return Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        return Err("database snapshot maintenance is Linux-only".into());
+    }
     let init = args.first().is_some_and(|a| a=="--init-admin");
     let add_node = args.first().is_some_and(|a| a=="--add-node");
     let set_node = args.first().is_some_and(|a| a=="--set-node-enabled");
@@ -73,14 +128,20 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let tls_resident = args.first().is_some_and(|a| a=="--runtime-tls-resident");
     let recover = args.first().is_some_and(|a| a=="--recover-runtime");
     let prune_history = args.first().is_some_and(|a| a=="--prune-history");
-    let expected = if prune_history {2} else if recover {4} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
+    let prune_logs = args.first().is_some_and(|a| a=="--prune-gateway-logs");
+    let expected = if prune_logs {3} else if prune_history {2} else if recover {4} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir>".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
     }
-    let operator = init || add_node || set_node || export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history;
+    let operator = init || add_node || set_node || export || gateway || supervise || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
+    if prune_logs{
+        let count=preview::prune_gateway_logs(&root,args[2].to_str().ok_or("invalid prefix")?)?;
+        println!("removed {count} expired numeric gateway logs");
+        return Ok(())
+    }
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .acquire_timeout(Duration::from_secs(3))
@@ -154,17 +215,25 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .merge(runtime::routes(pool.clone()))
         .merge(traffic::routes(pool.clone()))
         .merge(audit::routes(pool.clone()))
-        .merge(domains::routes(pool).map_err(|_|"invalid DNS resolver configuration")?);
+        .merge(domains::routes(pool).map_err(|_|"invalid DNS resolver configuration")?)
+        .layer(axum::middleware::from_fn_with_state(protection::Limits::new(), protection::protect));
     // No configurable public bind or unauthenticated data API in this increment.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     println!("LISTENING {}", listener.local_addr()?);
     io::stdout().flush()?;
-    axum::serve(listener, app).await?;
+    transport::serve(listener, app).await?;
     Ok(())
 }
 
+fn main() {
+    // Set the process mask before creating runtime threads or SQLite files.
+    #[cfg(target_os = "linux")]
+    unsafe { libc::umask(0o077); }
+    entry();
+}
+
 #[tokio::main]
-async fn main() {
+async fn entry() {
     if run().await.is_err() {
         // Do not print SQL, filesystem paths, or future credentials.
         eprintln!("LocalTunnel management server failed to initialize or serve");

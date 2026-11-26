@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import http.server
+from tunnel_load_fixture import EchoFixture, transfer
 import re
 import socket
 import time
@@ -159,7 +160,7 @@ try:
             db_path=root/"control.sqlite3"
             body=secrets.token_hex(24).encode()
             probe_requests=[]
-            class Web(http.server.BaseHTTPRequestHandler):
+            class Web(EchoFixture, http.server.BaseHTTPRequestHandler):
                 def do_GET(self):
                     probe_requests.append(self.headers.get("Host"))
                     self.send_response(200)
@@ -276,6 +277,10 @@ try:
             await_body(gp,"preview.example.test",(200,body),processes)
             backup.unlink()
             report["actual_gateway_apply_and_failed_apply_preserves_live_route"]=True
+            report["http_tunnel_measurements"]=transfer(gp,"preview.example.test",processes)
+            assert request(gp,"preview.example.test")== (200,body)
+            assert request(gp,"wrong.example.test")[0]==421
+            report["real_http_noise_concurrent_bidirectional_payload_integrity"]=True
             p,base=launch(root)
             try:
                 expect(call(base,"devices/"+device["id"]+"/revoke","POST",admin),204)
@@ -506,6 +511,54 @@ try:
                 assert (root/("crash_bundle-"+rid)).is_dir()
                 assert operator("--recover-runtime","gateway",rid).returncode!=0
                 report["real_supervisor_sigkill_parent_death_and_verified_local_recovery"]=True
+                # Real gateway lifecycle with a controlled sparse quota
+                # fixture. No external traffic or fake runtime state.
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"quota_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                rid=queued["request_id"]
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                wait_state("running")
+                assert operator("--prune-gateway-logs","gateway").returncode!=0
+                cfg=(prefix/"nginx.conf").read_text()
+                name=re.search(r"access_log (traffic-[0-9]+-[0-9]+\.log) lt_traffic;",cfg).group(1)
+                active_log=prefix/name
+                assert active_log.is_file() and active_log.stat().st_size>0
+                with active_log.open("r+b") as log:
+                    log.truncate(4*1024*1024+1)
+                assert supervisor.wait(timeout=40)!=0
+                assert wait_state("failed_or_unknown")["request_id"]==rid
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                assert active_log.stat().st_size>=4*1024*1024+1
+                assert (root/("quota_bundle-"+rid)).is_dir()
+                assert operator("--recover-runtime","gateway",rid).returncode==0
+                wait_state("stopped")
+                report["real_gateway_log_budget_stops_and_preserves_evidence"]=True
+                # Explicit retention pruning refuses a running Nginx even
+                # after the mapping is stopped and the gateway is empty.
+                assert operator("--prune-gateway-logs","gateway").returncode!=0
+                assert active_log.exists()
+                nginx_process=processes[-1]
+                stop(nginx_process)
+                processes.pop()
+                assert nginx_process.poll() is not None
+                assert not (prefix/"nginx.pid").exists()
+                old=time.time()-8*24*3600
+                os.utime(active_log,(old,old))
+                recent=prefix/"traffic-1-1.log"
+                recent.write_bytes(b"1 2 200\n")
+                unrelated=prefix/"unrelated.log"
+                unrelated.write_bytes(b"keep")
+                unsafe=prefix/"traffic-2-2.log"
+                unsafe.symlink_to(unrelated)
+                assert operator("--prune-gateway-logs","gateway").returncode!=0
+                assert active_log.exists() and unrelated.read_bytes()==b"keep"
+                unsafe.unlink()
+                assert operator("--prune-gateway-logs","gateway").returncode==0
+                assert not active_log.exists() and recent.read_bytes()==b"1 2 200\n"
+                assert unrelated.read_bytes()==b"keep"
+                assert (root/("quota_bundle-"+rid)).is_dir()
+                report["offline_gateway_log_retention_preserves_recent_and_unrelated"]=True
             finally:
                 # Test failure cleanup: revoke before waiting so that the
                 # supervisor gets the opportunity to stop its own children.

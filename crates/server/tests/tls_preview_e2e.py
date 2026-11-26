@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import http.server
+from tunnel_load_fixture import EchoFixture, transfer
 import re
 import socket
 import ssl
@@ -178,7 +179,7 @@ try:
             body=secrets.token_hex(24).encode()
             hostname="secure.example.test"
             probe_requests=[]
-            class Web(http.server.BaseHTTPRequestHandler):
+            class Web(EchoFixture, http.server.BaseHTTPRequestHandler):
                 def do_GET(self):
                     probe_requests.append(self.headers.get("Host"))
                     self.send_response(200)
@@ -276,6 +277,10 @@ try:
             rejects(gp,"wrong.example.test",ca)
             assert tls_request(gp,"wrong.example.test",ca,sni=hostname)[0]==421
             report["real_tls_certificate_and_noise_http_body"]=True
+            report["https_tunnel_measurements"]=transfer(gp,hostname,processes,ca)
+            assert tls_request(gp,hostname,ca)==(200,body)
+            rejects(gp,hostname,wrongca)
+            report["real_https_noise_concurrent_bidirectional_payload_integrity"]=True
             old=(prefix/"nginx.conf").read_bytes()
             expected.write_bytes(b"wrong expected response")
             prior=len(probe_requests)
@@ -441,16 +446,121 @@ try:
                 supervisor=resident("tls_resident")
                 ready()
                 assert operator("--runtime-tls-resident",mid3,1,rp,"competing_resident","tls_gateway",gp,"expected_body",probe,"cert_v2").returncode!=0
-                for _ in range(2):
+                def owned_engines(bundle):
+                    children=set()
+                    for task in (Path("/proc")/str(supervisor.pid)/"task").iterdir():
+                        try:
+                            candidates=(task/"children").read_text().split()
+                        except FileNotFoundError:
+                            continue
+                        for child in candidates:
+                            try:
+                                proc=Path("/proc")/child
+                                if (proc/"exe").resolve()==engine.resolve() and str(bundle).encode() in (proc/"cmdline").read_bytes():
+                                    children.add(int(child))
+                            except FileNotFoundError:
+                                pass
+                    assert len(children)==2,"expected two live owned Noise engines"
+                    return children
+
+                def resource_sample(pid):
+                    proc=Path("/proc")/str(pid)
+                    fields=(proc/"stat").read_text().rsplit(")",1)[1].split()
+                    rss=next(int(line.split()[1]) for line in (proc/"status").read_text().splitlines()
+                             if line.startswith("VmRSS:"))
+                    return {"start_ticks":int(fields[19]),"rss_kib":rss,
+                            "fd_count":len(list((proc/"fd").iterdir()))}
+
+                for cycle in range(2):
+                    if cycle==1:
+                        expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
                     rid=start_run()
                     recovery_record(rid)
-                    assert (root/("tls_resident-"+rid)/"client.toml").is_file()
+                    active_bundle=root/("tls_resident-"+rid)
+                    assert (active_bundle/"client.toml").is_file()
+                    if cycle==1:
+                        # Five-minute real managed HTTPS soak with the same
+                        # request, supervisor, API, gateway and Noise engines.
+                        # Refresh the real TXT proof before the 300s expiry.
+                        engine_ids=owned_engines(active_bundle)
+                        tracked={"api":p.pid,"resident":supervisor.pid,
+                                 "gateway":processes[0].pid,
+                                 "engine_a":min(engine_ids),"engine_b":max(engine_ids)}
+                        assert len(set(tracked.values()))==5
+                        for _ in range(3):
+                            assert tls_request(gp,hostname,ca2)==(200,body)
+                        time.sleep(.5)
+                        initial={name:resource_sample(pid) for name,pid in tracked.items()}
+                        peaks={name:{key:sample[key] for key in ("rss_kib","fd_count")}
+                               for name,sample in initial.items()}
+                        timings=[]
+                        started=time.monotonic()
+                        first_update=None
+                        last_update=None
+                        renewals=0
+                        for index in range(150):
+                            tick=time.monotonic()
+                            assert supervisor.poll() is None and p.poll() is None
+                            assert all(proc.poll() is None for proc in processes)
+                            if index in (60,120):
+                                expect(call(base,"domains/verify","POST",admin,
+                                            {"domain_id":domain["id"]}),200)
+                                renewals+=1
+                            before=time.monotonic()
+                            assert tls_request(gp,hostname,ca2)==(200,body)
+                            timings.append((time.monotonic()-before)*1000)
+                            observed=expect(call(base,path+"/runtime",token=admin),200)
+                            current=observed["request"]
+                            assert current["request_id"]==rid and current["state"]=="running"
+                            assert current["mapping_revision"]==1 and observed["worker_recent"] is True
+                            if first_update is None:
+                                first_update=current["updated_at"]
+                            assert last_update is None or current["updated_at"]>=last_update
+                            last_update=current["updated_at"]
+                            if index%15==0 or index==149:
+                                assert owned_engines(active_bundle)==engine_ids
+                                for name,pid in tracked.items():
+                                    sample=resource_sample(pid)
+                                    assert sample["start_ticks"]==initial[name]["start_ticks"]
+                                    for key in ("rss_kib","fd_count"):
+                                        peaks[name][key]=max(peaks[name][key],sample[key])
+                            # No catch-up burst, hidden reconnect of the
+                            # tunnel engines, or retry of a failed transaction.
+                            time.sleep(max(0,2-(time.monotonic()-tick)))
+                        elapsed=time.monotonic()-started
+                        assert 299<=elapsed<=345 and len(timings)==150 and renewals==2
+                        assert last_update-first_update>=285,"worker heartbeat did not progress"
+                        assert owned_engines(active_bundle)==engine_ids
+                        settled={name:resource_sample(pid) for name,pid in tracked.items()}
+                        for name,sample in settled.items():
+                            assert sample["start_ticks"]==initial[name]["start_ticks"]
+                            assert sample["fd_count"]<=initial[name]["fd_count"]+12
+                            assert sample["rss_kib"]<=initial[name]["rss_kib"]+65536
+                        ordered=sorted(timings)
+                        # Only numerical resource measurements, never PID,
+                        # tokens, private paths, domains or response payloads.
+                        def public_samples(samples):
+                            return {name:{key:sample[key] for key in ("rss_kib","fd_count")}
+                                    for name,sample in samples.items()}
+                        report["https_soak_measurements"]={
+                            "seconds":round(elapsed,3),"verified_https_requests":len(timings),
+                            "verified_runtime_reads":150,"dns_proof_refreshes":renewals,
+                            "worker_timestamp_advance_seconds":last_update-first_update,
+                            "latency_ms":{"p50":round(ordered[74],3),
+                                          "p95":round(ordered[142],3),
+                                          "max":round(ordered[-1],3)},
+                            "baseline":public_samples(initial),"sampled_max":peaks,
+                            "settled":public_samples(settled),
+                        }
+                        report["real_https_five_minute_resident_soak_and_resource_bounds"]=True
                     expect(call(base,path+"/stop","POST",admin,{"request_id":rid}),202)
                     wait_state("stopped",rid)
                     closed_tunnel()
                     empty_gateway()
                     assert not (root/("tls_resident-"+rid)).exists()
                     assert supervisor.poll() is None
+                assert report["real_https_five_minute_resident_soak_and_resource_bounds"] is True
+                report["real_https_soak_clean_stop_and_listener_release"]=True
                 report["real_https_resident_multiple_start_stop"]=True
                 # Fail one direct engine child only after identifying the exact
                 # test executable and private per-request configuration.
@@ -534,6 +644,116 @@ try:
                 assert not (root/("tls_recovered-"+fresh)).exists()
                 marker.unlink()
                 report["real_https_restart_after_recovery_and_local_stop"]=True
+
+                # Boundary inventory fixtures are sparse local files only.
+                # Actual admission, TLS traffic, stop and recovery use the
+                # existing real API, supervisor, Noise and Nginx.
+                mib=1024*1024
+                def logs():
+                    return {p.name:p.stat().st_size for p in prefix.iterdir()
+                            if re.fullmatch(r"traffic-[0-9]+-[0-9]+\.log",p.name)}
+                baseline=logs()
+                assert 0<len(baseline)<31 and 0<sum(baseline.values())<mib
+                def fillers(count,size):
+                    paths=[]
+                    for i in range(count):
+                        p=prefix/("traffic-0-"+str(10000+i)+".log")
+                        with p.open("xb") as out:
+                            out.truncate(size)
+                        paths.append(p)
+                    return paths
+                def rejected_start(bundle):
+                    global supervisor
+                    expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                    supervisor=resident(bundle)
+                    ready()
+                    before=logs()
+                    failed=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)["request_id"]
+                    assert supervisor.wait(timeout=40)!=0
+                    wait_state("failed_or_unknown",failed)
+                    recovery_record(failed)
+                    assert not (root/(bundle+"-"+failed)).exists()
+                    closed_tunnel()
+                    empty_gateway()
+                    assert logs()==before,"admission changed retained log generations"
+                    assert operator("--recover-runtime","tls_gateway",failed).returncode==0
+                    wait_state("stopped",failed)
+                    return failed
+
+                # Exactly 32 existing logs is within the runtime cap, but
+                # cannot reserve a new generation. No tunnel may start.
+                fill=fillers(32-len(baseline),0)
+                assert len(logs())==32
+                rejected_start("tls_count_quota")
+                for fixture_log in fill:fixture_log.unlink()
+                assert logs()==baseline
+                report["real_https_log_count_reservation_rejected"]=True
+
+                # Seven individually valid 4MiB files plus the actual
+                # existing logs exceed the 28MiB startup reservation only.
+                fill=fillers(7,4*mib)
+                assert 28*mib<sum(logs().values())<32*mib
+                assert len(logs())<32
+                rejected_start("tls_size_quota")
+                for fixture_log in fill:fixture_log.unlink()
+                assert logs()==baseline
+                report["real_https_log_byte_reservation_rejected"]=True
+
+                # Admit a real generation just below the reserved budget;
+                # then grow several retained fixtures without exceeding the
+                # per-file cap. Only aggregate quota is violated.
+                fill=fillers(6,4*mib)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=resident("tls_total_quota")
+                ready()
+                rid=start_run()
+                first=logs()
+                new=set(first)-set(baseline)-{p.name for p in fill}
+                assert len(new)==1
+                first_name=new.pop()
+                assert first[first_name]>0
+                assert all(first[k]==v for k,v in baseline.items())
+                added=[]
+                for i in range(3):
+                    fixture_log=prefix/("traffic-0-"+str(20000+i)+".log")
+                    with fixture_log.open("xb") as out:
+                        out.truncate(4*mib)
+                    added.append(fixture_log)
+                exceeded=logs()
+                assert sum(exceeded.values())>32*mib and max(exceeded.values())<=4*mib
+                assert len(exceeded)<=32
+                assert supervisor.wait(timeout=40)!=0
+                wait_state("failed_or_unknown",rid)
+                closed_tunnel()
+                empty_gateway()
+                assert (root/("tls_total_quota-"+rid)).is_dir()
+                assert set(exceeded)<=set(logs())
+                assert operator("--recover-runtime","tls_gateway",rid).returncode==0
+                wait_state("stopped",rid)
+                for fixture_log in fill+added:fixture_log.unlink()
+                report["real_https_aggregate_log_quota_stops_and_recovers"]=True
+
+                # Re-admission after removing only test-created fixtures
+                # must produce a new numeric log, not reuse old generation.
+                retained=logs()
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                supervisor=resident("tls_quota_recovered")
+                ready()
+                next_id=start_run()
+                assert next_id!=rid
+                current=logs()
+                generated=set(current)-set(retained)
+                assert len(generated)==1 and first_name not in generated
+                assert current[next(iter(generated))]>0
+                assert all(current[k]==v for k,v in retained.items())
+                marker.touch(mode=0o600)
+                assert supervisor.wait(timeout=40)==0
+                wait_state("stopped",next_id)
+                closed_tunnel()
+                empty_gateway()
+                marker.unlink()
+                assert (root/("tls_total_quota-"+rid)).is_dir()
+                report["real_https_log_generation_isolation_after_quota_recovery"]=True
             finally:
                 if supervisor is not None and supervisor.poll() is None:
                     try:

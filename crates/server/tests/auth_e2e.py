@@ -88,6 +88,19 @@ try:
             assert call(base,"me")[0]==401
             assert call(base,"me",token="a"*64)[0]==401
             assert call(base,"logout","POST")[0]==401
+            # Even valid credentials must not reach login from a disallowed
+            # browser origin. Native bearer clients remain supported.
+            req=urllib.request.Request(base+"/api/v1/auth/login",method="POST",
+                headers={"Content-Type":"application/json","Origin":"https://external.example.test"},
+                data=json.dumps({"username":"operator","password":password}).encode())
+            try:
+                with urllib.request.urlopen(req,timeout=10):
+                    raise AssertionError("foreign origin login unexpectedly succeeded")
+            except urllib.error.HTTPError as e:
+                assert e.code==403 and e.read()==b"invalid local request origin"
+            with sqlite3.connect(db_path) as db:
+                assert db.execute("SELECT count(*) FROM admin_sessions").fetchone()==(0,)
+            report["foreign_origin_valid_login_no_session"]=True
             wrong=login(base,pw=secrets.token_hex(24))
             unknown=login(base,user="unknown")
             ordinary=login(base,user="ordinary")
@@ -135,6 +148,25 @@ try:
                 assert login(base,pw=secrets.token_hex(24))[0]==401
             assert login(base)[0]==429
             report["restart_and_bounded_login"]=True
+        finally:
+            stop(p)
+        # A separately launched process has a fresh existing login budget.
+        # Corrupt the PHC in this private fixture, never a production database.
+        p,base=launch(root)
+        try:
+            for invalid in (phc.replace("m=19456","m=1048576"),
+                            phc.replace("t=2","t=1000"),
+                            phc.replace("p=1","p=64"),
+                            phc.replace("argon2id","argon2i")):
+                with sqlite3.connect(db_path) as db:
+                    db.execute("UPDATE users SET password_hash=? WHERE id=?",(invalid,uid))
+                assert login(base)[0]==401
+                assert call(base,"me",token=persisted)[0]==401
+            with sqlite3.connect(db_path) as db:
+                db.execute("UPDATE users SET password_hash=? WHERE id=?",(phc,uid))
+            fresh=token_from(login(base))
+            assert call(base,"me",token=fresh)[0]==200
+            report["unsupported_stored_argon2_parameters_rejected"]=True
         finally:
             stop(p)
 finally:

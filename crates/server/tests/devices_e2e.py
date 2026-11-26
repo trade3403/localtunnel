@@ -154,6 +154,46 @@ try:
                 stored=db.execute("SELECT credential_digest FROM devices WHERE id=?",(device_id,)).fetchone()[0]
                 assert stored!=hashlib.sha256(token.encode()).digest()
             report["restart_and_revocation"]=True
+            # Seed only the bulk inventory in SQLite; every boundary request,
+            # pairing, authorization and revocation below uses actual HTTP.
+            with sqlite3.connect(db_path) as db:
+                for _ in range(63):
+                    db.execute("INSERT INTO devices(id,owner_id,name,credential_digest) VALUES (?,?,?,?)",
+                               (secrets.token_hex(16),owner,"quota fixture",secrets.token_bytes(32)))
+            last=expect(enroll(base,issue(base,admin)),201)
+            pending=issue(base,admin)
+            expect(enroll(base,pending),409)
+            with sqlite3.connect(db_path) as db:
+                assert db.execute("SELECT count(*) FROM devices WHERE owner_id=? AND enabled=1",(owner,)).fetchone()==(64,)
+                assert db.execute("SELECT code_digest FROM device_pairings WHERE owner_id=?",(owner,)).fetchone()==(hashlib.sha256(pending.encode()).digest(),)
+                before=db.execute("SELECT count(*) FROM devices WHERE owner_id=?",(owner,)).fetchone()[0]
+                assert before==65
+            expect(call(base,"devices/"+last["id"]+"/revoke","POST",admin),204)
+            replacement=expect(enroll(base,pending),201)
+            expect(call(base,"devices/"+last["id"]+"/identity",token=last["device_token"]),401)
+            expect(call(base,"devices/"+replacement["id"]+"/identity",token=replacement["device_token"]),200)
+            report["active_device_quota_transaction_and_pairing_retry"]=True
+            # Free an active slot, then fill the independent retained-row
+            # quota with revoked fixtures; an owner cannot grow the database
+            # without bound by repeatedly enrolling and revoking.
+            expect(call(base,"devices/"+replacement["id"]+"/revoke","POST",admin),204)
+            with sqlite3.connect(db_path) as db:
+                for _ in range(190):
+                    db.execute("INSERT INTO devices(id,owner_id,name,credential_digest,enabled) VALUES (?,?,?,?,0)",
+                               (secrets.token_hex(16),owner,"revoked quota fixture",secrets.token_bytes(32)))
+                assert db.execute("SELECT count(*) FROM devices WHERE owner_id=?",(owner,)).fetchone()==(256,)
+                assert db.execute("SELECT count(*) FROM devices WHERE owner_id=? AND enabled=1",(owner,)).fetchone()==(63,)
+            pending=issue(base,admin)
+            # Concurrent attempts must not consume a code or exceed the cap.
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results=list(pool.map(lambda _:enroll(base,pending),range(2)))
+            assert [r[0] for r in results]==[409,409]
+            other_device=expect(enroll(base,issue(base,other)),201)
+            assert expect(call(base,"devices",token=other),200)[0]["id"]==other_device["id"]
+            with sqlite3.connect(db_path) as db:
+                assert db.execute("SELECT count(*) FROM devices WHERE owner_id=?",(owner,)).fetchone()==(256,)
+                assert db.execute("SELECT code_digest FROM device_pairings WHERE owner_id=?",(owner,)).fetchone()==(hashlib.sha256(pending.encode()).digest(),)
+            report["retained_device_quota_concurrent_and_owner_isolated"]=True
         finally:
             stop(p)
 finally:

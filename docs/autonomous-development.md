@@ -301,3 +301,80 @@
 ## 2026-11-26：HTTPS 常驻恢复全绿、V0.4 最终验收门禁
 - HEAD d21c0443aeae221172eb5a1e6eb5ef5dcd1050ab 六CI全绿：Management #57 https://github.com/trade3403/localtunnel/actions/runs/45660656427 、#58 https://github.com/trade3403/localtunnel/actions/runs/45660672583 ，Windows #128 https://github.com/trade3403/localtunnel/actions/runs/45660672597 ，Gateway #122、Runner #253/#254。#58 job 139369338718 真实HTTPS故障恢复与全部管理/浏览器回归成功，证据 https://github.com/trade3403/localtunnel/actions/runs/45660672583/artifacts/15045291519 ；Windows job 139369339289 全部真实安装GUI/SCM/Noise回归通过，报告 https://github.com/trade3403/localtunnel/actions/runs/45660672597/artifacts/15046540966 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45660672597/artifacts/15045697127 。
 - 更新README现状与入口，新增docs/v0.4-acceptance.md 记录实测SHA、可复现操作入口、明确回环与生产边界、V0.5优先项。新增 tests/verify_v04_evidence.py 及两个CI步骤，在真实测试成功后严格核对管理9份报告54个字段、桌面4份报告88个字段；拒绝缺失/非true/重复字段，并有验证器负例单测。未改变产品运行逻辑、依赖及原测试门禁。最终证据门禁待新CI；全部通过后进入V0.5资源上限与限流。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.4 最终验收全绿，V0.5 资源保护第一批
+- V0.4 HEAD d6440ab87c7f9b782ef32a3689d32719935124d0 六CI全部成功：Management #59 https://github.com/trade3403/localtunnel/actions/runs/45664984037 、#60 https://github.com/trade3403/localtunnel/actions/runs/45664993154 ，Windows #129 https://github.com/trade3403/localtunnel/actions/runs/45664993096 ，Gateway #123、Runner #255/#256。管理job 139384634049 与桌面job 139384634216 的54/88项证据门禁均成功；报告 https://github.com/trade3403/localtunnel/actions/runs/45664993154/artifacts/15045534976 、https://github.com/trade3403/localtunnel/actions/runs/45664993096/artifacts/15047221649 ，未签名安装包 https://github.com/trade3403/localtunnel/actions/runs/45664993096/artifacts/15048435188 。
+- 新叠加分支 feat/v0.5-security-stability，第一批 Axum 全局固定内存令牌桶120/s、突发240、32并发无队列、12秒处理期限、URI/header/声明body边界、统一安全响应头；原业务限流不变。真实慢body/并发/期限/突发429/恢复测试及确定性单测，显式启用已锁定Tokio time feature，无新版本/依赖。仅应用层，不保证连接级/全局公平/公网DoS或超时写入撤销。待CI，下一步连接级保护及配额。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 资源保护测试修复
+- HEAD 80bc16c6533cb4534a0fa1cb35ee911d250b7939 正式分支 push 两项结束：Runner #257 https://github.com/trade3403/localtunnel/actions/runs/45667046953 成功，Management #61 https://github.com/trade3403/localtunnel/actions/runs/45667046956 失败。job 139391901278 实际 Rust 编译/单测和基础 HTTP/SQLite 成功；protection_e2e.py:17 TypeError HTTPConnection object does not support context manager protocol，业务断言尚未执行。
+- 修复两处 HTTPConnection 生命周期为 contextlib.closing，逐个保存慢连接确保失败清理；管理证据门禁在旧54项基础上新增4项及负例测试。产品限制、依赖及原验收断言不改。恢复全量 CI，建立叠加草稿PR；新版本待CI，不提前开发连接级保护。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 应用层资源保护全绿、连接层保护
+- HEAD 70572a88b201fe902f47c6065501cdd779e7bbeb 六CI全绿：Management #62 https://github.com/trade3403/localtunnel/actions/runs/45668971892 、#63 https://github.com/trade3403/localtunnel/actions/runs/45668997835 ，Windows #130 https://github.com/trade3403/localtunnel/actions/runs/45668997849 ，Gateway #124、Runner #258/#259。#63 job 139398818597 实际资源保护/期限/突发限流及58项管理证据通过，报告 https://github.com/trade3403/localtunnel/actions/runs/45668997835/artifacts/15047694882 ；Windows报告 https://github.com/trade3403/localtunnel/actions/runs/45668997849/artifacts/15048449875 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45668997849/artifacts/15049586499 。草稿PR #7 叠加在V0.4。
+- 用Hyper HTTP/1显式连接驱动保留Axum路由，64已接纳socket任务、超额立即关闭、5秒完整头期限、32KiB读缓冲、120秒连接总寿命，原业务保护不变。复用锁中hyper/hyper-util直接引用，无新版本。真实头部滴流、空闲keepalive、超额/已接纳真实HTTP/恢复专项，四项证据门禁新增至62。未单独测120秒总寿命及慢响应，非公网/内核DoS保障；待CI再做认证/设备配额。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 连接层全绿、认证与设备安全配额
+- HEAD d1661874f2d6ea6e59637422a422fd26a5fa20ca 六CI全绿：Management #64 https://github.com/trade3403/localtunnel/actions/runs/45671114563 、#65 https://github.com/trade3403/localtunnel/actions/runs/45671124678 ，Windows #131 https://github.com/trade3403/localtunnel/actions/runs/45671124765 ，Gateway #125、Runner #260/#261。#65 job 139406361748 真实传输/资源/62项证据全过，报告 https://github.com/trade3403/localtunnel/actions/runs/45671124678/artifacts/15049528445 ，Windows报告 https://github.com/trade3403/localtunnel/actions/runs/45671124765/artifacts/15050308013 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45671124765/artifacts/15050248031 。
+- 严格验证存储Argon2id PHC工作因子/版本/摘要长度后才校验；注册同一写事务限制每owner 64启用/256总设备含吊销，409回滚保留配对、不写成功事件，吊销释放启用额度不释放总额度。真实HTTP边界/并发/隔离/PHC异常恢复及三项证据门禁至65。无依赖/迁移变化。阈值为预览默认值，既有超额不主动删/禁用，安全归档功能未来补齐。待CI再做访问控制与密钥安全；未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 认证配额全绿、回环访问与凭据文件保护
+- HEAD caaeea3e50fe55183a9f433f856b324ca7ce64a8 六CI全绿：Management #66 https://github.com/trade3403/localtunnel/actions/runs/45675256416 、#67 https://github.com/trade3403/localtunnel/actions/runs/45675268208 ，Windows #132 https://github.com/trade3403/localtunnel/actions/runs/45675268035 ，Gateway #126、Runner #262/#263。#67 job 139420992157 实际认证/注册/65项证据全过，报告 https://github.com/trade3403/localtunnel/actions/runs/45675268208/artifacts/15051851324 ，Windows报告 https://github.com/trade3403/localtunnel/actions/runs/45675268035/artifacts/15051443066 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45675268035/artifacts/15052931517 。
+- 管理API本机Host/Origin/Fetch-Site及重复头门禁，固定Vite同源兼容、原Bearer与所属限制不变；Linux进程启动umask077、目录有效UID、主库及附属文件FD所有权/普通文件/单硬链接校验与0600兼容收紧。新增真实来源/合法密码跨来源无会话、SQLite权限/硬链接测试及3项证据至68。未新增依赖/迁移，仍信任私有父路径/本机原生程序边界，非生产TLS/密钥轮换/Windows ACL新增保障。待CI再做日志轮转/磁盘配额。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 访问边界全绿、日志预算与离线保留期维护
+- HEAD 3b1dd35f82ea961056d38b1d07dde6e24becfae3 六CI全绿：Management #68 https://github.com/trade3403/localtunnel/actions/runs/45679320799 、#69 https://github.com/trade3403/localtunnel/actions/runs/45679329341 ，Windows #133 https://github.com/trade3403/localtunnel/actions/runs/45679329307 ，Gateway #127、Runner #264/#265。#69 job 139435330256 真实访问边界/SQLite/浏览器及68项证据全过，报告 https://github.com/trade3403/localtunnel/actions/runs/45679329341/artifacts/15051799436 ，Windows报告 https://github.com/trade3403/localtunnel/actions/runs/45679329307/artifacts/15054526203 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45679329307/artifacts/15053528169 。
+- 监督器日志软预算4MiB/文件、32文件/32MiB、512目录扫描、启动预留/运行超限实际停止清空并留证；可信离线显式7日维护双guard/空配置/无pid和标记/端口关闭、仅精确同UID单链接数值日志。实际HTTP超限/故障恢复/拒绝活动维护/离线保留与符号链接拒绝专项及2项证据至70。非硬配额、非在线无损轮转、非全盘保障；未新增依赖/迁移。待CI后补总量/代际边界测试，再推进备份恢复。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 日志预算全绿、HTTPS 总量与代际边界专项
+- HEAD 00da3bbcc5ad6d57556aa888a6079dcd63b77b7a 六CI全绿：Management #70 https://github.com/trade3403/localtunnel/actions/runs/45681195755 、#71 https://github.com/trade3403/localtunnel/actions/runs/45681206479 ，Windows #134 https://github.com/trade3403/localtunnel/actions/runs/45681206422 ，Gateway #128、Runner #266/#267。#71 job 139441902379 真实HTTP日志预算/离线清理/HTTPS回归及70项证据通过，报告 https://github.com/trade3403/localtunnel/actions/runs/45681206479/artifacts/15053582821 ，Windows报告 https://github.com/trade3403/localtunnel/actions/runs/45681206422/artifacts/15055700737 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45681206422/artifacts/15055551106 。
+- 新增真实HTTPS运行专项：32文件/28MiB新代际预留拒绝、仅32MiB总量超限的真实停止及显式恢复、重新启动独立日志代际和旧文件保留。测试自造稀疏库存，不伪称真实大流量；4项门禁至74，无产品/依赖改动。待CI后进入数据库备份与恢复。仍非全盘硬配额/在线无损轮转。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 日志边界与并发测试修复
+- HEAD fd71ebe4090147d4ffabd6acbc160ee8d377b1df Runner #268/#269、Gateway #129、Windows #135 成功；Management #72 https://github.com/trade3403/localtunnel/actions/runs/45683124646 、#73 https://github.com/trade3403/localtunnel/actions/runs/45683140740 失败。#72 job 139448582714 在tls_preview_e2e.py:654 stop(p) AttributeError PosixPath无terminate，新增模块级循环路径覆盖API进程变量；#73 job 139448637693 在protection_e2e.py:115 未观察到32请求许可耗尽，原因未确定。两个Rust构建/单测及基础HTTP均成功。
+- 更名所有新增模块级日志路径避免覆盖API进程，保留原真实HTTPS断言与清理；慢请求使用Expect:100-continue确认实际body轮询、32个真实接纳后第33个必须503、全部32个最终期限响应及恢复。未改变产品限制、依赖、74项管理证据或原有断言。待新CI全部通过再进入备份恢复。未改main、未部署公网、未开启定时任务。
+
+## 2026-11-26：V0.5 日志与并发专项全绿、SQLite安全快照及隔离恢复
+- HEAD d5c583b74a3988f0cf98fce08a47b911934f50c4 六CI全绿：Management #74 https://github.com/trade3403/localtunnel/actions/runs/45685146577 、#75 https://github.com/trade3403/localtunnel/actions/runs/45685157871 ，Windows #136 https://github.com/trade3403/localtunnel/actions/runs/45685157721 ，Gateway #130、Runner #270/#271。#75 job 139455695924 实际资源/HTTPS日志专项及74项证据通过，报告 https://github.com/trade3403/localtunnel/actions/runs/45685157871/artifacts/15055668747 ，Windows报告 https://github.com/trade3403/localtunnel/actions/runs/45685157721/artifacts/15056622589 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45685157721/artifacts/15056817308 。
+- Linux本地备份/恢复命令，VACUUM INTO一致性快照、256MiB检查、完整性/外键/精确迁移及schema、私有暂存原子不覆盖发布；恢复只到新目录，清旧会话/配对/心跳/运行、禁旧设备/轮换摘要/禁已启用映射/清DNS证明，保留历史账号密码及配置，切换需可信操作员审查并隔离旧服务。真实WAL/恢复API/异常拒绝测试及3项证据至77。无新依赖/迁移，不宣称备份加密/异地/在线覆盖或全盘硬配额。待CI后补恢复状态及磁盘边界，再负载测试。未改main、未部署公网、未开启定时任务。
+
+## SQLite 恢复状态与容量边界专项（待 CI）
+- 上一提交 `4b6b6b63fa9e460f1130fadda703ee593eabc55a` 六 CI 全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45689115975)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45689127053)，Windows [CI](https://github.com/trade3403/localtunnel/actions/runs/45689126978)，Gateway [CI](https://github.com/trade3403/localtunnel/actions/runs/45689126967)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45689116022)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45689127257)。实际管理 job 139469567344 的备份恢复、77项证据及依赖锁门禁通过；Windows job 139469566688 证据及锁门禁通过。
+- 扩展实际 Linux CLI / HTTP / SQLite 备份恢复 E2E：旧启用映射、历史域名证明由私有库夹具预置，真实 HTTP 创建映射及排队运行请求；确认备份包含旧状态，恢复后停用映射并递增版本、清除旧证明及请求、拒绝旧请求启停、生成新挑战仍不得启动。未宣称真实 DNS 验证或实际隧道运行。
+- 使用私有稀疏文件检查主库+sidecar 超256MiB、单快照超256MiB及快照sidecar拒绝，确认无目标/暂存泄漏及移除不合格测试库存后真实备份/恢复成功。验证逻辑长度准入而非真实磁盘满、写入中硬配额或在线轮转。新增2项强制管理证据至79；无产品阈值、依赖或迁移变化，原有测试不放宽。
+- 待新CI全绿后进入实际性能及负载专项。未改main、未部署公网、未开启定时任务。
+- 已验收基线工件：管理 https://github.com/trade3403/localtunnel/actions/runs/45689127053/artifacts/15057648649 ，Windows https://github.com/trade3403/localtunnel/actions/runs/45689126978/artifacts/15059595146 ，未签名包 https://github.com/trade3403/localtunnel/actions/runs/45689126978/artifacts/15058193235 。
+
+## V0.5 实际管理 API 负载基线（待 CI）
+- 上一提交 `256f395e3be7fae085f24343fe9299652d626fa2` 同 SHA 六项 CI 全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45728223119)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45728231378)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45728231332)、[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45728231348)、Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45728223049)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45728231322)。备份容量拒绝诊断仅输出固定允许列表，真实备份专项及79项证据门禁通过。
+- 新增 Linux 实际回环管理负载：真实管理员登录、设备配对，8个工作者100轮（800次请求，目标约40请求/秒，20秒），含健康、就绪、认证、设备库存/身份/配置/状态及真实SQLite心跳写入。验证每个响应语义，不自动重试、不累积任务队列、不向公网发送请求。
+- 输出实测完成速率、p50/p95/p99/max延迟、分操作p95、Linux /proc RSS与FD基线/采样最大/结束值；门禁要求800次成功、19–45秒、结束FD增长不超过8、RSS增长不超过64MiB、负载后真实心跳/就绪/认证仍正常。阈值为宽松CI回归保护，不是生产SLA、实际极限吞吐、内存峰值或长期无泄漏证明。所有数值待真实CI生成。
+- 新增3项强制管理证据至82；不改产品、阈值、依赖或旧验收门禁。后续再做持续过载恢复、连接总寿命、真实加密隧道吞吐与更长时间稳定性。未改main、未部署公网、未开启定时任务。
+
+## V0.5 持续限流过载与同进程恢复专项（待 CI）
+- 上一提交 `78dcf685c26e759b8cea359063ac8d1a789b7ced` 六项同SHA CI最终全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45734591432)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45734598159)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45734598049)（首次托盘show辅助进程超时，第二次完整测试通过，未确认根因），[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45734598080)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45734591417)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45734598089)。管理82项及桌面证据门禁通过。
+- 保留原800次混合真实管理请求，新增同一私有回环进程8条HTTP/1连接、各250次健康请求（共2000次、目标200次/秒、约10秒），每个工作者独立限速，无追赶突发、无重试、无外部地址。必须同时观察200与真实429，末两批均有成功和限流，校验拒绝正文/Retry-After/安全头、成功数不超过初始240令牌加实际时间120/s补充。输出实测速率、延迟分位和五批响应统计。
+- 压力结束后不重启进程，验证健康/就绪、真实管理员会话、设备认证心跳写入与读回、无凭据拒绝，以及RSS/FD回落检查。新增2项强制管理证据至84，原有82项不放宽。测试参数为有界CI回归目标，不是公网抗攻击、生产性能SLA、长期资源泄漏或连接总寿命证明。
+- 无产品代码、依赖及阈值变化。下一步连接总寿命专项及实际加密隧道吞吐量测试。未改main、未部署公网、未开启定时任务。
+
+## V0.5 HTTP/1 连接总寿命真实专项（待 CI）
+- 上一提交 `6e9f91242798e7c0e471192698945aaf91311f38` 同SHA六项CI全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45738416789)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45738422997)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45738423029)、[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45738423097)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45738416808)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45738423235)。
+- 原有连接上限/慢头/空闲超时与恢复测试保留。新增实际同一个HTTP/1 TCP连接每秒一次健康请求、不自动重连，期间独立连接也须成功；至少100次真实响应、最后一次成功不早于115秒、118–125秒观察连接关闭，距最后成功小于5秒，以区别于空闲超时。记录实测时长及请求数，随后同进程新长连接连续请求、Linux FD回落检查。新增2项强制管理证据至86。
+- 保留真实120秒阈值，无假时钟、产品代码或依赖变更。容许CI调度误差，非慢响应写入专项或生产长期无泄漏保证。仅在已有本地测试进程执行，不部署公网。下一步实际加密隧道吞吐量专项。未改main、未开启定时任务。
+
+## V0.5 真实 Noise 隧道 HTTP/HTTPS 双向吞吐量专项（待 CI）
+- 上一提交 `705586c97e35b30e6e8bf545bf3082ae439acff6` 六项同SHA CI全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45739805050)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45739811657)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45739811693)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45739811752)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45739805032)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45739811677)。管理86项门禁通过，真实120秒连接寿命专项验收完成。
+- 复用原有真实 DNS TXT 验证、管理导出、锁定 Rathole Noise 引擎与 Nginx HTTP/HTTPS 网关进程。每种协议4个并行工作者、4轮、16个独立真实连接；每个发送256KiB独立随机数据、接收后端回显并比较实际字节与SHA256。每种协议4MiB上传+4MiB下载，总16MiB双向有效载荷。HTTPS继续验证测试CA及主机名，不关闭TLS验证；测试后正常业务、错误Host或错误CA拒绝仍须成立。
+- 输出每种协议真实总耗时、已验证双向字节数、合计应用层有效吞吐Mbps及事务延迟p50/p95/max，要求16次成功、60秒内完成、网关和隧道子进程持续存活。该宽松完成门禁非生产SLA；不宣称链路峰值带宽、广域网或跨主机吞吐，不包含管理面认证性能。全部测量待CI。新增2项强制管理证据至88，旧86项不放宽。
+- Echo仅在隔离回环测试夹具中使用，无产品接口、依赖、阈值变更，不改main、不部署公网、未开启定时任务。下一步长时间稳定性专项。
+
+## V0.5 五分钟真实 HTTPS 常驻稳定性专项（待 CI）
+- 上一提交 `2917e747c8714e04a721e094268366a64a140dcd` 同SHA六项CI全绿：Management [push](https://github.com/trade3403/localtunnel/actions/runs/45742497250)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45742503754)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45742503864)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45742503765)，Runner [push](https://github.com/trade3403/localtunnel/actions/runs/45742497100)、[PR](https://github.com/trade3403/localtunnel/actions/runs/45742503820)。管理实际88项证据通过、HTTP/HTTPS双向有效载荷完整性专项完成；不捏造未读取的吞吐数值。
+- 在现有真实HTTPS常驻生命周期第二次运行中持续约300秒，150次实际TLS业务正文验证和150次已认证运行状态读取，每2秒一轮，不重试失败请求；在约120/240秒实际刷新DNS TXT证明，保留300秒有效期及全部原有安全策略。要求相同运行请求、版本、worker心跳前进，API/常驻监督器/Nginx/两Noise引擎进程存活，抽查PID启动时刻一致。
+- 记录实测时间、HTTPS事务延迟、五个进程RSS/FD基线、采样最大及结束值，不输出PID或凭据。每进程结束FD增量<=12、RSS增量<=64MiB，宽松CI回归门禁而非内存峰值或长时间无泄漏保证。完成后实际正常停止、双隧道监听关闭、HTTPS拒绝及bundle清理，保留旧的故障恢复与日志容量专项。新增2项强制管理证据至90。
+- 原管理CI约6分20秒，增加约5分钟保持现有20分钟上限；实际耗时待CI。不是24小时/7天老化、公网跨主机、证书到期或生产SLA验收。无产品代码、依赖、阈值变化，不改main、不部署公网、未开启定时任务。通过后进入V0.5阶段验收与后续明确未完成项。
+
+## V0.5 开发预览最终验收
+- 功能基线 `24f504696fec84677556c24343221416873e8f87` 同SHA六项CI全部通过；管理90项、桌面88项强制 E2E 字段及原生核心回归通过。实际下载并校验管理、桌面和未签名安装包 ZIP SHA256，核对 JSON、EXE 哈希；详见 [最终验收与实测数据](v0.5-acceptance.md)。
+- 实测800次管理请求全成功，40请求/秒，p95 2.255ms；持续过载2000次中562次真实429并恢复；同一HTTP连接120.084秒关闭；HTTP/HTTPS随机双向有效载荷各8MiB完整，常驻300.019秒150次实际HTTPS成功。仅同机短时开发预览，不视为公网吞吐/长期老化或生产安全达标。
+- 本轮只更新验收与路线文档，不改变产品代码、测试、依赖或既定阈值。验收文档提交后的CI仍待核对，随后进入V0.6 Linux/macOS/ARM64原生客户端增量。无main合并、公网部署、签名或正式发布。

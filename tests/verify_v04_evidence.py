@@ -183,6 +183,70 @@ REQUIRED = {
     }
 }
 
+# V0.5 retains the entire V0.4 management gate and adds its own report.
+REQUIRED["management-v05"] = {
+    **REQUIRED["management"],
+    "http.json": [
+        *REQUIRED["management"]["http.json"],
+        "linux_private_sqlite_modes_and_hardlinks",
+    ],
+    "auth.json": [
+        *REQUIRED["management"]["auth.json"],
+        "unsupported_stored_argon2_parameters_rejected",
+        "foreign_origin_valid_login_no_session",
+    ],
+    "devices.json": [
+        *REQUIRED["management"]["devices.json"],
+        "active_device_quota_transaction_and_pairing_retry",
+        "retained_device_quota_concurrent_and_owner_isolated",
+    ],
+    "preview.json": [
+        *REQUIRED["management"]["preview.json"],
+        "real_gateway_log_budget_stops_and_preserves_evidence",
+        "offline_gateway_log_retention_preserves_recent_and_unrelated",
+        "real_http_noise_concurrent_bidirectional_payload_integrity",
+    ],
+    "tls-preview.json": [
+        *REQUIRED["management"]["tls-preview.json"],
+        "real_https_log_count_reservation_rejected",
+        "real_https_log_byte_reservation_rejected",
+        "real_https_aggregate_log_quota_stops_and_recovers",
+        "real_https_log_generation_isolation_after_quota_recovery",
+        "real_https_noise_concurrent_bidirectional_payload_integrity",
+        "real_https_five_minute_resident_soak_and_resource_bounds",
+        "real_https_soak_clean_stop_and_listener_release",
+    ],
+    "protection.json": [
+        "real_request_bounds_and_response_headers",
+        "real_concurrent_requests_rejected_without_queue",
+        "real_partial_body_deadline_and_capacity_recovery",
+        "real_global_rate_limit_and_refill",
+        "real_local_host_origin_and_fetch_site_guard",
+    ],
+    "backup.json": [
+        "real_consistent_live_wal_snapshot_and_no_overwrite",
+        "real_restored_login_mapping_and_stale_credentials_rejected",
+        "corrupt_schema_symlink_and_existing_destination_refused",
+        "restored_runtime_and_domain_authority_cleared",
+        "snapshot_size_and_sidecar_admission_recovery",
+    ],
+    "load.json": [
+        "real_sustained_mixed_management_workload",
+        "real_load_process_resources_sampled_and_recovered",
+        "real_post_load_heartbeat_readiness_and_auth",
+        "real_sustained_rate_overload_bounded_and_rejected",
+        "real_overload_recovery_without_restart_and_authenticated_write",
+    ],
+    "transport.json": [
+        "real_incomplete_header_absolute_deadline",
+        "real_keepalive_idle_connection_released",
+        "real_connection_cap_and_admitted_request",
+        "real_transport_capacity_recovery",
+        "real_active_connection_total_lifetime",
+        "real_connection_lifetime_same_process_recovery",
+    ],
+}
+
 def unique_object(pairs):
     obj = {}
     for key, value in pairs:
@@ -230,6 +294,23 @@ class EvidenceGateTests(unittest.TestCase):
             self.assertTrue(validate("management", root)[1])
             first.unlink()
             self.assertTrue(validate("management", root)[1])
+
+    def test_v05_requires_additional_real_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for filename, keys in REQUIRED["management"].items():
+                (root / filename).write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
+            self.assertFalse(validate("management", root)[1])
+            self.assertTrue(validate("management-v05", root)[1])
+            for name in ("http.json", "auth.json", "devices.json", "preview.json", "tls-preview.json", "protection.json", "transport.json", "backup.json", "load.json"):
+                filename = root / name
+                keys = REQUIRED["management-v05"][name]
+                filename.write_text(json.dumps(dict.fromkeys(keys, True)), encoding="utf-8")
+            total, errors = validate("management-v05", root)
+            self.assertEqual(total, sum(map(len, REQUIRED["management-v05"].values())))
+            self.assertFalse(errors)
+            filename.write_text(json.dumps(dict.fromkeys(keys, False)), encoding="utf-8")
+            self.assertTrue(validate("management-v05", root)[1])
 
 def main():
     parser = argparse.ArgumentParser()

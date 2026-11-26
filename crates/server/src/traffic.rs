@@ -8,6 +8,72 @@ type Failure=(StatusCode,&'static str);
 const UNAVAILABLE:Failure=(StatusCode::SERVICE_UNAVAILABLE,"traffic unavailable");
 const MISSING:Failure=(StatusCode::NOT_FOUND,"mapping not found");
 const MAX_BYTES:u64=4*1024*1024;
+const MAX_LOG_FILES:usize=32;
+const MAX_LOG_BYTES:u64=32*1024*1024;
+const MAX_DIRECTORY_ENTRIES:usize=512;
+const RETENTION:Duration=Duration::from_secs(7*24*60*60);
+
+fn log_name(name:&str)->bool{
+    let Some(revision)=name.strip_prefix("traffic-").and_then(|s|s.strip_suffix(".log")) else{return false};
+    let Some((pid,stamp))=revision.split_once('-') else{return false};
+    revision.len()<=64&&!pid.is_empty()&&!stamp.is_empty()&&
+        pid.bytes().all(|b|b.is_ascii_digit())&&stamp.bytes().all(|b|b.is_ascii_digit())
+}
+
+#[cfg(target_os="linux")]
+fn inventory(prefix:&FsPath)->Result<Vec<(PathBuf,fs::Metadata)>,&'static str>{
+    use std::os::unix::fs::MetadataExt;
+    let mut logs=Vec::new();
+    for (i,entry) in fs::read_dir(prefix).map_err(|_|"log directory unavailable")?.enumerate(){
+        if i>=MAX_DIRECTORY_ENTRIES{return Err("log directory entry limit")}
+        let entry=entry.map_err(|_|"log directory read failed")?;
+        let name=entry.file_name();
+        if !name.to_str().is_some_and(log_name){continue}
+        let m=fs::symlink_metadata(entry.path()).map_err(|_|"log metadata unavailable")?;
+        if !m.is_file()||m.nlink()!=1||m.uid()!=unsafe{libc::geteuid()}{
+            return Err("unsafe gateway log file")
+        }
+        logs.push((entry.path(),m));
+    }
+    Ok(logs)
+}
+#[cfg(target_os="linux")]
+pub fn check_log_budget(prefix:&FsPath,reserve:bool)->Result<(),&'static str>{
+    let logs=inventory(prefix)?;
+    let mut total=0u64;
+    for (_,m) in &logs{
+        if m.len()>MAX_BYTES{return Err("gateway log file budget exceeded")}
+        total=total.checked_add(m.len()).ok_or("gateway log size overflow")?;
+    }
+    let (files,bytes)=if reserve{(MAX_LOG_FILES-1,MAX_LOG_BYTES-MAX_BYTES)}else{(MAX_LOG_FILES,MAX_LOG_BYTES)};
+    if logs.len()>files||total>bytes{return Err("gateway log inventory budget exceeded")}
+    Ok(())
+}
+#[cfg(not(target_os="linux"))]
+pub fn check_log_budget(_: &FsPath,_:bool)->Result<(),&'static str>{Err("Linux gateway logs only")}
+
+// Caller must hold the dedicated offline maintenance guards. This is
+// explicit retention pruning, never rotation of an open Nginx descriptor.
+#[cfg(target_os="linux")]
+pub fn prune_offline(prefix:&FsPath)->Result<usize,&'static str>{
+    use std::os::unix::fs::MetadataExt;
+    let logs=inventory(prefix)?;
+    let now=std::time::SystemTime::now();
+    let mut removed=0;
+    for (path,m) in logs{
+        if now.duration_since(m.modified().map_err(|_|"log time unavailable")?).unwrap_or_default()<RETENTION{continue}
+        let current=fs::symlink_metadata(&path).map_err(|_|"log changed during pruning")?;
+        if !current.is_file()||current.nlink()!=1||current.dev()!=m.dev()||current.ino()!=m.ino()||
+            current.len()!=m.len()||current.modified().ok()!=m.modified().ok(){
+            return Err("log changed during pruning")
+        }
+        fs::remove_file(path).map_err(|_|"old log removal failed")?;
+        removed+=1;
+    }
+    Ok(removed)
+}
+#[cfg(not(target_os="linux"))]
+pub fn prune_offline(_: &FsPath)->Result<usize,&'static str>{Err("Linux gateway logs only")}
 #[derive(Serialize,sqlx::FromRow)]
 struct Observation{
     request_id:String,mapping_revision:i64,requests:i64,request_bytes:i64,response_bytes:i64,sampled_at:i64,sampling_state:String,
@@ -107,6 +173,10 @@ impl Meter{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]fn exact_generated_log_names(){
+        for s in ["traffic-1-2.log","traffic-123-456789.log"]{assert!(log_name(s))}
+        for s in ["traffic.log","traffic-1-2.log.old","traffic-1-x.log","traffic--2.log","traffic-1-2-3.log","../traffic-1-2.log"]{assert!(!log_name(s))}
+    }
     #[test]fn numeric_lines_only(){
         let mut c=Counts::default();c.add("100 200 200").unwrap();c.add("50 80 502").unwrap();
         assert_eq!((c.requests,c.request_bytes,c.response_bytes),(2,150,280));
