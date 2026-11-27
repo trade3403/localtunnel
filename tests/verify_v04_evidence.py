@@ -383,6 +383,10 @@ REQUIRED["management-v09"] = {
         "real_center_process_loss_preserves_existing_tcp_stream_and_denies_new_claim",
         "real_offline_expiry_closes_established_tcp_stream_and_ports",
         "real_center_restart_rejects_expired_claims_and_retains_reservations",
+        "real_two_independent_nodes_udp_https_forward_during_center_loss",
+        "real_https_supervisor_sigkill_closes_owned_gateway_and_engine_other_node_survives",
+        "real_offline_udp_expiry_closes_datagram_port_and_retains_crash_reservation",
+        "real_crashed_https_claim_rejected_after_center_recovery",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",

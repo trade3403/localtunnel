@@ -760,6 +760,180 @@ try:
                 report["real_center_restart_rejects_expired_claims_and_retains_reservations"]=True
             finally:
                 target.shutdown();worker.join(timeout=3)
+        # Independent UDP and HTTPS supervisors on two different nodes.
+        # Both must forward during actual control loss; killing one supervisor
+        # must close its own gateway and engine without stopping the other.
+        for i in (0,1):
+            control(tokens[i],{"protocol_version":1,"node_id":nodes[i],"generation":1,
+                "capacity":i+5,"nonce":secrets.token_hex(16)},200)
+        multi_host="offline-secure.example.test"
+        multi_domain=admin("domains",{"hostname":multi_host},owner,201)
+        records[multi_domain["txt_name"]+"."]=multi_domain["txt_value"]
+        assert admin("domains/verify",{"domain_id":multi_domain["id"]},owner)["verified_at"] is not None
+        multi_leaf=root/"offline-leaf.pem";multi_key=root/"offline-leaf.key";multi_csr=root/"offline-leaf.csr"
+        multi_ext=root/"offline-ext"
+        multi_ext.write_text("subjectAltName=DNS:"+multi_host+"\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n")
+        openssl("req","-new","-newkey","rsa:2048","-nodes","-subj","/CN="+multi_host,"-keyout",multi_key,"-out",multi_csr)
+        openssl("x509","-req","-in",multi_csr,"-CA",ca,"-CAkey",cak,"-CAcreateserial","-days","2","-extfile",multi_ext,"-out",multi_leaf)
+        multi_fp=hashlib.sha256(ssl.PEM_cert_to_DER_cert(multi_leaf.read_text())).hexdigest()
+        provision("leaf.pem",multi_leaf);provision("leaf.key",multi_key);provision("web-ca.pem",ca)
+        multi_udp_token=secrets.token_hex(32);multi_web_token=secrets.token_hex(32)
+        tokens.extend([multi_udp_token,multi_web_token])
+        for path,value in ((dirs[0]/"udp.token",multi_udp_token),(dirs[1]/"https.token",multi_web_token)):
+            path.write_text(value+"\n");path.chmod(0o600)
+        multi_ur=offline_port(30000,59999);multi_ub=offline_port(20001,29999)
+        multi_wr=offline_port(30000,59999);multi_wb=offline_port(20001,29999);multi_wg=offline_port(60000,64999)
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp_target:
+            udp_target.bind(("127.0.0.1",0));udp_target.settimeout(.2)
+            # Confirm the actual UDP business port is free, separately from TCP.
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
+                probe.bind(("127.0.0.1",multi_ub))
+            done=threading.Event()
+            def echo_multi_udp():
+                while not done.is_set():
+                    try:
+                        data,peer=udp_target.recvfrom(4096)
+                        udp_target.sendto(data,peer)
+                    except socket.timeout:continue
+                    except OSError:return
+            udp_thread=threading.Thread(target=echo_multi_udp,daemon=True);udp_thread.start()
+            target=http.server.ThreadingHTTPServer(("127.0.0.1",0),WebTarget)
+            web_thread=threading.Thread(target=target.serve_forever,daemon=True);web_thread.start()
+            try:
+                def prepare_multi(i,kind,rp,bp,local,secret,pub,domain=None):
+                    spec=dict(request_key=secrets.token_hex(16),device_id=device,node_id=nodes[i],
+                        protocol=kind,local_port=local,bind_port=bp)
+                    if domain:spec["domain_id"]=domain
+                    a=admin("allocations",spec,owner,201)
+                    config=root/("multi-"+a["id"]+".toml")
+                    subprocess.run([str(core_test.CLI),"client-udp-config" if kind=="udp" else "client-config",
+                        str(config),f"127.0.0.1:{rp}","m_"+a["mapping_id"],f"127.0.0.1:{local}"],
+                        env=dict(os.environ,LOCALTUNNEL_TOKEN=secret,LOCALTUNNEL_SERVER_PUBLIC_KEY=pub),
+                        check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    return a,config
+                ua,uc=prepare_multi(0,"udp",multi_ur,multi_ub,udp_target.getsockname()[1],multi_udp_token,public0)
+                wa,wc=prepare_multi(1,"https",multi_wr,multi_wb,target.server_port,multi_web_token,public,multi_domain["id"])
+                def grant_multi(a,kind,rp,extra=None):
+                    g=admin("allocations/"+a["id"]+"/grant",{"expected_generation":1,"expected_mapping_revision":1},owner,201)
+                    intent=dict(grant_id=g["id"],expected_generation=2,relay_port=rp)
+                    if extra:intent.update(extra)
+                    admin("allocations/"+a["id"]+"/"+kind+"-intent",intent,owner,201)
+                    return g
+                def start_multi(i,kind,a,g,rp,bp,config,extra=()):
+                    child=subprocess.Popen([str(relay),"--"+kind+"-preview",str(dirs[i]),"localhost",str(tp),
+                        nodes[i],"1",str(i+5),a["id"],a["mapping_id"],"1","2",g["id"],str(rp),str(bp),str(engine),*extra],
+                        stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                    children.append(child)
+                    with selectors.DefaultSelector() as sel:
+                        sel.register(child.stdout,selectors.EVENT_READ);assert sel.select(5)
+                    assert child.stdout.readline().strip()=="relay "+kind.upper()+" engine started"
+                    client=subprocess.Popen([str(engine),str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                        env=dict(os.environ,RUST_LOG="warn"))
+                    children.append(client)
+                    return child,client
+                ug=grant_multi(ua,"udp",multi_ur)
+                wg=grant_multi(wa,"https",multi_wr,dict(gateway_port=multi_wg,certificate_sha256=multi_fp))
+                ur,ucp=start_multi(0,"udp",ua,ug,multi_ur,multi_ub,uc)
+                wr,wcp=start_multi(1,"https",wa,wg,multi_wr,multi_wb,wc,(str(multi_wg),multi_host))
+                secure_ctx=ssl.create_default_context(cafile=str(ca))
+                def multi_web():
+                    body="/"+secrets.token_hex(16)
+                    try:
+                        with socket.create_connection(("127.0.0.1",multi_wg),timeout=.5) as raw:
+                            with secure_ctx.wrap_socket(raw,server_hostname=multi_host) as tls:
+                                assert hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()==multi_fp
+                                tls.sendall(("GET "+body+" HTTP/1.1\r\nHost: "+multi_host+"\r\nConnection: close\r\n\r\n").encode())
+                                with http.client.HTTPResponse(tls) as response:
+                                    response.begin()
+                                    if response.status!=200:return False
+                                    return json.loads(response.read())=={"path":body,"host":multi_host,"xff":"127.0.0.1","proto":"https","forwarded":None}
+                    except (OSError,http.client.HTTPException):return False
+                with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as client:
+                    client.settimeout(.5)
+                    def multi_udp():
+                        body=secrets.token_bytes(48)
+                        try:
+                            client.sendto(body,("127.0.0.1",multi_ub))
+                            return client.recvfrom(4096)==(body,("127.0.0.1",multi_ub))
+                        except OSError:return False
+                    wait(lambda:multi_udp() and multi_web(),7)
+                    assert all(p.poll() is None for p in (ur,wr,ucp,wcp))
+                    stop(center_process)
+                    assert center_process.poll() is not None
+                    assert request("/api/v1/relay/identity",tokens[0])[0] in (502,503,504)
+                    assert multi_udp() and multi_web()
+                    report["real_two_independent_nodes_udp_https_forward_during_center_loss"]=True
+                    # Verify exactly two test-owned direct child executables,
+                    # not arbitrary PIDs or processes discovered by name.
+                    def owned_children(p):
+                        found=set()
+                        for task in (Path("/proc")/str(p.pid)/"task").iterdir():
+                            try:found.update(int(n) for n in (task/"children").read_text().split())
+                            except FileNotFoundError:pass
+                        return found
+                    direct=owned_children(wr)
+                    assert len(direct)==2
+                    binaries={(Path("/proc")/str(pid)/"exe").resolve() for pid in direct}
+                    assert binaries=={engine.resolve(),Path("/usr/sbin/nginx").resolve()}
+                    wr.kill();assert wr.wait(timeout=3)!=0
+                    def closed_web():
+                        for port in (multi_wr,multi_wb,multi_wg):
+                            with socket.socket() as probe:
+                                probe.settimeout(.2)
+                                if probe.connect_ex(("127.0.0.1",port))==0:return False
+                        # Reparented zombies are already dead, so not live
+                        # children. Check state rather than PID existence alone.
+                        for pid in direct:
+                            try:
+                                stat=(Path("/proc")/str(pid)/"stat").read_text()
+                                if stat.rsplit(")",1)[1].split()[0]!="Z":return False
+                            except FileNotFoundError:pass
+                        return True
+                    wait(closed_web,3)
+                    assert not multi_web()
+                    assert ur.poll() is None and ucp.poll() is None and multi_udp()
+                    # SIGKILL bypasses RAII cleanup: preserve crash evidence,
+                    # never treat missing heartbeat as resource release.
+                    assert (dirs[1]/("https-"+wg["id"]+".gateway")).is_dir()
+                    assert (dirs[1]/("https-"+wg["id"]+".toml")).is_file()
+                    report["real_https_supervisor_sigkill_closes_owned_gateway_and_engine_other_node_survives"]=True
+                    out,err=ur.communicate(timeout=20)
+                    assert ur.returncode==0 and out.strip()=="relay UDP engine expired and stopped"
+                    assert not any(t in out+err for t in tokens)
+                    assert not multi_udp()
+                    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
+                        probe.bind(("127.0.0.1",multi_ub))
+                    with socket.socket() as probe:
+                        probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",multi_ur))!=0
+                    assert not (dirs[0]/("udp-"+ug["id"]+".toml")).exists()
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        for table,g in (("relay_udp_intents",ug),("relay_https_intents",wg)):
+                            assert db.execute("SELECT claimed_at IS NOT NULL FROM "+table+" WHERE grant_id=?",(g["id"],)).fetchone()==(1,)
+                        assert db.execute("SELECT count(*) FROM relay_allocations WHERE id IN (?,?) AND state='reserved' AND generation=2",
+                            (ua["id"],wa["id"])).fetchone()==(2,)
+                    report["real_offline_udp_expiry_closes_datagram_port_and_retains_crash_reservation"]=True
+                center_process=subprocess.Popen([str(exe),str(center),str(cp)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                    env=dict(os.environ,LOCALTUNNEL_DNS_RESOLVER=resolver))
+                children.append(center_process)
+                with selectors.DefaultSelector() as sel:
+                    sel.register(center_process.stdout,selectors.EVENT_READ);assert sel.select(20)
+                assert center_process.stdout.readline().strip()==f"LISTENING 127.0.0.1:{cp}"
+                wait(lambda:request("/api/v1/relay/identity",tokens[0])[0]==200)
+                # Recheck exact consumed HTTPS claim via TLS after recovery,
+                # not merely local retained configuration or port conflicts.
+                control(tokens[1],{"protocol_version":1,"node_id":nodes[1],"generation":1,"capacity":6,"nonce":secrets.token_hex(16)},200)
+                payload=dict(protocol_version=1,grant_id=wg["id"],allocation_id=wa["id"],mapping_id=wa["mapping_id"],
+                    mapping_revision=1,node_id=nodes[1],node_generation=1,generation=2,relay_port=multi_wr,
+                    gateway_port=multi_wg,hostname=multi_host,certificate_sha256=multi_fp,nonce=secrets.token_hex(16))
+                req=urllib.request.Request(f"https://localhost:{tp}/api/v1/relay/https-claim",method="POST",
+                    headers={"Authorization":"Bearer "+tokens[1],"Content-Type":"application/json"},data=json.dumps(payload).encode())
+                try:
+                    with opener.open(req,timeout=4):raise AssertionError("crashed HTTPS claim replay accepted")
+                except urllib.error.HTTPError as ex:assert ex.code==401
+                report["real_crashed_https_claim_rejected_after_center_recovery"]=True
+            finally:
+                target.shutdown();target.server_close();web_thread.join(timeout=3)
+                done.set();udp_thread.join(timeout=3)
         dns.shutdown();dns_thread.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
@@ -772,4 +946,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==19 and all(report.values())
+assert len(report)==23 and all(report.values())
