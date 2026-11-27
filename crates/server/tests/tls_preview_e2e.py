@@ -652,7 +652,7 @@ try:
                         wait_connection_slots(0)
                         def hold_web(port,host):
                             sock=socket.create_connection(("127.0.0.1",port),timeout=5)
-                            sock.sendall(("GET / HTTP/1.1\\r\\nHost: "+host+"\\r\\n").encode())
+                            sock.sendall(("GET / HTTP/1.1\r\nHost: "+host+"\r\n").encode())
                             return sock
                         with hold_web(bp,hostname) as a, hold_web(hm["bind_port"],http_host) as b, socket.create_connection(("127.0.0.1",tm["bind_port"]),timeout=5) as c, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as d:
                             payload=secrets.token_bytes(32)
@@ -672,7 +672,7 @@ try:
                             except (OSError,http.client.HTTPException):result=None
                             assert result is None or result[0]!=200
                             for sock in (a,b):
-                                sock.sendall(b"Connection: close\\r\\n\\r\\n")
+                                sock.sendall(b"Connection: close\r\n\r\n")
                                 with http.client.HTTPResponse(sock) as response:
                                     response.begin()
                                     assert response.status==200 and response.read()==body
