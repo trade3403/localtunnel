@@ -91,7 +91,9 @@ try:
         try:
             with sqlite3.connect(db_path) as db:
                 db.execute("PRAGMA foreign_keys=ON")
-                assert {t:rows(db,t) for t in tables}==baseline
+                # 0020 appends policy columns, without changing any existing node fields.
+                expected={**baseline,"nodes":[row+(0,"unassigned","active",1) for row in baseline["nodes"]]}
+                assert {t:rows(db,t) for t in tables}==expected
                 assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
                 assert db.execute("PRAGMA integrity_check").fetchone()==("ok",)
                 assert db.execute("SELECT success FROM _sqlx_migrations WHERE version=12").fetchone()==(1,)

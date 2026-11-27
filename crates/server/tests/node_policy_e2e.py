@@ -66,10 +66,17 @@ try:
         a="a"*32
         b="b"*32
         token="ltrelay_"+secrets.token_hex(32)
+        # Obtain the exact SQLx bookkeeping DDL from a genuine current database.
+        # Restore validates sqlite_schema text, not just equivalent column types.
+        reference=parent/"reference"
+        reference.mkdir(mode=0o700)
+        command(reference,"--add-node","schema reference")
+        with sqlite3.connect(reference/"control.sqlite3") as db:
+            migration_ddl=db.execute("SELECT sql FROM sqlite_schema WHERE type='table' AND name='_sqlx_migrations'").fetchone()[0]
         # Execute the exact prior migrations with genuine SQLx bookkeeping.
         with sqlite3.connect(dbpath) as db:
             db.execute("PRAGMA foreign_keys=ON")
-            db.execute("CREATE TABLE _sqlx_migrations(version BIGINT PRIMARY KEY,description TEXT NOT NULL,installed_on TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,success BOOLEAN NOT NULL,checksum BLOB NOT NULL,execution_time BIGINT NOT NULL)")
+            db.execute(migration_ddl)
             for path in sorted(migrations.glob("*.sql")):
                 number,description=path.stem.split("_",1)
                 if int(number)>19:continue
