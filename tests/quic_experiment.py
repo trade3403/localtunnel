@@ -242,7 +242,23 @@ async def exercise(root,report,comparison=None,resilience=False):
             if comparison is not None:
                 from quic_noise_benchmark import compare
                 binary, engine_report = comparison
-                report["comparison"] = await compare(root,binary,engine_report,local,reverse,observed)
+                # The alternating Noise measurements can leave the registered
+                # QUIC connection idle for longer than its 10-second timeout.
+                # Keep the same authenticated transport alive with actual QUIC
+                # PING/ACK frames, not synthetic business requests or re-registration.
+                async def keepalive():
+                    while True:
+                        await asyncio.sleep(2)
+                        await asyncio.wait_for(client.ping(),5)
+                        assert registry["active"] is original
+                async with asyncio.TaskGroup() as group:
+                    heartbeat=group.create_task(keepalive())
+                    try:
+                        report["comparison"] = await compare(root,binary,engine_report,local,reverse,observed)
+                        assert registry["active"] is original
+                        report["comparison"]["quic_keepalive"]="PING every 2 seconds during comparison; included in transport overhead"
+                    finally:
+                        heartbeat.cancel()
                 assert len(report["comparison"]["passed"]) == 3
         # CONNECTION_CLOSE is not guaranteed to arrive under packet loss.
         # The server must remove registration via actual termination or its
