@@ -540,7 +540,7 @@ try:
                     while time.monotonic()<until:
                         if monthly_inventory()["reserved_connection_slots"]==expected:return
                         time.sleep(.05)
-                    raise AssertionError("web connection slot mismatch")
+                    raise AssertionError(f"web connection slot mismatch: expected {expected}, actual {monthly_inventory()['reserved_connection_slots']}")
                 wait_connection_slots(0)
                 # Hold a real upstream TCP stream via the owned Noise relay,
                 # then issue a distinct request through the actual gateway.
@@ -676,8 +676,9 @@ try:
                                 with http.client.HTTPResponse(sock) as response:
                                     response.begin()
                                     assert response.status==200 and response.read()==body
-                            c.shutdown(socket.SHUT_RDWR)
-                            c.close()
+                            for sock in (a,b,c):
+                                sock.shutdown(socket.SHUT_RDWR)
+                                sock.close()
                             wait_connection_slots(1)
                             assert request(hp,http_host)==(200,body)
                             assert tls_request(gp,hostname,ca2)==(200,body)
