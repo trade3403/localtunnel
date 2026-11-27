@@ -218,6 +218,7 @@ REQUIRED["management-v05"] = {
         "real_http_commercial_expiry_and_queued_cancellation",
         "real_http_commercial_tcp_bandwidth_and_plan_change_cleanup",
         "real_http_monthly_only_plan_debits_and_stops_without_overspend",
+        "real_http_connection_only_plan_denies_extra_backend_stream",
     ],
     "tls-preview.json": [
         *REQUIRED["management"]["tls-preview.json"],
@@ -229,6 +230,7 @@ REQUIRED["management-v05"] = {
         "real_https_commercial_suspend_latches_stop_across_renewal",
         "real_https_commercial_tcp_bandwidth_and_plan_change_cleanup",
         "real_https_monthly_only_plan_debits_and_stops_without_overspend",
+        "real_https_connection_only_plan_denies_extra_backend_stream",
         "real_https_five_minute_resident_soak_and_resource_bounds",
         "real_https_soak_clean_stop_and_listener_release",
     ],
@@ -284,6 +286,8 @@ REQUIRED["management-v08"] = {
         "real_monthly_udp_and_tcp_share_durable_tenant_budget",
         "real_monthly_over_budget_closes_real_tcp_without_overspend",
         "real_monthly_debits_survive_management_restart",
+        "real_tenant_tcp_connection_slots_shared_denied_and_reused",
+        "real_crashed_connection_slot_retained_until_audited_recovery",
     ],
     "udp-preview.json": [
         "real_udp_commercial_suspend_revokes_lease_and_closes_relay",

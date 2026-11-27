@@ -514,6 +514,58 @@ try:
                 policy(plan_id="legacy-v1")
                 assert monthly_inventory()["monthly_charged_bytes"]==final["monthly_charged_bytes"]
                 report["real_https_monthly_only_plan_debits_and_stops_without_overspend"]=True
+                conn_plan={**plan,"version":3,"name":"Web connection fixture","max_bandwidth_bps":None,"max_monthly_bytes":None,"max_concurrent_connections":1}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(conn_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                policy(plan_id=created.stdout.decode().strip())
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"connection_bypass").returncode!=0
+                assert not (root/"connection_bypass").exists()
+                assert operator("--preview-tls-gateway",mid3,1,"tls_gateway",gp,probe,"cert_v2","apply-checked","expected_body").returncode!=0
+                queued=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-tls-worker",str(root),mid3,"1",str(rp),"connection_web","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                end=time.monotonic()+45
+                while time.monotonic()<end:
+                    assert supervisor.poll() is None
+                    current=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                    try:
+                        if current["state"]=="running" and tls_request(gp,hostname,ca2)==(200,body):break
+                    except (OSError,http.client.HTTPException):pass
+                    time.sleep(.25)
+                else: raise AssertionError("connection HTTPS worker not running")
+                manifest=json.loads((root/"connection_web"/"manifest.json").read_text())
+                assert manifest["connection_cap"]==1 and manifest["commercial_bandwidth_bps"] is None and manifest["monthly_cap"] is None
+                def wait_connection_slots(expected):
+                    until=time.monotonic()+8
+                    while time.monotonic()<until:
+                        if monthly_inventory()["reserved_connection_slots"]==expected:return
+                        time.sleep(.05)
+                    raise AssertionError("web connection slot mismatch")
+                wait_connection_slots(0)
+                # Hold a real upstream TCP stream via the owned Noise relay,
+                # then issue a distinct request through the actual gateway.
+                with socket.create_connection(("127.0.0.1",bp),timeout=5) as held:
+                    held.sendall(("GET / HTTP/1.1\r\nHost: "+hostname+"\r\n").encode())
+                    wait_connection_slots(1)
+                    try:
+                        result=tls_request(gp,hostname,ca2)
+                    except (OSError,http.client.HTTPException):
+                        result=None
+                    assert result is None or result[0]!=200
+                    assert supervisor.poll() is None
+                    held.sendall(b"Connection: close\r\n\r\n")
+                    with http.client.HTTPResponse(held) as response:
+                        response.begin()
+                        assert response.status==200 and response.read()==body
+                wait_connection_slots(0)
+                assert tls_request(gp,hostname,ca2)==(200,body)
+                wait_connection_slots(0)
+                policy(plan_id="legacy-v1")
+                assert supervisor.wait(timeout=40)==0
+                assert expect(call(base,path+"/runtime",token=admin),200)["request"]["state"]=="stopped"
+                rejects(gp,hostname,ca2)
+                assert request(bp,hostname) is None
+                report["real_https_connection_only_plan_denies_extra_backend_stream"]=True
                 # Exercise the shared recovery mechanism with actual HTTPS,
                 # a verified certificate and two owned encrypted tunnel children.
                 import signal

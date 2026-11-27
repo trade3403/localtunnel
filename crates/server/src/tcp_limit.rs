@@ -39,6 +39,24 @@ impl MonthlyMeter{
         }
     }
 }
+/// Each admitted backend socket owns a durable tenant slot until both
+/// sockets are dropped. The supervisor releases any remaining slots only
+/// after confirmed guard/engine cleanup via the reservation foreign key.
+pub(crate) struct ConnectionQuota{
+    pool:sqlx::SqlitePool,handle:tokio::runtime::Handle,
+    mapping:String,revision:i64,rid:String,cap:i64,
+}
+impl ConnectionQuota{
+    pub(crate) fn new(pool:sqlx::SqlitePool,mapping:String,revision:i64,rid:String,cap:i64)->Self{
+        Self{pool,handle:tokio::runtime::Handle::current(),mapping,revision,rid,cap}
+    }
+    fn acquire(&self)->io::Result<Option<String>>{
+        self.handle.block_on(crate::commercial::acquire_connection(&self.pool,&self.mapping,self.revision,&self.rid,self.cap)).map_err(io::Error::other)
+    }
+    fn release(&self,id:&str)->io::Result<()>{
+        self.handle.block_on(crate::commercial::release_connection(&self.pool,id)).map_err(io::Error::other)
+    }
+}
 struct Direction{buf:[u8;BURST],start:usize,end:usize,eof:bool}
 impl Direction{
     fn new()->Self{Self{buf:[0;BURST],start:0,end:0,eof:false}}
@@ -91,9 +109,9 @@ impl Connection{
 pub(crate) struct Guard{port:u16,stop:Arc<AtomicBool>,quota_denied:Arc<AtomicBool>,thread:Option<JoinHandle<io::Result<()>>>}
 impl Guard{
     pub(crate) fn start(target:u16,rate:u32)->Result<Self,&'static str>{
-        Self::start_metered(target,rate,None)
+        Self::start_controlled(target,rate,None,None)
     }
-    pub(crate) fn start_metered(target:u16,rate:u32,mut meter:Option<MonthlyMeter>)->Result<Self,&'static str>{
+    pub(crate) fn start_controlled(target:u16,rate:u32,mut meter:Option<MonthlyMeter>,quota:Option<ConnectionQuota>)->Result<Self,&'static str>{
         if target==0||!(65536..=125_000_000).contains(&rate){return Err("unsupported TCP preview byte rate")}
         let listener=TcpListener::bind((Ipv4Addr::LOCALHOST,0)).map_err(|_|"TCP limiter bind failed")?;
         let port=listener.local_addr().map_err(|_|"TCP limiter address unavailable")?.port();
@@ -107,18 +125,33 @@ impl Guard{
         let thread=thread::Builder::new().name("mapping-tcp-limit".into()).spawn(move||{
             let mut up=Bucket::new(rate);
             let mut down=Bucket::new(rate);
-            let mut connections:Vec<Connection>=Vec::with_capacity(MAX_CONNECTIONS);
+            let mut connections:Vec<(Connection,Option<String>)>=Vec::with_capacity(MAX_CONNECTIONS);
             while !signal.load(Ordering::Relaxed){
                 match listener.accept(){
                     Ok((source,peer))=>{
                         if peer.ip().is_loopback()&&connections.len()<MAX_CONNECTIONS{
-                            if let Ok(c)=Connection::new(source,target){connections.push(c)}
+                            let slot=match quota.as_ref(){
+                                Some(q)=>q.acquire()?,
+                                None=>None,
+                            };
+                            if quota.is_none()||slot.is_some(){
+                                match Connection::new(source,target){
+                                    Ok(c)=>connections.push((c,slot)),
+                                    Err(_)=>if let (Some(q),Some(id))=(quota.as_ref(),slot.as_deref()){q.release(id)?;},
+                                }
+                            }
                         }
                     },
                     Err(e) if retry(&e)=>{},
                     Err(e)=>return Err(e),
                 }
-                connections.retain_mut(|c|c.poll(&mut up,&mut down,&mut meter));
+                let mut i=0;
+                while i<connections.len(){
+                    if connections[i].0.poll(&mut up,&mut down,&mut meter){i+=1;continue}
+                    let (connection,slot)=connections.swap_remove(i);
+                    drop(connection);
+                    if let (Some(q),Some(id))=(quota.as_ref(),slot.as_deref()){q.release(id)?;}
+                }
                 if meter.as_ref().is_some_and(|m|m.failed){return Err(io::Error::other("monthly debit unavailable"))}
                 if meter.as_ref().is_some_and(|m|m.denied){denied.store(true,Ordering::Release);return Ok(())}
                 // Rotate servicing order so the same connection does not

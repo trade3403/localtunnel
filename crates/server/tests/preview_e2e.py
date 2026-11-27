@@ -528,6 +528,55 @@ try:
                 policy(plan_id="legacy-v1")
                 assert monthly_inventory()["monthly_charged_bytes"]==final["monthly_charged_bytes"]
                 report["real_http_monthly_only_plan_debits_and_stops_without_overspend"]=True
+                conn_plan={**plan,"version":3,"name":"Web connection fixture","max_bandwidth_bps":None,"max_monthly_bytes":None,"max_concurrent_connections":1}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(conn_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                policy(plan_id=created.stdout.decode().strip())
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"connection_bypass").returncode!=0
+                assert not (root/"connection_bypass").exists()
+                assert operator("--preview-gateway",mid3,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"connection_web","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                    if current["state"]=="running":break
+                    time.sleep(.2)
+                else: raise AssertionError("connection HTTP worker not running")
+                manifest=json.loads((root/"connection_web"/"manifest.json").read_text())
+                assert manifest["connection_cap"]==1 and manifest["commercial_bandwidth_bps"] is None and manifest["monthly_cap"] is None
+                def wait_connection_slots(expected):
+                    until=time.monotonic()+8
+                    while time.monotonic()<until:
+                        if monthly_inventory()["reserved_connection_slots"]==expected:return
+                        time.sleep(.05)
+                    raise AssertionError("web connection slot mismatch")
+                wait_connection_slots(0)
+                # Hold a real upstream TCP stream via the owned Noise relay,
+                # then issue a distinct request through the actual gateway.
+                with socket.create_connection(("127.0.0.1",bp),timeout=5) as held:
+                    held.sendall(("GET / HTTP/1.1\r\nHost: "+"preview.example.test"+"\r\n").encode())
+                    wait_connection_slots(1)
+                    try:
+                        result=request(gp,"preview.example.test")
+                    except (OSError,http.client.HTTPException):
+                        result=None
+                    assert result is None or result[0]!=200
+                    assert supervisor.poll() is None
+                    held.sendall(b"Connection: close\r\n\r\n")
+                    with http.client.HTTPResponse(held) as response:
+                        response.begin()
+                        assert response.status==200 and response.read()==body
+                wait_connection_slots(0)
+                assert request(gp,"preview.example.test")==(200,body)
+                wait_connection_slots(0)
+                policy(plan_id="legacy-v1")
+                assert supervisor.wait(timeout=40)==0
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["state"]=="stopped"
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                report["real_http_connection_only_plan_denies_extra_backend_stream"]=True
                 # Resident owns a single fixed mapping, but accepts multiple
                 # independently authorized requests without operator relaunch.
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)

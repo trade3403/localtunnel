@@ -450,6 +450,89 @@ try:
                 assert db.execute("SELECT charged_bytes FROM tenant_monthly_usage WHERE tenant_id=? AND month_utc=?",(tenant,previous)).fetchone()==(cap,)
                 assert db.execute("SELECT count(*) FROM tenant_monthly_usage WHERE tenant_id=?",(tenant,)).fetchone()==(2,)
             report["real_monthly_debits_survive_management_restart"]=True
+            concurrent=command("--commercial-create-plan",{"code":"tcp-fixture","version":3,"name":"Connection fixture","max_active_devices":4,
+                "max_retained_devices":8,"max_mappings":8,"max_bandwidth_bps":None,"max_monthly_bytes":None,"max_concurrent_connections":2})
+            policy(concurrent)
+            call(base,udp_path+"/udp-start",409,"POST",admin,{"expected_revision":allowed["revision"]})
+            def wait_slots(expected,token=admin):
+                until=time.monotonic()+8
+                while time.monotonic()<until:
+                    if inventory(token)["reserved_connection_slots"]==expected:return
+                    time.sleep(.05)
+                raise AssertionError("connection slot count mismatch")
+            run_a=spawn_tcp(b,"connection_a")
+            ready_tcp(run_a)
+            wait_slots(0)
+            run_b=spawn_tcp(new,"connection_b")
+            ready_tcp(run_b)
+            wait_slots(0)
+            def held(port):
+                conn=socket.create_connection(("127.0.0.1",port),timeout=3)
+                try:
+                    data=secrets.token_bytes(32)
+                    conn.sendall(data)
+                    received=bytearray()
+                    while len(received)<len(data):
+                        piece=conn.recv(len(data)-len(received))
+                        assert piece
+                        received.extend(piece)
+                    assert received==data
+                    return conn
+                except BaseException:
+                    conn.close()
+                    raise
+            def rejected_stream(port):
+                with socket.create_connection(("127.0.0.1",port),timeout=3) as conn:
+                    try:
+                        conn.sendall(secrets.token_bytes(32))
+                        assert conn.recv(32)==b"", "over-limit stream received data"
+                    except (ConnectionResetError,BrokenPipeError):pass
+            with held(b["bind_port"]) as first, held(new["bind_port"]) as second:
+                wait_slots(2)
+                rejected_stream(b["bind_port"])
+                rejected_stream(new["bind_port"])
+                wait_slots(2)
+                assert all(run[0].poll() is None for run in (run_a,run_b))
+                first.shutdown(socket.SHUT_RDWR)
+                first.close()
+                wait_slots(1)
+                with held(new["bind_port"]) as reused:
+                    wait_slots(2)
+                    assert inventory(other)["reserved_connection_slots"]==0
+                wait_slots(1)
+            wait_slots(0)
+            stop_run(run_a)
+            stop_run(run_b)
+            assert inventory()["reserved_connection_slots"]==0
+            report["real_tenant_tcp_connection_slots_shared_denied_and_reused"]=True
+            # Crash retains an actual open stream slot; offline recovery
+            # removes the exact reservation and its child slots together.
+            crashed_slots=spawn_tcp(b,"connection_crash")
+            guard_port=ready_tcp(crashed_slots)
+            wait_slots(0)
+            with held(b["bind_port"]) as active:
+                wait_slots(1)
+                crashed_slots[0].kill()
+                crashed_slots[0].wait(timeout=10)
+            assert inventory()["reserved_connection_slots"]==1
+            rows=reservations()
+            assert len(rows)==1 and rows[0]["request_id"]==crashed_slots[1]
+            entry=rows[0]
+            for port in (b["bind_port"],crashed_slots[3],guard_port):
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    with socket.socket() as check:
+                        check.settimeout(.5)
+                        if check.connect_ex(("127.0.0.1",port))!=0:break
+                    time.sleep(.1)
+                else:raise AssertionError("crashed connection listener remained reachable")
+            spec={"reservation_id":entry["id"],"tenant_id":entry["tenant_id"],"mapping_id":entry["mapping_id"],
+                  "mapping_revision":entry["mapping_revision"],"request_id":entry["request_id"],"confirmation":"offline_all_tunnels_stopped"}
+            assert command("--commercial-recover-bandwidth",spec)==entry["id"]
+            assert inventory()["reserved_connection_slots"]==0 and reservations()==[]
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT count(*) FROM connection_slots").fetchone()==(0,)
+            report["real_crashed_connection_slot_retained_until_audited_recovery"]=True
         finally:
             for p in reversed(children):
                 if p.poll() is None:
@@ -461,4 +544,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len([v for v in report.values() if v is True])==17
+assert len([v for v in report.values() if v is True])==19

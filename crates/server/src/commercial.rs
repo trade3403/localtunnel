@@ -17,6 +17,7 @@ struct Entitlement {
     active_devices:i64,retained_devices:i64,mappings:i64,
     bandwidth_reservations:i64, reserved_bytes_per_second:Option<i64>,
     month_utc:String, monthly_charged_bytes:i64,
+    reserved_connection_slots:i64,
 }
 #[derive(Serialize)]
 struct View {
@@ -29,6 +30,7 @@ struct View {
     tcp_bandwidth_scope:&'static str,
     aggregate_bandwidth_scope:&'static str,
     monthly_quota_scope:&'static str,
+    connection_quota_scope:&'static str,
     entitlement:Entitlement,
 }
 pub fn routes(pool:SqlitePool)->Router{
@@ -39,10 +41,10 @@ async fn current(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Respon
     // Identity, policy and real counts in one SQL snapshot. No caller-
     // supplied owner/tenant selector, no device credentials or hashes.
     let entitlement=sqlx::query_as::<_,Entitlement>(
-        "SELECT t.id AS tenant_id,p.id AS plan_id,p.code AS plan_code,p.version AS plan_version,p.name AS plan_name,e.revision,e.state,e.expires_at,CASE WHEN e.state='suspended' THEN 'suspended' WHEN e.expires_at IS NOT NULL AND e.expires_at<=unixepoch() THEN 'expired' ELSE 'active' END AS effective_state,p.max_active_devices,p.max_retained_devices,p.max_mappings,p.max_bandwidth_bps,p.max_monthly_bytes,p.max_concurrent_connections,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id AND d.enabled=1) AS active_devices,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id) AS retained_devices,(SELECT count(*) FROM mappings m WHERE m.owner_id=u.id) AS mappings,(SELECT count(*) FROM bandwidth_reservations b WHERE b.tenant_id=t.id) AS bandwidth_reservations,CASE WHEN EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.rate_bytes_per_second IS NULL) THEN NULL ELSE (SELECT coalesce(sum(b.rate_bytes_per_second),0) FROM bandwidth_reservations b WHERE b.tenant_id=t.id) END AS reserved_bytes_per_second,strftime('%Y-%m','now') AS month_utc,coalesce((SELECT charged_bytes FROM tenant_monthly_usage q WHERE q.tenant_id=t.id AND q.month_utc=strftime('%Y-%m','now')),0) AS monthly_charged_bytes FROM users u JOIN admin_sessions a ON a.user_id=u.id JOIN tenants t ON t.owner_id=u.id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
+        "SELECT t.id AS tenant_id,p.id AS plan_id,p.code AS plan_code,p.version AS plan_version,p.name AS plan_name,e.revision,e.state,e.expires_at,CASE WHEN e.state='suspended' THEN 'suspended' WHEN e.expires_at IS NOT NULL AND e.expires_at<=unixepoch() THEN 'expired' ELSE 'active' END AS effective_state,p.max_active_devices,p.max_retained_devices,p.max_mappings,p.max_bandwidth_bps,p.max_monthly_bytes,p.max_concurrent_connections,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id AND d.enabled=1) AS active_devices,(SELECT count(*) FROM devices d WHERE d.owner_id=u.id) AS retained_devices,(SELECT count(*) FROM mappings m WHERE m.owner_id=u.id) AS mappings,(SELECT count(*) FROM bandwidth_reservations b WHERE b.tenant_id=t.id) AS bandwidth_reservations,CASE WHEN EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.rate_bytes_per_second IS NULL) THEN NULL ELSE (SELECT coalesce(sum(b.rate_bytes_per_second),0) FROM bandwidth_reservations b WHERE b.tenant_id=t.id) END AS reserved_bytes_per_second,strftime('%Y-%m','now') AS month_utc,coalesce((SELECT charged_bytes FROM tenant_monthly_usage q WHERE q.tenant_id=t.id AND q.month_utc=strftime('%Y-%m','now')),0) AS monthly_charged_bytes,(SELECT count(*) FROM connection_slots s JOIN bandwidth_reservations b ON b.id=s.reservation_id WHERE b.tenant_id=t.id) AS reserved_connection_slots FROM users u JOIN admin_sessions a ON a.user_id=u.id JOIN tenants t ON t.owner_id=u.id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE a.token_digest=? AND a.expires_at>unixepoch() AND u.enabled=1 AND u.role='admin'")
         .bind(digest).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
     Ok(auth::uncached(Json(View{scope:"owner_inventory_only",commercial_enforcement:false,
-        enforced_admission:["active_devices","retained_devices","mappings","active_entitlement_for_creation"],enforced_runtime_entitlement:true,udp_bandwidth_scope:"per_mapping_per_direction_guarded_payload_only",web_bandwidth_scope:"supervised_web_per_mapping_per_direction_tcp_stream",tcp_bandwidth_scope:"supervised_tcp_per_mapping_per_direction_stream",aggregate_bandwidth_scope:"same_database_fixed_reservations_per_direction_not_measured_usage",monthly_quota_scope:"finite_plan_managed_tcp_http_https_udp_precharged_both_directions",entitlement})))
+        enforced_admission:["active_devices","retained_devices","mappings","active_entitlement_for_creation"],enforced_runtime_entitlement:true,udp_bandwidth_scope:"per_mapping_per_direction_guarded_payload_only",web_bandwidth_scope:"supervised_web_per_mapping_per_direction_tcp_stream",tcp_bandwidth_scope:"supervised_tcp_per_mapping_per_direction_stream",aggregate_bandwidth_scope:"same_database_fixed_reservations_per_direction_not_measured_usage",monthly_quota_scope:"finite_plan_managed_tcp_http_https_udp_precharged_both_directions",connection_quota_scope:"finite_plan_managed_tcp_http_https_backend_stream_slots_including_unknown",entitlement})))
 }
 
 
@@ -153,12 +155,12 @@ async fn assign(pool:&SqlitePool,c:Assignment)->Result<String,&'static str>{
 /// ingress starts. A NULL reservation marks an uncapped preview and blocks
 /// finite admission until that preview has been confirmed stopped.
 /// The INSERT is the atomic admission operation across independent workers.
-pub async fn reserve_bandwidth(pool:&SqlitePool,mapping:&str,revision:i64,request:Option<&str>,bps:Option<i64>,rate:Option<u32>,monthly:Option<i64>)->Result<String,&'static str>{
+pub async fn reserve_bandwidth(pool:&SqlitePool,mapping:&str,revision:i64,request:Option<&str>,bps:Option<i64>,rate:Option<u32>,monthly:Option<i64>,connections:Option<i64>)->Result<String,&'static str>{
     if bps.is_some()!=rate.is_some(){return Err("invalid bandwidth reservation")}
     let id=random_id()?;
     let rate=rate.map(i64::from);
-    let changed=sqlx::query("INSERT INTO bandwidth_reservations(id,tenant_id,mapping_id,mapping_revision,request_id,rate_bytes_per_second,monthly_cap) SELECT ?,t.id,m.id,m.revision,?,?,? FROM mappings m JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE m.id=? AND m.revision=? AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND p.max_bandwidth_bps IS ? AND p.max_monthly_bytes IS ? AND (p.max_monthly_bytes IS NULL OR (m.protocol IN ('tcp','http','https','udp') AND ? IS NOT NULL AND NOT EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.monthly_cap IS NOT p.max_monthly_bytes) AND coalesce((SELECT charged_bytes FROM tenant_monthly_usage q WHERE q.tenant_id=t.id AND q.month_utc=strftime('%Y-%m','now')),0)<p.max_monthly_bytes)) AND (p.max_bandwidth_bps IS NULL OR (? BETWEEN 1 AND p.max_bandwidth_bps/8 AND NOT EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.rate_bytes_per_second IS NULL) AND (SELECT coalesce(sum(b.rate_bytes_per_second),0) FROM bandwidth_reservations b WHERE b.tenant_id=t.id)<=p.max_bandwidth_bps/8-?))")
-        .bind(&id).bind(request).bind(rate).bind(monthly).bind(mapping).bind(revision).bind(bps).bind(monthly).bind(request).bind(rate).bind(rate)
+    let changed=sqlx::query("INSERT INTO bandwidth_reservations(id,tenant_id,mapping_id,mapping_revision,request_id,rate_bytes_per_second,monthly_cap,connection_cap) SELECT ?,t.id,m.id,m.revision,?,?,?,? FROM mappings m JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE m.id=? AND m.revision=? AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND p.max_bandwidth_bps IS ? AND p.max_monthly_bytes IS ? AND p.max_concurrent_connections IS ? AND (p.max_concurrent_connections IS NULL OR (m.protocol IN ('tcp','http','https') AND ? IS NOT NULL AND NOT EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.connection_cap IS NOT p.max_concurrent_connections))) AND (p.max_monthly_bytes IS NULL OR (m.protocol IN ('tcp','http','https','udp') AND ? IS NOT NULL AND NOT EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.monthly_cap IS NOT p.max_monthly_bytes) AND coalesce((SELECT charged_bytes FROM tenant_monthly_usage q WHERE q.tenant_id=t.id AND q.month_utc=strftime('%Y-%m','now')),0)<p.max_monthly_bytes)) AND (p.max_bandwidth_bps IS NULL OR (? BETWEEN 1 AND p.max_bandwidth_bps/8 AND NOT EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.rate_bytes_per_second IS NULL) AND (SELECT coalesce(sum(b.rate_bytes_per_second),0) FROM bandwidth_reservations b WHERE b.tenant_id=t.id)<=p.max_bandwidth_bps/8-?))")
+        .bind(&id).bind(request).bind(rate).bind(monthly).bind(connections).bind(mapping).bind(revision).bind(bps).bind(monthly).bind(connections).bind(request).bind(request).bind(rate).bind(rate)
         .execute(pool).await.map_err(|_|"bandwidth admission unavailable")?;
     if changed.rows_affected()!=1{return Err("tenant bandwidth budget unavailable or policy changed")}
     Ok(id)
@@ -229,4 +231,21 @@ pub async fn charge_monthly(pool:&SqlitePool,mapping:&str,revision:i64,rid:&str,
         .bind(n).bind(mapping).bind(revision).bind(cap).bind(n).bind(rid).bind(cap)
         .execute(pool).await.map_err(|_|"monthly debit unavailable")?;
     Ok(changed.rows_affected()==1)
+}
+
+
+/// Atomic same-tenant admission for a single actual backend TCP stream.
+/// Old or mismatched reservations cannot supply admission. Counts include
+/// unknown/crashed slots until the exact reservation is safely recovered.
+pub async fn acquire_connection(pool:&SqlitePool,mapping:&str,revision:i64,rid:&str,cap:i64)->Result<Option<String>,&'static str>{
+    if !(1..=65536).contains(&cap){return Err("invalid connection cap")}
+    let id=random_id()?;
+    let n=sqlx::query("INSERT INTO connection_slots(id,reservation_id) SELECT ?,b.id FROM bandwidth_reservations b JOIN mappings m ON m.id=b.mapping_id AND m.revision=b.mapping_revision JOIN tenants t ON t.id=b.tenant_id AND t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id JOIN runtime_requests r ON r.mapping_id=m.id AND r.request_id=b.request_id JOIN users u ON u.id=m.owner_id JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN nodes node ON node.id=m.node_id WHERE m.id=? AND m.revision=? AND b.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running') AND m.protocol IN ('tcp','http','https') AND m.enabled=0 AND u.enabled=1 AND u.role='admin' AND d.enabled=1 AND node.enabled=1 AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND p.max_concurrent_connections=? AND b.connection_cap=p.max_concurrent_connections AND (m.protocol='tcp' OR EXISTS(SELECT 1 FROM domains h WHERE h.id=m.domain_id AND h.owner_id=m.owner_id AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch())) AND (SELECT count(*) FROM connection_slots s JOIN bandwidth_reservations existing ON existing.id=s.reservation_id WHERE existing.tenant_id=t.id)<p.max_concurrent_connections")
+        .bind(&id).bind(mapping).bind(revision).bind(rid).bind(cap).execute(pool).await.map_err(|_|"connection admission unavailable")?.rows_affected();
+    match n{0=>Ok(None),1=>Ok(Some(id)),_=>Err("ambiguous connection admission")}
+}
+pub async fn release_connection(pool:&SqlitePool,id:&str)->Result<(),&'static str>{
+    let n=sqlx::query("DELETE FROM connection_slots WHERE id=?").bind(id).execute(pool).await.map_err(|_|"connection release unavailable")?.rows_affected();
+    if n!=1{return Err("connection release outcome unknown")}
+    Ok(())
 }
