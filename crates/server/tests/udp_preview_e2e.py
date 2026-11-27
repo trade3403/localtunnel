@@ -288,7 +288,7 @@ try:
                         if kind==socket.SOCK_STREAM:
                             sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
                         sock.bind(("127.0.0.1",port))
-            def launch_lease():
+            def launch_lease(finite=False):
                 request=call(base,lease_route+"/udp-start",202,"POST",admin,{"expected_revision":lm["revision"]})
                 rid=request["request_id"]
                 worker=subprocess.Popen([exe,"--runtime-udp-device-worker",str(root),lm["id"],str(lm["revision"]),str(relay),str(internal),"4096","1200"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
@@ -312,7 +312,8 @@ try:
                 agent=subprocess.Popen([str(engine),str(config_file)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 children.append(agent)
                 line(worker,"UDP_PREVIEW_READY",35)
-                assert agent.poll() is None and lease_echo()
+                assert agent.poll() is None
+                if not finite:assert lease_echo()
                 state=call(base,lease_route+"/runtime",200,token=admin)
                 assert state["request"]["request_id"]==rid and state["request"]["state"]=="running"
                 return worker,agent,config_file,lease
@@ -426,6 +427,41 @@ try:
             policy(plan_id="legacy-v1")
             assert monthly()["monthly_charged_bytes"]==final["monthly_charged_bytes"]
             report["real_udp_device_monthly_shared_budget_exhaustion_and_cleanup"]=True
+            connection_plan={**plan,"code":"udp-connections","max_monthly_bytes":None,"max_concurrent_connections":1}
+            created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(connection_plan).encode(),capture_output=True,timeout=20)
+            assert created.returncode==0
+            policy(plan_id=created.stdout.decode().strip())
+            rejected(command(m["revision"],"connection_manual"))
+            assert not (root/"connection_manual").exists()
+            # Avoid the helper's extra user echo so the probe exemption
+            # is tested before any actual client claims a slot.
+            worker,agent,config_file,connection_lease=launch_lease(finite=True)
+            assert monthly()["reserved_connection_slots"]==0
+            assert json.loads((root/("udp-device-"+connection_lease["request_id"])/"manifest.json").read_text())["connection_cap"]==1
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as first, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as second:
+                first.settimeout(3)
+                second.settimeout(.5)
+                dst=("127.0.0.1",lease_ingress)
+                data=secrets.token_bytes(64)
+                first.sendto(data,dst)
+                assert first.recvfrom(65535)==(data,dst)
+                assert monthly()["reserved_connection_slots"]==1
+                second.sendto(data,dst)
+                try:second.recvfrom(65535)
+                except socket.timeout:pass
+                else:raise AssertionError("over-limit device UDP source received data")
+                first.sendto(data,dst)
+                assert first.recvfrom(65535)==(data,dst)
+                assert worker.poll() is None
+                call(base,endpoint,200,"POST",d2["device_token"],spec)
+                call(base,lease_route+"/stop",202,"POST",admin,{"request_id":connection_lease["request_id"]})
+                assert worker.wait(timeout=15)==0
+            assert monthly()["reserved_connection_slots"]==0 and monthly()["bandwidth_reservations"]==0
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            finish_agent(agent,config_file)
+            assert_clean(connection_lease)
+            policy(plan_id="legacy-v1")
+            report["real_udp_device_connection_quota_probe_exempt_and_cleanup"]=True
             worker,agent,config_file,lease3=launch_lease()
             call(base,device_route+"/revoke",204,"POST",admin)
             assert worker.wait(timeout=15)!=0
@@ -513,4 +549,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==18 and all(v is True for v in report.values())
+assert len(report)==19 and all(v is True for v in report.values())
