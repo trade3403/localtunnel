@@ -1045,12 +1045,15 @@ async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16
     let private=key("LOCALTUNNEL_SERVER_PRIVATE_KEY")?;
     let public=key("LOCALTUNNEL_SERVER_PUBLIC_KEY")?;
     let token=hex::encode(auth::random::<32>().map_err(|_|"random generation failed")?);
-    // Reject occupied listeners before creating any secret material.
+    // Keep both preflight listeners reserved while selecting the ephemeral
+    // limiter port and preparing the bundle. Otherwise the OS can assign
+    // the requested relay port to our own limiter (or a concurrent worker).
+    let mut preflight=Vec::with_capacity(2);
     for p in [relay_port,bind]{
         let tcp=tokio::net::TcpSocket::new_v4().map_err(|_|"TCP preflight socket unavailable")?;
         tcp.set_reuseaddr(true).map_err(|_|"TCP preflight setup failed")?;
         tcp.bind(std::net::SocketAddr::from(([127,0,0,1],p))).map_err(|_|"TCP preview port unavailable")?;
-        let _listener=tcp.listen(1).map_err(|_|"TCP preview listener unavailable")?;
+        preflight.push(tcp.listen(1).map_err(|_|"TCP preview listener unavailable")?);
     }
     let meter=m.monthly_cap.map(|cap|crate::tcp_limit::MonthlyMeter::new(pool.clone(),id.into(),revision,rid.into(),cap));
     let quota=m.connection_cap.map(|cap|crate::tcp_limit::ConnectionQuota::new(pool.clone(),id.into(),revision,rid.into(),cap));
@@ -1081,6 +1084,9 @@ async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16
         if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         if {let current=checked_tcp(pool,id,revision,rid).await?; (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap)}{return Ok(())}
         reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,Some(rid),m.bandwidth_bps,m.bandwidth_bps.map(|_|rate),m.monthly_cap,m.connection_cap).await?);
+        // The engine must bind its own sockets. Release immediately before
+        // spawning; the external bind race is still fail-closed.
+        drop(preflight);
         children.start(&engine,&dir.join("server.toml"))?;
         children.start(&engine,&dir.join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
@@ -1088,8 +1094,12 @@ async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16
         loop{
             if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
             if {let current=checked_tcp(pool,id,revision,rid).await?; (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap)}{return Ok(())}
-            if guard.quota_denied(){return Ok(())}
-            if !children.healthy()||!guard.healthy(){return Err("TCP worker child or guard exited")}
+            if guard.quota_denied(){
+                if !ready{eprintln!("TCP readiness denied by monthly quota or current policy");}
+                return Ok(())
+            }
+            if !children.healthy(){return Err("TCP engine child exited")}
+            if !guard.healthy(){return Err("TCP limiter thread exited")}
             if !ready{
                 if tcp_echo_probe(bind){
                     if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}

@@ -172,8 +172,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .create_if_missing(true)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(3)))
-        .await?;
-    MIGRATOR.run(&pool).await?;
+        .await.map_err(|e|{
+            if tcp_worker{eprintln!("TCP worker database connection failed");}
+            e
+        })?;
+    MIGRATOR.run(&pool).await.map_err(|e|{
+        if tcp_worker{eprintln!("TCP worker database migration check failed");}
+        e
+    })?;
     // Hold the guard until this entire process finishes, including
     // cleanup and DB release. Exclusive recovery cannot race a new worker.
     let _bandwidth_guard=if bandwidth_recover{
@@ -237,7 +243,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     if tcp_worker {
         let arg=|i:usize|args[i].to_str().ok_or("invalid TCP worker argument");
-        preview::tcp_worker(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?,arg(6)?.parse()?).await?;
+        // tcp_worker returns only static, internally authored errors. Never
+        // print SQLx errors, engine stderr, argument values or secret material.
+        preview::tcp_worker(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?,arg(6)?.parse()?).await.map_err(|reason|{
+            eprintln!("TCP worker stopped: {reason}");
+            reason
+        })?;
         return Ok(());
     }
     if udp_device_worker {

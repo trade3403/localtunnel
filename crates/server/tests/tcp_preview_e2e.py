@@ -52,7 +52,9 @@ def line(p,prefix,seconds):
     with selectors.DefaultSelector() as s:
         s.register(p.stdout,selectors.EVENT_READ)
         assert s.select(seconds),"TCP readiness timed out"
-    assert p.stdout.readline().strip().startswith(prefix),"TCP readiness failed"
+    # No raw stdout/credential material in logs. Worker stderr contains
+    # fixed diagnostics only; the return code distinguishes exit from timeout.
+    assert p.stdout.readline().strip().startswith(prefix),f"TCP/UDP readiness failed (exit={p.poll()})"
 
 class Echo(socketserver.BaseRequestHandler):
     def handle(self):
@@ -137,7 +139,7 @@ try:
             report["real_node_drain_cancels_unclaimed_and_blocks_new_admission"]=True
             def start(bundle):
                 q=call(base,route+"/tcp-start",202,"POST",admin,spec)
-                p=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),mid,str(m["revision"]),str(relay),bundle,"240000"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                p=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),mid,str(m["revision"]),str(relay),bundle,"240000"],env=env,stdout=subprocess.PIPE,text=True)
                 children.append(p)
                 line(p,"TCP_PREVIEW_READY",45)
                 state=call(base,route+"/runtime",200,token=admin)
@@ -222,12 +224,20 @@ try:
                 path="mappings/"+item["id"]
                 q=call(base,path+"/tcp-start",202,"POST",token,{"expected_revision":item["revision"]})
                 port=alloc(30000,60000)
-                child=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),item["id"],str(item["revision"]),str(port),bundle,"65536"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                child=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),item["id"],str(item["revision"]),str(port),bundle,"65536"],env=env,stdout=subprocess.PIPE,text=True)
                 children.append(child)
                 return child,q["request_id"],path,port,bundle
             def ready_tcp(run):
                 child,rid,path,port,bundle=run
-                line(child,"TCP_PREVIEW_READY",45)
+                try:
+                    line(child,"TCP_PREVIEW_READY",45)
+                except AssertionError:
+                    # Inspect only enumerated request state and numeric exit
+                    # status. Do not print the request, manifest or credentials.
+                    with sqlite3.connect(root/"control.sqlite3") as db:
+                        state=db.execute("SELECT state FROM runtime_requests WHERE request_id=?",(rid,)).fetchone()
+                    print(f"TCP readiness diagnostic: bundle={bundle}, state={state}, exit={child.poll()}",file=sys.stderr,flush=True)
+                    raise
                 manifest=json.loads((root/bundle/"manifest.json").read_text())
                 assert manifest["byte_rate"]==65536
                 return manifest["tcp_limiter_port"]
