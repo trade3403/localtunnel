@@ -66,12 +66,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y dnsutils nginx curl openssl
+      - name: Build existing core CLI for preview integration
+        run: cargo build --release --locked
       - name: Real verified TLS relay control and restricted ingress
         run: python3 crates/server/tests/relay_tls_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-tls.json
       - name: Real node inventory and DNS TXT proof lifecycle
         run: python3 crates/server/tests/domains_e2e.py crates/server/target/release/localtunnel-server management-evidence/domains.json
-      - name: Build existing core CLI for preview integration
-        run: cargo build --release --locked
       - name: Real authorized TCP management draft to guarded Noise echo preview
         run: python3 crates/server/tests/tcp_preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/tcp-preview.json
       - name: Real authorized UDP management draft to guarded Noise echo preview

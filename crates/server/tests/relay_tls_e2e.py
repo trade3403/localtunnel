@@ -15,6 +15,7 @@ import urllib.error
 import urllib.request
 import http.server
 import threading
+import re
 
 exe=Path(sys.argv[1]).resolve()
 relay=exe.with_name("localtunnel-relay")
@@ -231,6 +232,83 @@ try:
             assert db.execute("SELECT count(*) FROM relay_grants").fetchone()==(1,)
             assert db.execute("SELECT generation,state FROM relay_allocations WHERE id=?",(alloc["id"],)).fetchone()==(2,"reserved")
         report["real_tls_node_conservative_expiry_and_restart_rejection"]=True
+        # Real TCP data path on an independently launched relay engine.
+        # Reuse the repository's checksum-pinned Rathole acquisition helper.
+        sys.path.insert(0,str(Path(__file__).resolve().parents[3]/"tests"))
+        import e2e as core_test
+        engine=core_test.engine(root)
+        keys=subprocess.check_output([str(engine),"--genkey"],text=True,timeout=15)
+        private=re.search(r"Private Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
+        public=re.search(r"Public Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
+        service_token=secrets.token_hex(32)
+        tokens.extend([private,service_token])
+        for name,value in (("noise.private",private),("tcp.token",service_token)):
+            path=dirs[1]/name
+            path.write_text(value+"\n");path.chmod(0o600)
+        def free_range(lo,hi):
+            for _ in range(200):
+                n=lo+secrets.randbelow(hi-lo+1)
+                with socket.socket() as s:
+                    try:s.bind(("127.0.0.1",n))
+                    except OSError:continue
+                    return n
+            raise AssertionError("port unavailable")
+        relay_port=free_range(30000,59999)
+        bind_port=free_range(20001,29999)
+        class Echo(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                body=self.path.encode()
+                self.send_response(200);self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+            def log_message(self,*args):pass
+        target=http.server.ThreadingHTTPServer(("127.0.0.1",0),Echo)
+        worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
+        try:
+            a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":device,"node_id":nodes[1],
+                "protocol":"tcp","local_port":target.server_port,"bind_port":bind_port},owner,201)
+            config=root/"agent.toml"
+            subprocess.run([str(core_test.CLI),"client-config",str(config),f"127.0.0.1:{relay_port}",
+                "m_"+a["mapping_id"],f"127.0.0.1:{target.server_port}"],
+                env=dict(os.environ,LOCALTUNNEL_TOKEN=service_token,LOCALTUNNEL_SERVER_PUBLIC_KEY=public),
+                check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            g=admin("allocations/"+a["id"]+"/grant",{"expected_generation":1,"expected_mapping_revision":1},owner,201)
+            def tcp():
+                p=subprocess.Popen([str(relay),"--tcp-preview",str(dirs[1]),"localhost",str(tp),nodes[1],"1","6",
+                    a["id"],a["mapping_id"],"1",str(g["generation"]),g["id"],str(relay_port),str(bind_port),str(engine)],
+                    stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                children.append(p);return p
+            denied=tcp();fails(denied)
+            assert "relay TCP engine started" not in denied.stdout.read()
+            admin("allocations/"+a["id"]+"/tcp-intent",{"grant_id":g["id"],"expected_generation":g["generation"],"relay_port":relay_port},owner,201)
+            running=tcp()
+            with selectors.DefaultSelector() as sel:
+                sel.register(running.stdout,selectors.EVENT_READ);assert sel.select(5)
+            assert running.stdout.readline().strip()=="relay TCP engine started"
+            agent=subprocess.Popen([str(engine),str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                env=dict(os.environ,RUST_LOG="warn"))
+            children.append(agent)
+            body="/"+secrets.token_hex(24)
+            def transfer():
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{bind_port}"+body,timeout=.5) as r:return r.read()==body.encode()
+                except OSError:return False
+            wait(transfer,9)
+            assert running.poll() is None and agent.poll() is None
+            replay=tcp();fails(replay)
+            assert "relay TCP engine started" not in replay.stdout.read()
+            report["real_independent_noise_tcp_transfer_and_one_shot_start"]=True
+            out,err=running.communicate(timeout=20)
+            assert running.returncode==0 and out.strip()=="relay TCP engine expired and stopped"
+            assert not any(t in out+err for t in tokens)
+            for port in (bind_port,relay_port):
+                with socket.socket() as s:
+                    s.settimeout(.5);assert s.connect_ex(("127.0.0.1",port))!=0
+            assert not transfer()
+            assert not (dirs[1]/("tcp-"+g["id"]+".toml")).exists()
+            with sqlite3.connect(center/"control.sqlite3") as db:
+                assert db.execute("SELECT claimed_at IS NOT NULL FROM relay_tcp_intents WHERE grant_id=?",(g["id"],)).fetchone()==(1,)
+            report["real_independent_tcp_engine_expiry_closes_ports"]=True
+        finally:
+            target.shutdown();target.server_close();worker.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
         assert request("/api/v1/relay/identity",tokens[1])[0]==401
@@ -242,4 +320,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==8 and all(report.values())
+assert len(report)==10 and all(report.values())

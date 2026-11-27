@@ -367,6 +367,8 @@ REQUIRED["management-v09"] = {
         "real_relay_process_live_policy_revision_sync",
         "real_tls_node_exact_grant_validation",
         "real_tls_node_conservative_expiry_and_restart_rejection",
+        "real_independent_noise_tcp_transfer_and_one_shot_start",
+        "real_independent_tcp_engine_expiry_closes_ports",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",
