@@ -118,8 +118,40 @@ try:
                     try:db.execute(sql);raise AssertionError("mutable budget")
                     except sqlite3.IntegrityError:db.rollback()
             report["real_cross_node_budget_independent_caps_and_immutable_non_executable_ledger"]=True
+            # Two separate finite TCP allocations on different nodes can
+            # observe only their own reserved slices; no old grant can run.
+            beat()
+            def issue(item,token=other,status=201):
+                return call(base,"allocations/"+item["id"]+"/budget-grant",status,token,"POST",dict(
+                    expected_generation=1,expected_mapping_revision=1,expected_entitlement_revision=other_ent["revision"]))
+            issue(independent,owner,409)
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                answers=list(workers.map(lambda _:issue(independent,status=(201,409)),range(2)))
+            assert sorted(code for code,_ in answers)==[201,409]
+            g=next(r["grant"] for code,r in answers if code==201)
+            h=issue(second)[1]["grant"]
+            assert g["rate_bytes_per_second"]==h["rate_bytes_per_second"]==65536 and g["monthly_bytes"]==40000 and h["monthly_bytes"]==60000
+            def observe(g,status=200,token=None,**changes):
+                payload={k:g[k] for k in ("allocation_id","mapping_id","mapping_revision","node_id","node_generation","generation")}
+                payload.update(protocol_version=1,grant_id=g["id"],nonce=secrets.token_hex(16));payload.update(changes)
+                return call(base,"relay/budget-grant",status,token or tokens[nodes.index(g["node_id"])],"POST",payload)[1]
+            r=observe(g)
+            assert r["scope"]=="budget_authorization_preview_only" and r["executable"] is False and r["grant"]["connection_slots"]==2
+            observe(h)
+            observe(g,401,tokens[0]);observe(g,401,other);observe(g,401,mapping_revision=2)
+            call(base,"allocations/"+independent["id"]+"/grant",409,other,"POST",{"expected_generation":1,"expected_mapping_revision":1})
+            payload={k:g[k] for k in ("allocation_id","mapping_id","mapping_revision","node_id","node_generation","generation")}
+            payload.update(protocol_version=1,grant_id=g["id"],relay_port=31000,nonce=secrets.token_hex(16))
+            call(base,"relay/tcp-claim",401,tokens[1],"POST",payload)
+            cmd(root,"--set-node-policy",nodes[1],2,8,"east","maintenance")
+            observe(g,401);observe(h)
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT count(*) FROM relay_budget_grants").fetchone()==(2,)
+                assert db.execute("SELECT count(*) FROM relay_grants").fetchone()==(0,)
+                assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
+            report["real_finite_budget_grant_exact_node_slice_and_legacy_isolation"]=True
         finally:stop(p)
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==2 and all(report.values())
+assert len(report)==3 and all(report.values())

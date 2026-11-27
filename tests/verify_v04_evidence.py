@@ -340,6 +340,7 @@ REQUIRED["management-v09"] = {
     "relay-budget.json": [
         "real_cross_node_budget_atomic_race_and_owner_isolation",
         "real_cross_node_budget_independent_caps_and_immutable_non_executable_ledger",
+        "real_finite_budget_grant_exact_node_slice_and_legacy_isolation",
     ],
     "relay-http-claim.json": [
         "real_http_dns_proof_exact_claim_and_protocol_isolation",
@@ -391,6 +392,7 @@ REQUIRED["management-v09"] = {
         "real_https_supervisor_sigkill_closes_owned_gateway_and_engine_other_node_survives",
         "real_offline_udp_expiry_closes_datagram_port_and_retains_crash_reservation",
         "real_crashed_https_claim_rejected_after_center_recovery",
+        "real_tls_finite_budget_node_verification_and_expiry_without_listener",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",

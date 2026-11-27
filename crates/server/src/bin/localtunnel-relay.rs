@@ -464,13 +464,53 @@ mod linux {
         println!("relay {} engine expired and stopped",protocol.to_ascii_uppercase());
         Ok(())
     }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BudgetResponse{protocol_version:i64,nonce:String,scope:String,executable:bool,grant:BudgetGrant}
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BudgetGrant{id:String,allocation_id:String,mapping_id:String,mapping_revision:i64,node_id:String,node_generation:i64,
+        generation:i64,policy_revision:i64,entitlement_revision:i64,device_revision:i64,bind_port:u16,
+        rate_bytes_per_second:u64,monthly_bytes:u64,connection_slots:u32,month_utc:String,issued_at:i64,expires_at:i64,server_time:i64}
+    fn verify_budget(endpoint:&Endpoint,token:&str,node:&str,generation:i64,capacity:i64,expected:&Expected<'_>,bind:u16,rate:u64,monthly:u64,slots:u32)->Result<()>{
+        if !matches!(endpoint,Endpoint::Tls{..})||!(20000..=29999).contains(&bind)||!(65536..=125000000).contains(&rate)||
+            !(1..=9000000000000000).contains(&monthly)||!(1..=65536).contains(&slots){return Err(Failure::Protocol)}
+        let policy=synchronize(endpoint,token,node,generation,capacity,None)?;
+        if policy.policy_mode!="active"||policy.approved_capacity<1||capacity<1{return Err(Failure::Denied)}
+        let mut bytes=[0u8;16];OsRng.try_fill_bytes(&mut bytes).map_err(|_|Failure::Protocol)?;
+        let nonce=hex::encode(bytes);
+        let payload=serde_json::json!({"protocol_version":1,"grant_id":expected.id,"allocation_id":expected.allocation,"mapping_id":expected.mapping,
+            "mapping_revision":expected.revision,"node_id":node,"node_generation":generation,"generation":expected.generation,"nonce":nonce}).to_string();
+        let started=Instant::now();let boot=boot_now()?;
+        let (code,data)=request(endpoint,token,"/api/v1/relay/budget-grant",Some(&payload))?;
+        if code!=200{return Err(Failure::Denied)}
+        let reply:BudgetResponse=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
+        let g=reply.grant;
+        if reply.protocol_version!=1||reply.nonce!=nonce||reply.scope!="budget_authorization_preview_only"||reply.executable||
+            g.id!=expected.id||g.allocation_id!=expected.allocation||g.mapping_id!=expected.mapping||g.mapping_revision!=expected.revision||
+            g.node_id!=node||g.node_generation!=generation||g.generation!=expected.generation||g.generation!=2||g.policy_revision!=policy.policy_revision||
+            g.device_revision<1||g.entitlement_revision<1||g.bind_port!=bind||g.rate_bytes_per_second!=rate||g.monthly_bytes!=monthly||g.connection_slots!=slots||
+            g.month_utc.len()!=7||g.month_utc.as_bytes()[4]!=b'-'||g.issued_at<1||g.issued_at.checked_add(15)!=Some(g.expires_at)||
+            g.server_time<g.issued_at||g.server_time<policy.received_at||g.server_time>=g.expires_at{return Err(Failure::Denied)}
+        let seconds=g.expires_at.checked_sub(g.server_time).and_then(|n|n.checked_sub(1)).filter(|n|*n>0).ok_or(Failure::Denied)?;
+        let duration=Duration::from_secs(seconds as u64);
+        let deadline=started.checked_add(duration).ok_or(Failure::Protocol)?;
+        let boot_deadline=boot.checked_add(duration).ok_or(Failure::Protocol)?;
+        if lease_left(deadline,boot_deadline)?.is_zero(){return Err(Failure::Denied)}
+        println!("relay budget preview verified");
+        loop{let left=lease_left(deadline,boot_deadline)?;if left.is_zero(){break}std::thread::sleep(left.min(Duration::from_millis(50)));}
+        println!("relay budget preview expired");
+        Ok(())
+    }
     pub(super) fn run()->Result<()>{
         let args:Vec<_>=std::env::args_os().skip(1).collect();
         let arg=|i:usize|args.get(i).and_then(|a|a.to_str()).ok_or(Failure::Protocol);
         let verify=args.len()==12&&arg(0)?=="--verify-grant";
+        let budget=args.len()==16&&arg(0)?=="--verify-budget";
         let tcp=args.len()==15&&matches!(arg(0)?,"--tcp-preview"|"--udp-preview");
         let http=args.len()==17&&matches!(arg(0)?,"--http-preview"|"--https-preview");
-        let (endpoint,dir,index,port)=if (args.len()==7&&arg(0)?=="--tls")||verify||tcp||http{
+        let (endpoint,dir,index,port)=if (args.len()==7&&arg(0)?=="--tls")||verify||budget||tcp||http{
             let host=arg(2)?;
             if !hostname(host){return Err(Failure::Protocol)}
             let port:u16=arg(3)?.parse().map_err(|_|Failure::Protocol)?;
@@ -486,10 +526,14 @@ mod linux {
         let capacity:i64=arg(index+2)?.parse().map_err(|_|Failure::Protocol)?;
         if port==0||node.len()!=32||!node.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||generation<1||!(0..=65536).contains(&capacity){return Err(Failure::Protocol)}
         let token=private_token(&dir)?;
-        if verify||tcp||http{
+        if verify||budget||tcp||http{
             let expected=Expected{allocation:arg(7)?,mapping:arg(8)?,revision:arg(9)?.parse().map_err(|_|Failure::Protocol)?,
                 generation:arg(10)?.parse().map_err(|_|Failure::Protocol)?,id:arg(11)?};
             if !hex_id(expected.id)||!hex_id(expected.allocation)||!hex_id(expected.mapping)||expected.revision<1||expected.generation<2{return Err(Failure::Protocol)}
+            if budget{
+                return verify_budget(&endpoint,&token,node,generation,capacity,&expected,arg(12)?.parse().map_err(|_|Failure::Protocol)?,
+                    arg(13)?.parse().map_err(|_|Failure::Protocol)?,arg(14)?.parse().map_err(|_|Failure::Protocol)?,arg(15)?.parse().map_err(|_|Failure::Protocol)?)
+            }
             if tcp||http{
                 let web=if http{Some(Web{port:arg(15)?.parse().map_err(|_|Failure::Protocol)?,hostname:arg(16)?,tls:arg(0)?=="--https-preview"})}else{None};
                 return supervise_tcp(if http{if arg(0)?=="--https-preview"{"https"}else{"http"}}else if arg(0)?=="--udp-preview"{"udp"}else{"tcp"},&endpoint,&dir,&token,node,generation,capacity,&expected,
@@ -519,6 +563,6 @@ fn main(){
     #[cfg(target_os="linux")]
     if linux::run().is_ok(){return}
     // Fixed diagnostics only, never paths, credentials or response bodies.
-    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine> OR --http-preview/--https-preview (same arguments plus gateway-port and hostname)");
+    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --verify-budget (verify-grant arguments plus bind-port rate-bytes-per-second monthly-bytes connection-slots) OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine> OR --http-preview/--https-preview (same arguments plus gateway-port and hostname)");
     std::process::exit(1);
 }

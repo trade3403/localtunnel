@@ -934,6 +934,39 @@ try:
             finally:
                 target.shutdown();target.server_close();web_thread.join(timeout=3)
                 done.set();udp_thread.join(timeout=3)
+        # Real independent TLS budget verifier, without any business listener.
+        finite=cmd("--commercial-create-plan",data={"code":"finite-relay","version":1,"name":"Finite relay",
+            "max_active_devices":4,"max_retained_devices":8,"max_mappings":8,"max_bandwidth_bps":1048576,
+            "max_monthly_bytes":100000,"max_concurrent_connections":4})
+        cmd("--commercial-create-account",data={"username":"finite","password":password,"plan_id":finite,"expires_at":None})
+        finite_owner=admin("auth/login",{"username":"finite","password":password})["access_token"];tokens.append(finite_owner)
+        pairing=admin("devices/pairing-code",None,finite_owner)["pairing_code"]
+        finite_device=admin("devices/enroll",{"pairing_code":pairing,"name":"budget fixture"},status=201)["id"]
+        control(tokens[0],{"protocol_version":1,"node_id":nodes[0],"generation":1,"capacity":5,"nonce":secrets.token_hex(16)},200)
+        bp=offline_port(20001,29999)
+        a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":finite_device,"node_id":nodes[0],
+            "protocol":"tcp","local_port":8080,"bind_port":bp},finite_owner,201)
+        spec=dict(expected_generation=1,expected_mapping_revision=1,expected_entitlement_revision=1)
+        admin("allocations/"+a["id"]+"/budget-preview",dict(spec,rate_bytes_per_second=65536,monthly_bytes=50000,connection_slots=2),finite_owner,201)
+        g=admin("allocations/"+a["id"]+"/budget-grant",spec,finite_owner,201)["grant"]
+        def verify_budget(rate="65536"):
+            child=subprocess.Popen([str(relay),"--verify-budget",str(dirs[0]),"localhost",str(tp),nodes[0],"1","5",
+                a["id"],a["mapping_id"],"1","2",g["id"],str(bp),rate,"50000","2"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            children.append(child);return child
+        bad=verify_budget("65537");fails(bad)
+        assert "relay budget preview verified" not in bad.stdout.read()
+        good=verify_budget()
+        with selectors.DefaultSelector() as sel:
+            sel.register(good.stdout,selectors.EVENT_READ);assert sel.select(5)
+        assert good.stdout.readline().strip()=="relay budget preview verified"
+        with socket.socket() as check:
+            check.settimeout(.5);assert check.connect_ex(("127.0.0.1",bp))!=0
+        out,err=good.communicate(timeout=20)
+        assert good.returncode==0 and out.strip()=="relay budget preview expired"
+        assert not any(t in out+err for t in tokens)
+        wait(lambda:time.time()>=g["expires_at"],5)
+        fails(verify_budget())
+        report["real_tls_finite_budget_node_verification_and_expiry_without_listener"]=True
         dns.shutdown();dns_thread.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
@@ -946,4 +979,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==23 and all(report.values())
+assert len(report)==24 and all(report.values())
