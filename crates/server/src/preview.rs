@@ -788,7 +788,6 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     let m=checked_udp(pool,id,revision,rid).await?;
     if (m.monthly_cap.is_some()||m.connection_cap.is_some())&&rid.is_none(){return Err("commercial UDP quota requires managed request")}
     let limits=effective_udp_limits(limits,m.bandwidth_bps)?;
-    if m.connection_cap.is_some() && device_lease{return Err("finite UDP device connection policy not yet enabled")}
     if device_lease!=bundle.starts_with("udp-device-"){return Err("reserved UDP device bundle name")}
     if [relay_port,internal_port,m.bind_port as u16].contains(&(m.local_port as u16)){
         return Err("conflicting UDP preview ports")
