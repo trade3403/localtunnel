@@ -605,16 +605,28 @@ try:
                 def mixed_start(item,action,route,*args):
                     mp="mappings/"+item["id"]
                     req=expect(call(base,mp+route,"POST",admin,{"expected_revision":item["revision"]}),202)
-                    proc=subprocess.Popen([exe,action,str(root),item["id"],str(item["revision"]),*map(str,args)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    proc=subprocess.Popen([exe,action,str(root),item["id"],str(item["revision"]),*map(str,args)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
                     processes.append(proc)
                     mixed_runs.append((proc,mp,req["request_id"]))
                     deadline=time.monotonic()+45
                     while time.monotonic()<deadline:
-                        assert proc.poll() is None,"mixed worker exited"
+                        assert proc.poll() is None, f"mixed {action} worker exited: {proc.stderr.read() if proc.poll() is not None else ''}"
                         if expect(call(base,mp+"/runtime",token=admin),200)["request"]["state"]=="running":return
                         time.sleep(.2)
                     raise AssertionError("mixed worker not running")
-                with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp_target:
+                class MixedEcho(socketserver.BaseRequestHandler):
+                    def handle(self):
+                        self.request.settimeout(20)
+                        try:
+                            while True:
+                                data=self.request.recv(4096)
+                                if not data:return
+                                self.request.sendall(data)
+                        except OSError:return
+                with socketserver.ThreadingTCPServer(("127.0.0.1",0),MixedEcho) as tcp_target, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp_target:
+                    tcp_target.daemon_threads=True
+                    tcp_thread=threading.Thread(target=tcp_target.serve_forever,daemon=True)
+                    tcp_thread.start()
                     udp_target.bind(("127.0.0.1",0))
                     udp_target.settimeout(.2)
                     done=threading.Event()
@@ -629,7 +641,7 @@ try:
                     echo_thread.start()
                     try:
                         hm=mixed_mapping("http",fixture.server_port,hd["id"])
-                        tm=mixed_mapping("tcp",fixture.server_port)
+                        tm=mixed_mapping("tcp",tcp_target.server_address[1])
                         um=mixed_mapping("udp",udp_target.getsockname()[1])
                         mixed_start(mapping3,"--runtime-tls-worker","/start",rp,"mixed_tls","tls_gateway",gp,"expected_body",probe,"cert_v2")
                         mixed_start(hm,"--runtime-worker","/start",unique_port(),"mixed_http","mixed_gateway",hp,"expected_body")
@@ -642,7 +654,10 @@ try:
                             sock=socket.create_connection(("127.0.0.1",port),timeout=5)
                             sock.sendall(("GET / HTTP/1.1\\r\\nHost: "+host+"\\r\\n").encode())
                             return sock
-                        with hold_web(bp,hostname) as a, hold_web(hm["bind_port"],http_host) as b, hold_web(tm["bind_port"],http_host) as c, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as d:
+                        with hold_web(bp,hostname) as a, hold_web(hm["bind_port"],http_host) as b, socket.create_connection(("127.0.0.1",tm["bind_port"]),timeout=5) as c, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as d:
+                            payload=secrets.token_bytes(32)
+                            c.sendall(payload)
+                            assert c.makefile("rb").read(len(payload))==payload
                             wait_connection_slots(3)
                             d.settimeout(3)
                             dst=("127.0.0.1",um["bind_port"])
@@ -656,11 +671,13 @@ try:
                             try:result=tls_request(gp,hostname,ca2)
                             except (OSError,http.client.HTTPException):result=None
                             assert result is None or result[0]!=200
-                            for sock in (a,b,c):
+                            for sock in (a,b):
                                 sock.sendall(b"Connection: close\\r\\n\\r\\n")
                                 with http.client.HTTPResponse(sock) as response:
                                     response.begin()
                                     assert response.status==200 and response.read()==body
+                            c.shutdown(socket.SHUT_RDWR)
+                            c.close()
                             wait_connection_slots(1)
                             assert request(hp,http_host)==(200,body)
                             assert tls_request(gp,hostname,ca2)==(200,body)
@@ -673,6 +690,8 @@ try:
                                 assert proc.wait(timeout=40)==0
                         done.set()
                         echo_thread.join(timeout=2)
+                        tcp_target.shutdown()
+                        tcp_thread.join(timeout=2)
                 wait_connection_slots(0)
                 assert monthly_inventory()["bandwidth_reservations"]==0
                 stop(nginx)
