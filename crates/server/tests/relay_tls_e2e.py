@@ -95,6 +95,7 @@ try:
         tokens.extend(cmd("--relay-issue",n) for n in nodes)
         p=subprocess.Popen([str(exe),str(center),"0"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,LOCALTUNNEL_DNS_RESOLVER=resolver))
         children.append(p)
+        center_process=p
         with selectors.DefaultSelector() as s:
             s.register(p.stdout,selectors.EVENT_READ);assert s.select(20)
         address=p.stdout.readline().strip()
@@ -606,6 +607,159 @@ try:
             report["real_independent_https_expiry_closes_tls_gateway_and_noise_engine"]=True
         finally:
             target.shutdown();target.server_close();worker.join(timeout=3)
+        # A real, already established TCP connection continues only within
+        # its bounded lease after the actual center process is stopped.
+        # Use a separate node and independently generated data credentials.
+        cmd("--set-node-policy",nodes[0],2,8,"west","active")
+        control(tokens[0],{"protocol_version":1,"node_id":nodes[0],"generation":1,"capacity":5,"nonce":secrets.token_hex(16)},200)
+        keys0=subprocess.check_output([str(engine),"--genkey"],text=True,timeout=15)
+        private0=re.search(r"Private Key:\s*([A-Za-z0-9+/=]+)",keys0).group(1)
+        public0=re.search(r"Public Key:\s*([A-Za-z0-9+/=]+)",keys0).group(1)
+        offline_token=secrets.token_hex(32);tokens.extend([private0,offline_token])
+        for name,value in (("noise.private",private0),("tcp.token",offline_token)):
+            path=dirs[0]/name;path.write_text(value+"\n");path.chmod(0o600)
+        used={relay_port,udp_relay,web_relay,tls_relay,bind_port,udp_bind,web_bind,tls_bind,20000}
+        low,high=map(int,Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split())
+        def offline_port(lo,hi):
+            candidates=[n for n in range(lo,hi+1) if n not in used and not low<=n<=high]
+            while candidates:
+                n=candidates.pop(secrets.randbelow(len(candidates)))
+                with socket.socket() as probe:
+                    try:probe.bind(("127.0.0.1",n))
+                    except OSError:continue
+                used.add(n);return n
+            raise AssertionError("offline fixture port unavailable")
+        class Stream(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.settimeout(25)
+                try:
+                    while True:
+                        data=self.request.recv(4096)
+                        if not data:return
+                        self.request.sendall(data)
+                except OSError:return
+        with socketserver.ThreadingTCPServer(("127.0.0.1",0),Stream) as target:
+            target.daemon_threads=True
+            worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
+            try:
+                def prepare():
+                    rp,bp=offline_port(30000,59999),offline_port(20001,29999)
+                    a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":device,"node_id":nodes[0],
+                        "protocol":"tcp","local_port":target.server_address[1],"bind_port":bp},owner,201)
+                    config=root/("offline-"+a["id"]+".toml")
+                    subprocess.run([str(core_test.CLI),"client-config",str(config),f"127.0.0.1:{rp}",
+                        "m_"+a["mapping_id"],f"127.0.0.1:{target.server_address[1]}"],
+                        env=dict(os.environ,LOCALTUNNEL_TOKEN=offline_token,LOCALTUNNEL_SERVER_PUBLIC_KEY=public0),
+                        check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    return a,rp,bp,config
+                pending,active=prepare(),prepare()
+                def authorize(item):
+                    a,rp,bp,_=item
+                    g=admin("allocations/"+a["id"]+"/grant",{"expected_generation":1,"expected_mapping_revision":1},owner,201)
+                    admin("allocations/"+a["id"]+"/tcp-intent",{"grant_id":g["id"],"expected_generation":2,"relay_port":rp},owner,201)
+                    return g
+                pending_grant=authorize(pending)
+                active_grant=authorize(active)
+                def start_offline(item,g):
+                    a,rp,bp,_=item
+                    child=subprocess.Popen([str(relay),"--tcp-preview",str(dirs[0]),"localhost",str(tp),nodes[0],"1","5",
+                        a["id"],a["mapping_id"],"1",str(g["generation"]),g["id"],str(rp),str(bp),str(engine)],
+                        stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                    children.append(child);return child
+                running=start_offline(active,active_grant)
+                with selectors.DefaultSelector() as sel:
+                    sel.register(running.stdout,selectors.EVENT_READ);assert sel.select(5)
+                assert running.stdout.readline().strip()=="relay TCP engine started"
+                agent=subprocess.Popen([str(engine),str(active[3])],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                    env=dict(os.environ,RUST_LOG="warn"))
+                children.append(agent)
+                def exchange_stream(conn):
+                    body=secrets.token_bytes(256)
+                    conn.sendall(body)
+                    received=bytearray()
+                    while len(received)<len(body):
+                        chunk=conn.recv(len(body)-len(received))
+                        assert chunk,"established stream closed early"
+                        received.extend(chunk)
+                    assert received==body
+                def connect_stream():
+                    try:
+                        conn=socket.create_connection(("127.0.0.1",active[2]),timeout=.5)
+                        try:exchange_stream(conn)
+                        except (OSError,AssertionError):conn.close();return None
+                        return conn
+                    except OSError:return None
+                holder=[]
+                def connected():
+                    conn=connect_stream()
+                    if conn is None:return False
+                    holder.append(conn);return True
+                wait(connected,6)
+                with holder[0] as conn:
+                    # Stop the actual management process, leave TLS ingress
+                    # and separate relay/agent running. Prove control is down.
+                    stop(center_process)
+                    assert center_process.poll() is not None
+                    with socket.socket() as check:
+                        check.settimeout(.5);assert check.connect_ex(("127.0.0.1",cp))!=0
+                    assert request("/api/v1/relay/identity",tokens[0])[0] in (502,503,504)
+                    exchange_stream(conn)
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        assert db.execute("SELECT expires_at>unixepoch() FROM relay_grants WHERE id=?",(pending_grant["id"],)).fetchone()==(1,)
+                    denied=start_offline(pending,pending_grant);fails(denied)
+                    assert "relay TCP engine started" not in denied.stdout.read()
+                    for n in pending[1:3]:
+                        with socket.socket() as check:
+                            check.settimeout(.5);assert check.connect_ex(("127.0.0.1",n))!=0
+                    exchange_stream(conn)
+                    assert running.poll() is None
+                    report["real_center_process_loss_preserves_existing_tcp_stream_and_denies_new_claim"]=True
+                    out,err=running.communicate(timeout=20)
+                    assert running.returncode==0 and out.strip()=="relay TCP engine expired and stopped"
+                    conn.settimeout(2)
+                    try:
+                        conn.sendall(secrets.token_bytes(64))
+                        assert conn.recv(1)==b"","expired connection forwarded data"
+                    except (ConnectionResetError,BrokenPipeError,ConnectionAbortedError):pass
+                for n in active[1:3]:
+                    with socket.socket() as check:
+                        check.settimeout(.5);assert check.connect_ex(("127.0.0.1",n))!=0
+                assert not (dirs[0]/("tcp-"+active_grant["id"]+".toml")).exists()
+                report["real_offline_expiry_closes_established_tcp_stream_and_ports"]=True
+                # Restore the same center/database/port. Do not rewrite grants
+                # or heartbeat times. Wait for real server time and control.
+                center_process=subprocess.Popen([str(exe),str(center),str(cp)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                    env=dict(os.environ,LOCALTUNNEL_DNS_RESOLVER=resolver))
+                children.append(center_process)
+                with selectors.DefaultSelector() as sel:
+                    sel.register(center_process.stdout,selectors.EVENT_READ);assert sel.select(20)
+                assert center_process.stdout.readline().strip()==f"LISTENING 127.0.0.1:{cp}"
+                wait(lambda:request("/api/v1/relay/identity",tokens[0])[0]==200)
+                def both_expired():
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        return db.execute("SELECT count(*) FROM relay_grants WHERE id IN (?,?) AND expires_at<=unixepoch()",
+                            (active_grant["id"],pending_grant["id"])).fetchone()==(2,)
+                wait(both_expired,5)
+                # Exact TLS API replay, independent of local port preflight.
+                def reject_replay(item,g):
+                    a,rp,bp,_=item
+                    payload=dict(protocol_version=1,grant_id=g["id"],allocation_id=a["id"],mapping_id=a["mapping_id"],
+                        mapping_revision=1,node_id=nodes[0],node_generation=1,generation=2,relay_port=rp,nonce=secrets.token_hex(16))
+                    req=urllib.request.Request(f"https://localhost:{tp}/api/v1/relay/tcp-claim",method="POST",
+                        headers={"Authorization":"Bearer "+tokens[0],"Content-Type":"application/json"},data=json.dumps(payload).encode())
+                    try:
+                        with opener.open(req,timeout=4):raise AssertionError("expired claim accepted")
+                    except urllib.error.HTTPError as ex:assert ex.code==401
+                control(tokens[0],{"protocol_version":1,"node_id":nodes[0],"generation":1,"capacity":5,"nonce":secrets.token_hex(16)},200)
+                reject_replay(active,active_grant);reject_replay(pending,pending_grant)
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT claimed_at IS NOT NULL FROM relay_tcp_intents WHERE grant_id=?",(active_grant["id"],)).fetchone()==(1,)
+                    assert db.execute("SELECT claimed_at FROM relay_tcp_intents WHERE grant_id=?",(pending_grant["id"],)).fetchone()==(None,)
+                    assert db.execute("SELECT count(*) FROM relay_allocations WHERE id IN (?,?) AND state='reserved' AND generation=2",
+                        (active[0]["id"],pending[0]["id"])).fetchone()==(2,)
+                report["real_center_restart_rejects_expired_claims_and_retains_reservations"]=True
+            finally:
+                target.shutdown();worker.join(timeout=3)
         dns.shutdown();dns_thread.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
@@ -618,4 +772,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==16 and all(report.values())
+assert len(report)==19 and all(report.values())

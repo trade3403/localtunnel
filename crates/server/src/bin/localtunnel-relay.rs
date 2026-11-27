@@ -355,6 +355,17 @@ mod linux {
     }
     struct GatewayDir(PathBuf);
     impl Drop for GatewayDir{fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
+    // CLOCK_BOOTTIME includes system suspend on Linux; Instant alone may
+    // pause during suspend. Require BOTH deadlines to remain valid.
+    fn boot_now()->Result<Duration>{
+        let mut value=libc::timespec{tv_sec:0,tv_nsec:0};
+        if unsafe{libc::clock_gettime(libc::CLOCK_BOOTTIME,&mut value)}!=0||
+            value.tv_sec<0||!(0..1_000_000_000).contains(&value.tv_nsec){return Err(Failure::Protocol)}
+        Ok(Duration::new(value.tv_sec as u64,value.tv_nsec as u32))
+    }
+    fn lease_left(deadline:Instant,boot_deadline:Duration)->Result<Duration>{
+        Ok(deadline.saturating_duration_since(Instant::now()).min(boot_deadline.saturating_sub(boot_now()?)))
+    }
     fn supervise_tcp(protocol:&str,endpoint:&Endpoint,dir:&Path,token:&str,node:&str,generation:i64,capacity:i64,expected:&Expected<'_>,relay_port:u16,bind_port:u16,engine:&Path,web:Option<Web<'_>>)->Result<()>{
         if !matches!(endpoint,Endpoint::Tls{..})||!(30000..=59999).contains(&relay_port)||!(20000..=29999).contains(&bind_port)||!engine.is_absolute(){return Err(Failure::Protocol)}
         if matches!(protocol,"http"|"https")!=web.is_some()||web.as_ref().is_some_and(|w|w.tls!=(protocol=="https")){return Err(Failure::Protocol)}
@@ -407,6 +418,7 @@ mod linux {
         if let Some(fp)=certificate_sha256.as_ref(){payload["certificate_sha256"]=serde_json::json!(fp);}
         let payload=payload.to_string();
         let started=Instant::now();
+        let boot_started=boot_now()?;
         let (code,data)=request(endpoint,token,match protocol{"udp"=>"/api/v1/relay/udp-claim","http"=>"/api/v1/relay/http-claim","https"=>"/api/v1/relay/https-claim",_=>"/api/v1/relay/tcp-claim"},Some(&payload))?;
         if code!=200{return Err(Failure::Protocol)}
         let reply:TcpClaim=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
@@ -421,13 +433,14 @@ mod linux {
             p.claimed_at<policy.received_at||p.server_time<p.claimed_at||p.server_time>=p.expires_at{return Err(Failure::Denied)}
         let seconds=p.expires_at.checked_sub(p.server_time).and_then(|n|n.checked_sub(1)).filter(|n|*n>0).ok_or(Failure::Denied)?;
         let deadline=started.checked_add(Duration::from_secs(seconds as u64)).ok_or(Failure::Protocol)?;
-        if deadline<=Instant::now(){return Err(Failure::Denied)}
+        let boot_deadline=boot_started.checked_add(Duration::from_secs(seconds as u64)).ok_or(Failure::Protocol)?;
+        if lease_left(deadline,boot_deadline)?.is_zero(){return Err(Failure::Denied)}
         let mut command=Command::new(engine);
         command.arg(&path).env_clear().env("PATH","/usr/bin:/bin").env("RUST_LOG","warn")
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         protect(&mut command);
         let mut child=Engine(command.spawn().map_err(|_|Failure::Protocol)?);
-        if deadline<=Instant::now(){child.stop()?;return Err(Failure::Denied)}
+        if lease_left(deadline,boot_deadline)?.is_zero(){child.stop()?;return Err(Failure::Denied)}
         let mut web_child=if let Some(g)=gateway.as_ref(){
             let mut command=Command::new("/usr/sbin/nginx");
             command.arg("-p").arg(&g.0).args(["-c","nginx.conf"]).env_clear().env("PATH","/usr/bin:/bin")
@@ -435,12 +448,12 @@ mod linux {
             protect(&mut command);
             Some(Engine(command.spawn().map_err(|_|Failure::Protocol)?))
         }else{None};
-        if deadline<=Instant::now(){return Err(Failure::Denied)}
+        if lease_left(deadline,boot_deadline)?.is_zero(){return Err(Failure::Denied)}
         println!("relay {} engine started",protocol.to_ascii_uppercase());
         // No renewal or retry of a consumed claim. A local deadline closes
         // the entire engine, including existing connections, before exit.
         loop{
-            let left=deadline.saturating_duration_since(Instant::now());
+            let left=lease_left(deadline,boot_deadline)?;
             if left.is_zero(){break}
             if child.0.try_wait().map_err(|_|Failure::Protocol)?.is_some(){return Err(Failure::Protocol)}
             if let Some(g)=web_child.as_mut(){if g.0.try_wait().map_err(|_|Failure::Protocol)?.is_some(){return Err(Failure::Protocol)}}

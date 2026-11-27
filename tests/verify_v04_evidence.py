@@ -380,6 +380,9 @@ REQUIRED["management-v09"] = {
         "real_independent_http_expiry_closes_gateway_and_noise_engine",
         "real_independent_https_certificate_key_fingerprint_and_sni_isolation",
         "real_independent_https_expiry_closes_tls_gateway_and_noise_engine",
+        "real_center_process_loss_preserves_existing_tcp_stream_and_denies_new_claim",
+        "real_offline_expiry_closes_established_tcp_stream_and_ports",
+        "real_center_restart_rejects_expired_claims_and_retains_reservations",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",
