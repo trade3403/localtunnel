@@ -8,6 +8,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -49,7 +50,8 @@ try:
                     with urllib.request.urlopen(req,timeout=10) as response:
                         assert response.status==status,"unexpected success status"
                         assert "no-store" in response.headers.get("Cache-Control","")
-                        return json.loads(response.read())
+                        raw=response.read()
+                        return json.loads(raw) if raw else None
                 except urllib.error.HTTPError as error:
                     assert error.code==status,f"{method} {path}: unexpected status {error.code}"
             owner=call("/api/v1/auth/login",200,method="POST",data={"username":"owner","password":password})["access_token"]
@@ -101,6 +103,41 @@ try:
                 assert audit==[(1,"issued"),(2,"rotated"),(3,"revoked"),(4,"rotated"),(5,"disabled"),(6,"rotated")]
                 assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
             report["real_relay_disable_no_resurrection_and_audit"]=True
+            heartbeat="/api/v1/relay/heartbeat"
+            def beat(token,generation,capacity,status=204,**extra):
+                call(heartbeat,status,token,"POST",{"protocol_version":1,"generation":generation,"capacity":capacity,**extra})
+            assert call(heartbeat,200,fresh)=={"node_id":a,"generation":6,"received_at":None,"capacity":None,"fresh":False}
+            call(heartbeat,401,owner)
+            beat(owner,6,1,401)
+            beat(third,4,1,401)
+            beat(fresh,5,1,401)
+            beat(fresh,6,65537,400)
+            beat(fresh,6,1,422,node_id=b)
+            before=int(time.time())
+            beat(fresh,6,17)
+            beat(second,1,4)
+            health=call(heartbeat,200,fresh)
+            assert health["node_id"]==a and health["generation"]==6 and health["capacity"]==17 and health["fresh"] is True
+            assert before<=health["received_at"]<=int(time.time())
+            assert call(heartbeat,200,second)["capacity"]==4
+            # Wait for actual server clock expiry, not a modified database time.
+            deadline=time.monotonic()+22
+            while call(heartbeat,200,fresh)["fresh"]:
+                assert time.monotonic()<deadline,"heartbeat freshness did not expire"
+                time.sleep(.25)
+            beat(fresh,6,18)
+            assert call(heartbeat,200,fresh)["fresh"] is True
+            final=command("--relay-rotate",a,6)
+            assert call(heartbeat,200,final)=={"node_id":a,"generation":7,"received_at":None,"capacity":None,"fresh":False}
+            beat(fresh,6,99,401)
+            beat(final,7,8)
+            assert call(heartbeat,200,final)["capacity"]==8
+            command("--relay-revoke",a,7)
+            call(heartbeat,401,final)
+            beat(final,7,100,401)
+            with sqlite3.connect(db_path) as db:
+                assert db.execute("SELECT generation,capacity FROM relay_heartbeat WHERE node_id=?",(a,)).fetchone()==(7,8)
+            report["real_relay_heartbeat_freshness_generation_and_isolation"]=True
         finally:
             p.terminate()
             try:p.communicate(timeout=5)
@@ -108,4 +145,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==3 and all(report.values())
+assert len(report)==4 and all(report.values())
