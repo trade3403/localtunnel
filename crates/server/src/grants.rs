@@ -55,6 +55,7 @@ async fn issue(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Heade
         AND (SELECT count(*) FROM mappings x WHERE x.owner_id=a.owner_id)<=p.max_mappings
         AND (SELECT count(*) FROM devices x WHERE x.owner_id=a.owner_id AND x.enabled=1)<=p.max_active_devices
         AND NOT EXISTS(SELECT 1 FROM relay_grants g WHERE g.allocation_id=a.id)
+        AND NOT EXISTS(SELECT 1 FROM relay_budget_previews b WHERE b.tenant_id=t.id)
         RETURNING {FIELDS}");
     let row=sqlx::query_as::<_,Grant>(&query).bind(grant).bind(&id).bind(&owner).bind(c.expected_generation).bind(c.expected_mapping_revision).bind(token)
         .fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)?;

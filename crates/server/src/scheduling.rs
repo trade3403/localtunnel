@@ -114,6 +114,7 @@ async fn cancel(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Head
         AND EXISTS(SELECT 1 FROM admin_sessions a JOIN users u ON u.id=a.user_id WHERE u.id=relay_allocations.owner_id AND u.enabled=1 AND u.role='admin' AND a.token_digest=? AND a.expires_at>unixepoch())
         AND NOT EXISTS(SELECT 1 FROM runtime_requests r WHERE r.mapping_id=relay_allocations.mapping_id)
         AND NOT EXISTS(SELECT 1 FROM relay_grants g WHERE g.allocation_id=relay_allocations.id)
+        AND NOT EXISTS(SELECT 1 FROM relay_budget_previews b WHERE b.allocation_id=relay_allocations.id)
         RETURNING {FIELDS}");
     let row=sqlx::query_as::<_,Allocation>(&query).bind(&id).bind(&owner).bind(c.expected_generation).bind(&token)
         .fetch_optional(&mut *tx).await.map_err(db_error)?;

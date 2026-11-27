@@ -1,0 +1,125 @@
+"""Real multi-node conservative quota reservations."""
+from concurrent.futures import ThreadPoolExecutor
+import json
+import secrets
+import selectors
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+exe=str(Path(sys.argv[1]).resolve())
+evidence=Path(sys.argv[2])
+report={}
+password=secrets.token_hex(24)
+def cmd(root,*args,data=None):
+    p=subprocess.run([exe,args[0],str(root),*map(str,args[1:])],input=None if data is None else json.dumps(data),text=True,capture_output=True,timeout=30)
+    assert p.returncode==0,"operator command failed"
+    return p.stdout.strip()
+def stop(p):
+    p.terminate()
+    try:p.communicate(timeout=5)
+    except subprocess.TimeoutExpired:p.kill();p.communicate(timeout=5)
+def launch(root):
+    p=subprocess.Popen([exe,str(root),"0"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    try:
+        with selectors.DefaultSelector() as sel:
+            sel.register(p.stdout,selectors.EVENT_READ)
+            assert sel.select(20)
+        line=p.stdout.readline().strip()
+        assert line.startswith("LISTENING 127.0.0.1:")
+        return p,"http://"+line.split()[1]
+    except BaseException:
+        stop(p);raise
+def call(base,path,status,token=None,method="GET",data=None):
+    headers={}
+    if token:headers["Authorization"]="Bearer "+token
+    if data is not None:headers["Content-Type"]="application/json"
+    req=urllib.request.Request(base+"/api/v1/"+path,method=method,headers=headers,data=None if data is None else json.dumps(data).encode())
+    try:
+        with urllib.request.urlopen(req,timeout=10) as r:
+            code,raw=r.status,r.read()
+            assert "no-store" in r.headers.get("Cache-Control","")
+    except urllib.error.HTTPError as e:code,raw=e.code,e.read()
+    assert code in (status if isinstance(status,tuple) else (status,)),f"{method} {path}: unexpected {code}"
+    return (code,json.loads(raw) if code in (200,201) else None)
+def login(base,name):
+    return call(base,"auth/login",200,method="POST",data={"username":name,"password":password})[1]["access_token"]
+def device(base,token):
+    code=call(base,"devices/pairing-code",200,token,"POST")[1]["pairing_code"]
+    return call(base,"devices/enroll",201,method="POST",data={"pairing_code":code,"name":"fixture"})[1]["id"]
+
+try:
+    with tempfile.TemporaryDirectory() as tmp:
+        root=Path(tmp)/"live";root.mkdir(mode=0o700)
+        cmd(root,"--init-admin",data={"username":"owner","password":password})
+        plan=cmd(root,"--commercial-create-plan",data={"code":"distributed-preview","version":1,"name":"Distributed preview",
+            "max_active_devices":4,"max_retained_devices":8,"max_mappings":16,"max_bandwidth_bps":1048576,
+            "max_monthly_bytes":100000,"max_concurrent_connections":4})
+        for name in ("budget","other"):
+            cmd(root,"--commercial-create-account",data={"username":name,"password":password,"plan_id":plan,"expires_at":None})
+        nodes=[cmd(root,"--add-node","budget relay "+str(i)) for i in range(2)]
+        tokens=[cmd(root,"--relay-issue",n) for n in nodes]
+        for n in nodes:cmd(root,"--set-node-policy",n,1,8,"east","active")
+        p,base=launch(root)
+        try:
+            owner=login(base,"budget");other=login(base,"other")
+            did=device(base,owner);oid=device(base,other)
+            ent=call(base,"commercial/entitlement",200,owner)[1]["entitlement"]
+            def beat():
+                for token in tokens:
+                    call(base,"relay/heartbeat",204,token,"POST",{"protocol_version":1,"generation":1,"capacity":8})
+            def alloc(i,port,kind="tcp",token=owner,dev=did):
+                beat()
+                return call(base,"allocations",201,token,"POST",dict(request_key=secrets.token_hex(16),device_id=dev,
+                    protocol=kind,local_port=8080,bind_port=port,node_id=nodes[i]))[1]
+            a,b=alloc(0,20000),alloc(1,20001,"udp")
+            spec=dict(expected_generation=1,expected_mapping_revision=1,expected_entitlement_revision=ent["revision"],
+                rate_bytes_per_second=131072,monthly_bytes=60000,connection_slots=3)
+            def reserve(item,status=201,token=owner,data=spec):
+                return call(base,"allocations/"+item["id"]+"/budget-preview",status,token,"POST",data)
+            reserve(a,409,other);reserve(a,401,tokens[0])
+            reserve(a,409,data=dict(spec,expected_entitlement_revision=ent["revision"]+1))
+            reserve(a,400,data=dict(spec,connection_slots=0))
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                result=list(workers.map(lambda item:reserve(item,(201,409)),(a,b)))
+            assert sorted(code for code,_ in result)==[201,409]
+            winner,loser=(a,b) if result[0][0]==201 else (b,a)
+            row=next(r for code,r in result if code==201)
+            assert row["scope"]=="reservation_preview_only" and row["executable"] is False
+            assert row["budget"]["node_id"]==winner["node_id"]
+            reserve(winner,409)
+            call(base,"allocations/"+winner["id"]+"/budget-preview",200,owner)
+            call(base,"allocations/"+winner["id"]+"/budget-preview",404,other)
+            # Test each independent cap; the winning reservation consumes all bandwidth.
+            reserve(loser,409,data=dict(spec,rate_bytes_per_second=65536,monthly_bytes=1,connection_slots=1))
+            call(base,"allocations/"+winner["id"]+"/grant",409,owner,"POST",{"expected_generation":1,"expected_mapping_revision":1})
+            call(base,"allocations/"+winner["id"]+"/cancel",409,owner,"POST",{"expected_generation":1})
+            independent=alloc(1,20002,token=other,dev=oid)
+            other_ent=call(base,"commercial/entitlement",200,other)[1]["entitlement"]
+            reserve(independent,201,other,dict(spec,expected_entitlement_revision=other_ent["revision"],rate_bytes_per_second=65536,monthly_bytes=40000,connection_slots=2))
+            report["real_cross_node_budget_atomic_race_and_owner_isolation"]=True
+            # The independent tenant has room for one rate slice but not an
+            # excessive monthly or connection reservation.
+            second=alloc(0,20003,token=other,dev=oid)
+            small=dict(spec,expected_entitlement_revision=other_ent["revision"],rate_bytes_per_second=65536,monthly_bytes=60000,connection_slots=2)
+            reserve(second,409,other,dict(small,monthly_bytes=60001))
+            reserve(second,409,other,dict(small,connection_slots=3))
+            reserve(second,201,other,small)
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert sorted(db.execute("SELECT sum(rate_bytes_per_second),sum(monthly_bytes),sum(connection_slots) FROM relay_budget_previews GROUP BY tenant_id").fetchall())==[(131072,60000,3),(131072,100000,4)]
+                assert db.execute("SELECT count(*) FROM relay_grants").fetchone()==(0,)
+                assert db.execute("SELECT count(*) FROM management_audit WHERE event='budget.preview_reserved'").fetchone()==(3,)
+                assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
+                for sql in ("DELETE FROM relay_budget_previews","UPDATE relay_budget_previews SET monthly_bytes=1"):
+                    try:db.execute(sql);raise AssertionError("mutable budget")
+                    except sqlite3.IntegrityError:db.rollback()
+            report["real_cross_node_budget_independent_caps_and_immutable_non_executable_ledger"]=True
+        finally:stop(p)
+finally:
+    evidence.parent.mkdir(parents=True,exist_ok=True)
+    evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
+assert len(report)==2 and all(report.values())

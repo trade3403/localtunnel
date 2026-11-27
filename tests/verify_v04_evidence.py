@@ -337,6 +337,10 @@ REQUIRED["management-v09"] = {
         "real_relay_disable_no_resurrection_and_audit",
         "real_relay_heartbeat_freshness_generation_and_isolation",
     ],
+    "relay-budget.json": [
+        "real_cross_node_budget_atomic_race_and_owner_isolation",
+        "real_cross_node_budget_independent_caps_and_immutable_non_executable_ledger",
+    ],
     "relay-http-claim.json": [
         "real_http_dns_proof_exact_claim_and_protocol_isolation",
         "real_http_proof_rotation_and_shared_transport_port_denial",
