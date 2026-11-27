@@ -269,6 +269,11 @@ REQUIRED["management-v05"] = {
 # V0.8 extends rather than replaces existing management gates.
 REQUIRED["management-v08"] = {
     **REQUIRED["management-v05"],
+    "admin-browser.json": [
+        *REQUIRED["management-v05"]["admin-browser.json"],
+        "real_browser_commercial_entitlement_and_refresh",
+        "real_browser_commercial_owner_isolation",
+    ],
     "tcp-preview.json": [
         "real_tcp_scoped_queue_and_cancel",
         "real_tcp_noise_shared_bidirectional_cap",
