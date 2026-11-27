@@ -41,7 +41,9 @@ const ELIGIBLE:&str="m.protocol='tcp' AND m.domain_id IS NULL AND m.enabled=0 AN
 const FIELDS:&str="g.id,a.id AS allocation_id,m.id AS mapping_id,b.mapping_revision,b.node_id,b.node_generation,a.generation,b.policy_revision,b.entitlement_revision,g.device_revision,a.bind_port,b.rate_bytes_per_second,b.monthly_bytes,b.connection_slots,b.month_utc,g.issued_at,g.expires_at,unixepoch() AS server_time";
 pub fn routes(pool:SqlitePool)->Router{
     Router::new().route("/api/v1/allocations/{id}/budget-grant",post(issue))
-        .route("/api/v1/relay/budget-grant",post(fetch)).layer(DefaultBodyLimit::max(1024)).with_state(pool)
+        .route("/api/v1/relay/budget-grant",post(fetch))
+        .route("/api/v1/allocations/{id}/budget-intent",post(intent))
+        .route("/api/v1/relay/budget-claim",post(claim)).layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 async fn issue(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Issue>)->Result<Response,Failure>{
     let token=auth::bearer(&headers)?;
@@ -78,4 +80,63 @@ async fn fetch(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Fetc
     let row=sqlx::query_as::<_,Grant>(&query).bind(c.grant_id).bind(c.allocation_id).bind(c.mapping_id).bind(c.mapping_revision).bind(c.node_id).bind(c.node_generation).bind(c.generation).bind(credential)
        .fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
     Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":"budget_authorization_preview_only","executable":false,"grant":row}))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Intent{grant_id:String,expected_generation:i64,relay_port:i64}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Claim{protocol_version:i64,grant_id:String,allocation_id:String,mapping_id:String,mapping_revision:i64,node_id:String,node_generation:i64,generation:i64,relay_port:i64,nonce:String}
+#[derive(Serialize,sqlx::FromRow)]
+struct IntentRecord{grant_id:String,node_id:String,relay_port:i64,bind_port:i64,created_at:i64,claimed_at:Option<i64>}
+const CLAIM_ELIGIBLE:&str="a.generation=2 AND d.revision=g.device_revision AND g.revoked_at IS NULL
+ AND g.issued_at<=unixepoch() AND g.expires_at>unixepoch()+2
+ AND (e.expires_at IS NULL OR e.expires_at>=g.expires_at)";
+async fn intent(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Intent>)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    if !hex_id(&id)||!hex_id(&c.grant_id)||c.expected_generation!=2||!(30000..=59999).contains(&c.relay_port){return Err(BAD)}
+    let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
+    let query=format!("INSERT INTO relay_budget_intents(grant_id,node_id,relay_port,bind_port,created_at)
+        SELECT g.id,b.node_id,?,a.bind_port,unixepoch() {CURRENT} JOIN relay_budget_grants g ON g.allocation_id=a.id
+        WHERE {ELIGIBLE} AND {CLAIM_ELIGIBLE} AND a.id=? AND g.id=? AND a.owner_id=?
+        AND EXISTS(SELECT 1 FROM admin_sessions s WHERE s.user_id=a.owner_id AND s.token_digest=? AND s.expires_at>unixepoch())
+        AND NOT EXISTS(SELECT 1 FROM relay_tcp_intents x WHERE x.node_id=b.node_id AND x.relay_port=?)
+        AND NOT EXISTS(SELECT 1 FROM relay_udp_intents x WHERE x.node_id=b.node_id AND x.relay_port=?)
+        AND NOT EXISTS(SELECT 1 FROM relay_http_intents x WHERE x.node_id=b.node_id AND x.relay_port=?)
+        AND NOT EXISTS(SELECT 1 FROM relay_https_intents x WHERE x.node_id=b.node_id AND x.relay_port=?)
+        ON CONFLICT DO NOTHING RETURNING grant_id,node_id,relay_port,bind_port,created_at,claimed_at");
+    let row=sqlx::query_as::<_,IntentRecord>(&query).bind(c.relay_port).bind(&id).bind(&c.grant_id).bind(&owner).bind(token)
+        .bind(c.relay_port).bind(c.relay_port).bind(c.relay_port).bind(c.relay_port)
+        .fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)?;
+    sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
+        SELECT a.owner_id,'budget.intent',a.live_mapping_id,a.mapping_revision,g.id,'pending' FROM relay_budget_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")
+        .bind(&row.grant_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    Ok(auth::uncached((StatusCode::CREATED,Json(serde_json::json!({"scope":"budget_intent_preview_only","executable":false,"intent":row})))))
+}
+async fn claim(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Claim>)->Result<Response,Failure>{
+    let credential=relay::digest(&headers)?;
+    if c.protocol_version!=1||!hex_id(&c.grant_id)||!hex_id(&c.allocation_id)||!hex_id(&c.mapping_id)||!hex_id(&c.node_id)||!hex_id(&c.nonce)
+        ||c.mapping_revision<1||c.node_generation<1||c.generation!=2||!(30000..=59999).contains(&c.relay_port){return Err(BAD)}
+    let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
+    let query=format!("UPDATE relay_budget_intents SET claimed_at=unixepoch()
+      WHERE grant_id=? AND node_id=? AND relay_port=? AND claimed_at IS NULL
+      AND EXISTS(SELECT 1 {CURRENT} JOIN relay_budget_grants g ON g.allocation_id=a.id
+        WHERE {ELIGIBLE} AND {CLAIM_ELIGIBLE} AND g.id=relay_budget_intents.grant_id
+        AND b.node_id=relay_budget_intents.node_id AND a.bind_port=relay_budget_intents.bind_port
+        AND a.id=? AND m.id=? AND b.mapping_revision=? AND b.node_generation=? AND r.token_digest=?)");
+    let changed=sqlx::query(&query).bind(&c.grant_id).bind(&c.node_id).bind(c.relay_port).bind(&c.allocation_id).bind(&c.mapping_id)
+        .bind(c.mapping_revision).bind(c.node_generation).bind(credential).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    if changed.rows_affected()!=1{return Err(DENIED)}
+    let query=format!("SELECT {FIELDS} {CURRENT} JOIN relay_budget_grants g ON g.allocation_id=a.id WHERE g.id=?");
+    let grant=sqlx::query_as::<_,Grant>(&query).bind(&c.grant_id).fetch_one(&mut *tx).await.map_err(|_|INTERNAL)?;
+    let row=sqlx::query_as::<_,IntentRecord>("SELECT grant_id,node_id,relay_port,bind_port,created_at,claimed_at FROM relay_budget_intents WHERE grant_id=?")
+        .bind(&c.grant_id).fetch_one(&mut *tx).await.map_err(|_|INTERNAL)?;
+    sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
+        SELECT a.owner_id,'budget.claimed',a.live_mapping_id,a.mapping_revision,g.id,'claimed' FROM relay_budget_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")
+        .bind(&c.grant_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":"budget_claim_preview_only","executable":false,"grant":grant,"intent":row}))))
 }

@@ -39,10 +39,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat','node_policy_audit','relay_allocations','relay_grants','relay_tcp_intents','relay_udp_intents','relay_http_intents','relay_https_intents','relay_budget_previews','relay_budget_grants')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat','node_policy_audit','relay_allocations','relay_grants','relay_tcp_intents','relay_udp_intents','relay_http_intents','relay_https_intents','relay_budget_previews','relay_budget_grants','relay_budget_intents')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(32) => (StatusCode::OK, "ready"),
+        Ok(33) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }

@@ -341,6 +341,7 @@ REQUIRED["management-v09"] = {
         "real_cross_node_budget_atomic_race_and_owner_isolation",
         "real_cross_node_budget_independent_caps_and_immutable_non_executable_ledger",
         "real_finite_budget_grant_exact_node_slice_and_legacy_isolation",
+         "real_finite_budget_one_shot_claim_and_replay_rejection",
     ],
     "relay-http-claim.json": [
         "real_http_dns_proof_exact_claim_and_protocol_isolation",
