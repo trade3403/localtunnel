@@ -14,6 +14,8 @@ import time
 import urllib.error
 import urllib.request
 import http.server
+import http.client
+import hashlib
 import threading
 import socketserver
 import struct
@@ -194,12 +196,14 @@ try:
         class Capture(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
                 hits.append(True);self.send_response(200);self.end_headers()
+            do_POST=do_GET
             def log_message(self,*args):pass
         capture=http.server.ThreadingHTTPServer(("127.0.0.1",0),Capture)
         thread=threading.Thread(target=capture.serve_forever,daemon=True);thread.start()
         class Redirect(Capture):
             def do_GET(self):
                 self.send_response(302);self.send_header("Location",f"http://127.0.0.1:{capture.server_port}/capture");self.send_header("Content-Length","0");self.end_headers()
+            do_POST=do_GET
         redirect=http.server.ThreadingHTTPServer(("127.0.0.1",0),Redirect)
         tls=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER);tls.load_cert_chain(cert,key)
         redirect.socket=tls.wrap_socket(redirect.socket,server_side=True)
@@ -505,6 +509,103 @@ try:
             report["real_independent_http_expiry_closes_gateway_and_noise_engine"]=True
         finally:
             target.shutdown();target.server_close();worker.join(timeout=3)
+        # Independent HTTPS with a real leaf signed by a separate trusted
+        # fixture CA, exact SAN/fingerprint and encrypted client traffic.
+        host="relay-secure.example.test"
+        secure=admin("domains",{"hostname":host},owner,201)
+        records[secure["txt_name"]+"."]=secure["txt_value"]
+        assert admin("domains/verify",{"domain_id":secure["id"]},owner)["verified_at"] is not None
+        tls_token=secrets.token_hex(32);tokens.append(tls_token)
+        path=dirs[1]/"https.token";path.write_text(tls_token+"\n");path.chmod(0o600)
+        tls_cert=root/"web-leaf.pem";tls_key=root/"web-leaf.key";tls_csr=root/"web-leaf.csr"
+        tls_ext=root/"web-ext"
+        tls_ext.write_text("subjectAltName=DNS:"+host+"\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n")
+        openssl("req","-new","-newkey","rsa:2048","-nodes","-subj","/CN="+host,"-keyout",tls_key,"-out",tls_csr)
+        openssl("x509","-req","-in",tls_csr,"-CA",ca,"-CAkey",cak,"-CAcreateserial","-days","2","-extfile",tls_ext,"-out",tls_cert)
+        alternate=root/"web-other.pem"
+        openssl("x509","-req","-in",tls_csr,"-CA",ca,"-CAkey",cak,"-CAcreateserial","-days","2","-extfile",tls_ext,"-out",alternate)
+        fp=hashlib.sha256(ssl.PEM_cert_to_DER_cert(tls_cert.read_text())).hexdigest()
+        assert fp!=hashlib.sha256(ssl.PEM_cert_to_DER_cert(alternate.read_text())).hexdigest()
+        def provision(name,source):
+            path=dirs[1]/name;path.write_bytes(source.read_bytes());path.chmod(0o600)
+        provision("web-ca.pem",ca);provision("leaf.pem",tls_cert);provision("leaf.key",tls_key)
+        tls_relay=free_range(30000,59999)
+        while tls_relay in (relay_port,udp_relay,web_relay):tls_relay=free_range(30000,59999)
+        tls_bind=free_range(20001,29999)
+        while tls_bind in (bind_port,udp_bind,web_bind):tls_bind=free_range(20001,29999)
+        tls_gateway=free_range(60000,64999)
+        while tls_gateway==gateway_port:tls_gateway=free_range(60000,64999)
+        target=http.server.ThreadingHTTPServer(("127.0.0.1",0),WebTarget)
+        worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
+        try:
+            a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":device,"node_id":nodes[1],
+                "protocol":"https","domain_id":secure["id"],"local_port":target.server_port,"bind_port":tls_bind},owner,201)
+            config=root/"https-agent.toml"
+            subprocess.run([str(core_test.CLI),"client-config",str(config),f"127.0.0.1:{tls_relay}","m_"+a["mapping_id"],
+                f"127.0.0.1:{target.server_port}"],env=dict(os.environ,LOCALTUNNEL_TOKEN=tls_token,LOCALTUNNEL_SERVER_PUBLIC_KEY=public),
+                check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            g=admin("allocations/"+a["id"]+"/grant",{"expected_generation":1,"expected_mapping_revision":1},owner,201)
+            admin("allocations/"+a["id"]+"/https-intent",{"grant_id":g["id"],"expected_generation":g["generation"],
+                "relay_port":tls_relay,"gateway_port":tls_gateway,"certificate_sha256":fp},owner,201)
+            def start_secure():
+                p=subprocess.Popen([str(relay),"--https-preview",str(dirs[1]),"localhost",str(tp),nodes[1],"1","6",
+                    a["id"],a["mapping_id"],"1",str(g["generation"]),g["id"],str(tls_relay),str(tls_bind),str(engine),
+                    str(tls_gateway),host],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                children.append(p);return p
+            # Wrong private key, wrong SAN, untrusted CA and a different
+            # correctly signed leaf cannot consume the authorized claim.
+            for name,wrong,correct in [("leaf.key",key,tls_key),("leaf.pem",cert,tls_cert),
+                    ("web-ca.pem",wrongca,ca),("leaf.pem",alternate,tls_cert)]:
+                provision(name,wrong)
+                bad=start_secure();fails(bad)
+                assert "relay HTTPS engine started" not in bad.stdout.read()
+                provision(name,correct)
+            with sqlite3.connect(center/"control.sqlite3") as db:
+                assert db.execute("SELECT claimed_at FROM relay_https_intents WHERE grant_id=?",(g["id"],)).fetchone()==(None,)
+            running=start_secure()
+            with selectors.DefaultSelector() as sel:
+                sel.register(running.stdout,selectors.EVENT_READ);assert sel.select(5)
+            assert running.stdout.readline().strip()=="relay HTTPS engine started"
+            agent=subprocess.Popen([str(engine),str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,RUST_LOG="warn"))
+            children.append(agent)
+            secure_ctx=ssl.create_default_context(cafile=str(ca))
+            body="/"+secrets.token_hex(24)
+            def https_request(sni=host,header=host,context=secure_ctx):
+                try:
+                    with socket.create_connection(("127.0.0.1",tls_gateway),timeout=.7) as raw:
+                        with context.wrap_socket(raw,server_hostname=sni) as tls:
+                            assert hashlib.sha256(tls.getpeercert(binary_form=True)).hexdigest()==fp
+                            tls.sendall(("GET "+body+" HTTP/1.1\r\nHost: "+header+"\r\nX-Forwarded-For: 203.0.113.9\r\nForwarded: for=203.0.113.9\r\nConnection: close\r\n\r\n").encode())
+                            with http.client.HTTPResponse(tls) as response:
+                                response.begin()
+                                return response.status,json.loads(response.read()) if response.status==200 else None
+                except (OSError,http.client.HTTPException):return None,None
+            def transfer_secure():
+                return https_request()==(200,{"path":body,"host":host,"xff":"127.0.0.1","proto":"https","forwarded":None})
+            wait(transfer_secure,8)
+            before=len(hits)
+            no_hostname=ssl.create_default_context(cafile=str(ca));no_hostname.check_hostname=False
+            assert https_request("wrong.example.test",host,no_hostname)==(None,None)
+            assert https_request(None,host,no_hostname)==(None,None)
+            assert https_request(host,"wrong.example.test")[0]==421
+            assert https_request(context=ssl.create_default_context(cafile=str(wrongca)))==(None,None)
+            assert len(hits)==before
+            replay=start_secure();fails(replay)
+            assert running.poll() is None
+            report["real_independent_https_certificate_key_fingerprint_and_sni_isolation"]=True
+            out,err=running.communicate(timeout=20)
+            assert running.returncode==0 and out.strip()=="relay HTTPS engine expired and stopped"
+            assert not any(t in out+err for t in tokens)
+            for n in (tls_relay,tls_bind,tls_gateway):
+                with socket.socket() as check:
+                    check.settimeout(.5);assert check.connect_ex(("127.0.0.1",n))!=0
+            assert not (dirs[1]/("https-"+g["id"]+".toml")).exists()
+            assert not (dirs[1]/("https-"+g["id"]+".gateway")).exists()
+            with sqlite3.connect(center/"control.sqlite3") as db:
+                assert db.execute("SELECT certificate_sha256,claimed_at IS NOT NULL FROM relay_https_intents WHERE grant_id=?",(g["id"],)).fetchone()==(fp,1)
+            report["real_independent_https_expiry_closes_tls_gateway_and_noise_engine"]=True
+        finally:
+            target.shutdown();target.server_close();worker.join(timeout=3)
         dns.shutdown();dns_thread.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
@@ -517,4 +618,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==14 and all(report.values())
+assert len(report)==16 and all(report.values())

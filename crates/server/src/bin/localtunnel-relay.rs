@@ -1,5 +1,5 @@
 //! Independent relay control-plane client: loopback preview or verified HTTPS.
-//! No database access, tunnel listener, or runtime assignment authority.
+//! No database access; bounded one-shot loopback data-plane previews.
 #[cfg(target_os="linux")]
 mod linux {
     use serde::Deserialize;
@@ -261,7 +261,7 @@ mod linux {
     struct TcpPermit{
         grant_id:String,allocation_id:String,mapping_id:String,mapping_revision:i64,node_id:String,node_generation:i64,
         generation:i64,policy_revision:i64,relay_port:u16,bind_port:u16,issued_at:i64,expires_at:i64,server_time:i64,claimed_at:i64,
-        gateway_port:Option<u16>,hostname:Option<String>,
+        gateway_port:Option<u16>,hostname:Option<String>,certificate_sha256:Option<String>,
     }
     fn secret_file(dir:&Path,name:&str,valid:impl Fn(&str)->bool)->Result<String>{
         let mut raw=String::new();
@@ -285,7 +285,7 @@ mod linux {
         }
     }
     impl Drop for Engine{fn drop(&mut self){let _=self.stop();}}
-    struct Web<'a>{hostname:&'a str,port:u16}
+    struct Web<'a>{hostname:&'a str,port:u16,tls:bool}
     fn web_hostname(s:&str)->bool{
         s.len()<=240&&s.contains('.')&&s!="localtunnel-probe.invalid"&&s.parse::<std::net::IpAddr>().is_err()&&
         hostname(s)&&s.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-'||b==b'.')&&
@@ -294,7 +294,55 @@ mod linux {
     // Standalone single-process Nginx: no master/worker descendants which
     // could survive a killed supervisor. No service reload or global config.
     fn gateway_config(web:&Web<'_>,bind_port:u16)->String{
-        format!("daemon off;\nmaster_process off;\nworker_processes 1;\npid nginx.pid;\nerror_log /dev/null crit;\nevents {{ worker_connections 128; }}\nhttp {{\n access_log off;\n client_body_temp_path client_body_temp;\n proxy_temp_path proxy_temp;\n fastcgi_temp_path fastcgi_temp;\n uwsgi_temp_path uwsgi_temp;\n scgi_temp_path scgi_temp;\n server_tokens off;\n client_max_body_size 1m;\n client_header_timeout 5s;\n client_body_timeout 5s;\n map $http_upgrade $lt_connection {{ default upgrade; '' close; }}\n server {{ listen 127.0.0.1:{port} default_server; server_name _; return 421; }}\n server {{ listen 127.0.0.1:{port}; server_name {host};\n if ($host != {host}) {{ return 421; }}\n if ($http_host = '') {{ return 421; }}\n location / {{\n proxy_pass http://127.0.0.1:{bind_port};\n proxy_http_version 1.1;\n proxy_set_header Host $host;\n proxy_set_header X-Real-IP $remote_addr;\n proxy_set_header X-Forwarded-For $remote_addr;\n proxy_set_header X-Forwarded-Host $host;\n proxy_set_header X-Forwarded-Proto $scheme;\n proxy_set_header X-Forwarded-Port $server_port;\n proxy_set_header Forwarded \"\";\n proxy_set_header Upgrade $http_upgrade;\n proxy_set_header Connection $lt_connection;\n proxy_connect_timeout 2s;\n proxy_read_timeout 5s;\n proxy_send_timeout 5s;\n proxy_buffering off;\n }} }} }}\n",port=web.port,host=web.hostname)
+        let tls=if web.tls{" ssl"}else{""};
+        let cert=if web.tls{"ssl_certificate leaf.pem;\n ssl_certificate_key leaf.key;\n ssl_protocols TLSv1.2 TLSv1.3;\n"}else{""};
+        let reject=if web.tls{"ssl_reject_handshake on;"}else{""};
+        let sni=if web.tls{"if ($ssl_server_name != $host) { return 421; }"}else{""};
+        format!("daemon off;\nmaster_process off;\nworker_processes 1;\npid nginx.pid;\nerror_log /dev/null crit;\nevents {{ worker_connections 128; }}\nhttp {{\n access_log off;\n client_body_temp_path client_body_temp;\n proxy_temp_path proxy_temp;\n fastcgi_temp_path fastcgi_temp;\n uwsgi_temp_path uwsgi_temp;\n scgi_temp_path scgi_temp;\n server_tokens off;\n client_max_body_size 1m;\n client_header_timeout 5s;\n client_body_timeout 5s;\n map $http_upgrade $lt_connection {{ default upgrade; '' close; }}\n {cert} server {{ listen 127.0.0.1:{port}{tls} default_server; server_name _; {reject} return 421; }}\n server {{ listen 127.0.0.1:{port}{tls}; server_name {host};\n {sni}\n if ($host != {host}) {{ return 421; }}\n if ($http_host = '') {{ return 421; }}\n location / {{\n proxy_pass http://127.0.0.1:{bind_port};\n proxy_http_version 1.1;\n proxy_set_header Host $host;\n proxy_set_header X-Real-IP $remote_addr;\n proxy_set_header X-Forwarded-For $remote_addr;\n proxy_set_header X-Forwarded-Host $host;\n proxy_set_header X-Forwarded-Proto $scheme;\n proxy_set_header X-Forwarded-Port $server_port;\n proxy_set_header Forwarded \"\";\n proxy_set_header Upgrade $http_upgrade;\n proxy_set_header Connection $lt_connection;\n proxy_connect_timeout 2s;\n proxy_read_timeout 5s;\n proxy_send_timeout 5s;\n proxy_buffering off;\n }} }} }}\n",port=web.port,host=web.hostname)
+    }
+    // Snapshot only bounded, operator-owned files. The verified bytes, not
+    // paths to mutable originals, are the sole input to the dedicated gateway.
+    fn snapshot(dir:&Path,target:&Path,name:&str,limit:u64)->Result<()>{
+        let mut bytes=Vec::new();
+        private_file(dir,name)?.take(limit+1).read_to_end(&mut bytes).map_err(|_|Failure::Protocol)?;
+        if bytes.is_empty()||bytes.len() as u64>limit{return Err(Failure::Protocol)}
+        let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(target.join(name)).map_err(|_|Failure::Protocol)?;
+        file.write_all(&bytes).and_then(|_|file.sync_all()).map_err(|_|Failure::Protocol)
+    }
+    fn openssl(dir:&Path,args:&[&str])->Result<Vec<u8>>{
+        // Bounded inputs and fixed OpenSSL commands, no shell, password
+        // prompts, default environment or diagnostic material on stderr.
+        let output=Command::new("/usr/bin/openssl").args(args).current_dir(dir).env_clear()
+            .env("PATH","/usr/bin:/bin").stdin(Stdio::null()).stderr(Stdio::null()).output().map_err(|_|Failure::Protocol)?;
+        if !output.status.success()||output.stdout.len()>65536{return Err(Failure::Denied)}
+        Ok(output.stdout)
+    }
+    fn certificate(dir:&Path,target:&Path,host:&str)->Result<String>{
+        use sha2::{Digest,Sha256};
+        snapshot(dir,target,"leaf.pem",65536)?;
+        snapshot(dir,target,"leaf.key",16384)?;
+        snapshot(dir,target,"web-ca.pem",65536)?;
+        // This preview intentionally accepts a single PEM leaf, signed
+        // directly by an operator-trusted CA (no automatic chain discovery).
+        let pem=fs::read_to_string(target.join("leaf.pem")).map_err(|_|Failure::Protocol)?;
+        if pem.matches("-----BEGIN CERTIFICATE-----").count()!=1||pem.matches("-----END CERTIFICATE-----").count()!=1{return Err(Failure::Denied)}
+        let san=openssl(target,&["x509","-in","leaf.pem","-noout","-ext","subjectAltName"])?;
+        let san=std::str::from_utf8(&san).map_err(|_|Failure::Protocol)?;
+        let exact=format!("DNS:{host}");
+        if !san.lines().skip(1).flat_map(|l|l.split(',')).any(|v|v.trim()==exact){return Err(Failure::Denied)}
+        // Verify trust, purpose and hostname now and after the maximum
+        // 15-second lease plus margin. No CN-only or wildcard-only acceptance.
+        let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|_|Failure::Protocol)?.as_secs();
+        let future=now.checked_add(30).ok_or(Failure::Protocol)?.to_string();
+        for when in [now.to_string(),future]{
+            openssl(target,&["verify","-CAfile","web-ca.pem","-no-CApath","-no-CAstore","-purpose","sslserver","-verify_hostname",host,"-attime",&when,"leaf.pem"])?;
+        }
+        let leaf_key=openssl(target,&["x509","-in","leaf.pem","-noout","-pubkey"])?;
+        let private_key=openssl(target,&["pkey","-in","leaf.key","-passin","pass:","-pubout"])?;
+        if leaf_key.is_empty()||leaf_key!=private_key{return Err(Failure::Denied)}
+        let der=openssl(target,&["x509","-in","leaf.pem","-outform","DER"])?;
+        if der.is_empty(){return Err(Failure::Denied)}
+        Ok(hex::encode(Sha256::digest(der)))
     }
     fn protect(command:&mut Command){
         use std::os::unix::process::CommandExt;
@@ -309,14 +357,14 @@ mod linux {
     impl Drop for GatewayDir{fn drop(&mut self){let _=fs::remove_dir_all(&self.0);}}
     fn supervise_tcp(protocol:&str,endpoint:&Endpoint,dir:&Path,token:&str,node:&str,generation:i64,capacity:i64,expected:&Expected<'_>,relay_port:u16,bind_port:u16,engine:&Path,web:Option<Web<'_>>)->Result<()>{
         if !matches!(endpoint,Endpoint::Tls{..})||!(30000..=59999).contains(&relay_port)||!(20000..=29999).contains(&bind_port)||!engine.is_absolute(){return Err(Failure::Protocol)}
-        if (protocol=="http")!=web.is_some(){return Err(Failure::Protocol)}
+        if matches!(protocol,"http"|"https")!=web.is_some()||web.as_ref().is_some_and(|w|w.tls!=(protocol=="https")){return Err(Failure::Protocol)}
         if let Some(w)=web.as_ref(){if !web_hostname(w.hostname)||!(60000..=64999).contains(&w.port){return Err(Failure::Protocol)}}
         let engine=fs::canonicalize(engine).map_err(|_|Failure::Protocol)?;
         if !engine.is_file(){return Err(Failure::Protocol)}
         // Trusted local operator provisions independent data-plane credentials.
         // Neither tenant nor relay-control credential is used as tunnel token.
         let private=secret_file(dir,"noise.private",noise_key)?;
-        let service_token=secret_file(dir,match protocol{"udp"=>"udp.token","http"=>"http.token",_=>"tcp.token"},|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)))?;
+        let service_token=secret_file(dir,match protocol{"udp"=>"udp.token","http"=>"http.token","https"=>"https.token",_=>"tcp.token"},|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)))?;
         let _probe=std::net::TcpListener::bind((Ipv4Addr::LOCALHOST,relay_port)).map_err(|_|Failure::Protocol)?;
         drop(_probe);
         if protocol=="udp"{
@@ -324,12 +372,14 @@ mod linux {
         }else{
             let _probe=std::net::TcpListener::bind((Ipv4Addr::LOCALHOST,bind_port)).map_err(|_|Failure::Protocol)?;
         }
+        let mut certificate_sha256=None;
         let gateway=if let Some(w)=web.as_ref(){
             let _probe=std::net::TcpListener::bind((Ipv4Addr::LOCALHOST,w.port)).map_err(|_|Failure::Protocol)?;
-            let path=dir.join(format!("http-{}.gateway",expected.id));
+            let path=dir.join(format!("{protocol}-{}.gateway",expected.id));
             use std::os::unix::fs::DirBuilderExt;
             fs::DirBuilder::new().mode(0o700).create(&path).map_err(|_|Failure::Protocol)?;
             let gateway=GatewayDir(path);
+            if w.tls{certificate_sha256=Some(certificate(dir,&gateway.0,w.hostname)?);}
             let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).open(gateway.0.join("nginx.conf")).map_err(|_|Failure::Protocol)?;
             file.write_all(gateway_config(w,bind_port).as_bytes()).and_then(|_|file.sync_all()).map_err(|_|Failure::Protocol)?;
             Some(gateway)
@@ -354,9 +404,10 @@ mod linux {
             "mapping_revision":expected.revision,"node_id":node,"node_generation":generation,"generation":expected.generation,
             "relay_port":relay_port,"nonce":nonce});
         if let Some(w)=web.as_ref(){payload["gateway_port"]=serde_json::json!(w.port);payload["hostname"]=serde_json::json!(w.hostname);}
+        if let Some(fp)=certificate_sha256.as_ref(){payload["certificate_sha256"]=serde_json::json!(fp);}
         let payload=payload.to_string();
         let started=Instant::now();
-        let (code,data)=request(endpoint,token,match protocol{"udp"=>"/api/v1/relay/udp-claim","http"=>"/api/v1/relay/http-claim",_=>"/api/v1/relay/tcp-claim"},Some(&payload))?;
+        let (code,data)=request(endpoint,token,match protocol{"udp"=>"/api/v1/relay/udp-claim","http"=>"/api/v1/relay/http-claim","https"=>"/api/v1/relay/https-claim",_=>"/api/v1/relay/tcp-claim"},Some(&payload))?;
         if code!=200{return Err(Failure::Protocol)}
         let reply:TcpClaim=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
         let p=reply.permit;
@@ -365,6 +416,7 @@ mod linux {
             p.mapping_revision!=expected.revision||p.generation!=expected.generation||p.node_id!=node||
             p.node_generation!=generation||p.policy_revision!=policy.policy_revision||p.relay_port!=relay_port||p.bind_port!=bind_port||
             p.gateway_port!=web.as_ref().map(|w|w.port)||p.hostname.as_deref()!=web.as_ref().map(|w|w.hostname)||
+            p.certificate_sha256!=certificate_sha256||
             p.issued_at<1||p.issued_at.checked_add(15)!=Some(p.expires_at)||p.claimed_at<p.issued_at||
             p.claimed_at<policy.received_at||p.server_time<p.claimed_at||p.server_time>=p.expires_at{return Err(Failure::Denied)}
         let seconds=p.expires_at.checked_sub(p.server_time).and_then(|n|n.checked_sub(1)).filter(|n|*n>0).ok_or(Failure::Denied)?;
@@ -404,7 +456,7 @@ mod linux {
         let arg=|i:usize|args.get(i).and_then(|a|a.to_str()).ok_or(Failure::Protocol);
         let verify=args.len()==12&&arg(0)?=="--verify-grant";
         let tcp=args.len()==15&&matches!(arg(0)?,"--tcp-preview"|"--udp-preview");
-        let http=args.len()==17&&arg(0)?=="--http-preview";
+        let http=args.len()==17&&matches!(arg(0)?,"--http-preview"|"--https-preview");
         let (endpoint,dir,index,port)=if (args.len()==7&&arg(0)?=="--tls")||verify||tcp||http{
             let host=arg(2)?;
             if !hostname(host){return Err(Failure::Protocol)}
@@ -426,8 +478,8 @@ mod linux {
                 generation:arg(10)?.parse().map_err(|_|Failure::Protocol)?,id:arg(11)?};
             if !hex_id(expected.id)||!hex_id(expected.allocation)||!hex_id(expected.mapping)||expected.revision<1||expected.generation<2{return Err(Failure::Protocol)}
             if tcp||http{
-                let web=if http{Some(Web{port:arg(15)?.parse().map_err(|_|Failure::Protocol)?,hostname:arg(16)?})}else{None};
-                return supervise_tcp(if http{"http"}else if arg(0)?=="--udp-preview"{"udp"}else{"tcp"},&endpoint,&dir,&token,node,generation,capacity,&expected,
+                let web=if http{Some(Web{port:arg(15)?.parse().map_err(|_|Failure::Protocol)?,hostname:arg(16)?,tls:arg(0)?=="--https-preview"})}else{None};
+                return supervise_tcp(if http{if arg(0)?=="--https-preview"{"https"}else{"http"}}else if arg(0)?=="--udp-preview"{"udp"}else{"tcp"},&endpoint,&dir,&token,node,generation,capacity,&expected,
                     arg(12)?.parse().map_err(|_|Failure::Protocol)?,arg(13)?.parse().map_err(|_|Failure::Protocol)?,Path::new(&args[14]),web)
             }
             return verify_grant(&endpoint,&token,node,generation,capacity,&expected)
@@ -454,6 +506,6 @@ fn main(){
     #[cfg(target_os="linux")]
     if linux::run().is_ok(){return}
     // Fixed diagnostics only, never paths, credentials or response bodies.
-    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine> OR --http-preview (same arguments plus gateway-port and hostname)");
+    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine> OR --http-preview/--https-preview (same arguments plus gateway-port and hostname)");
     std::process::exit(1);
 }

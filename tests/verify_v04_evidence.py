@@ -378,6 +378,8 @@ REQUIRED["management-v09"] = {
         "real_independent_udp_expiry_closes_transport_and_datagram_port",
         "real_independent_http_dns_host_routing_and_header_isolation",
         "real_independent_http_expiry_closes_gateway_and_noise_engine",
+        "real_independent_https_certificate_key_fingerprint_and_sni_isolation",
+        "real_independent_https_expiry_closes_tls_gateway_and_noise_engine",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",
