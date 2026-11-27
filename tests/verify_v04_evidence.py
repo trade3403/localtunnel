@@ -330,6 +330,7 @@ REQUIRED["management-v09"] = {
         "real_independent_relay_identity_and_tenant_boundary",
         "real_relay_generation_rotation_and_revocation",
         "real_relay_disable_no_resurrection_and_audit",
+        "real_relay_heartbeat_freshness_generation_and_isolation",
     ],
 }
 
