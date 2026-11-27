@@ -453,7 +453,6 @@ try:
             concurrent=command("--commercial-create-plan",{"code":"tcp-fixture","version":3,"name":"Connection fixture","max_active_devices":4,
                 "max_retained_devices":8,"max_mappings":8,"max_bandwidth_bps":None,"max_monthly_bytes":None,"max_concurrent_connections":2})
             policy(concurrent)
-            call(base,udp_path+"/udp-start",409,"POST",admin,{"expected_revision":allowed["revision"]})
             def wait_slots(expected,token=admin):
                 until=time.monotonic()+8
                 while time.monotonic()<until:
@@ -505,6 +504,56 @@ try:
             stop_run(run_b)
             assert inventory()["reserved_connection_slots"]==0
             report["real_tenant_tcp_connection_slots_shared_denied_and_reused"]=True
+            # Real mixed protocol admission under one finite tenant cap.
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp:
+                udp.bind(("127.0.0.1",udp_local))
+                udp.settimeout(.2)
+                stop_echo=threading.Event()
+                echo_thread=threading.Thread(target=udp_echo,daemon=True)
+                echo_thread.start()
+                try:
+                    child,udp_rid,udp_path,rp,ip=spawn_udp(allowed,"connection_udp")
+                    line(child,"UDP_PREVIEW_READY",45)
+                    wait_slots(0)
+                    run=spawn_tcp(b,"connection_mixed_tcp")
+                    ready_tcp(run)
+                    wait_slots(0)
+                    with held(b["bind_port"]) as active, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as first, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as second:
+                        first.settimeout(3)
+                        second.settimeout(.4)
+                        dst=("127.0.0.1",allowed["bind_port"])
+                        data=secrets.token_bytes(64)
+                        first.sendto(data,dst)
+                        assert first.recvfrom(65535)==(data,dst)
+                        wait_slots(2)
+                        rejected_stream(b["bind_port"])
+                        second.sendto(data,dst)
+                        try:
+                            second.recvfrom(65535)
+                        except socket.timeout:pass
+                        else:raise AssertionError("over-limit UDP source received data")
+                        first.sendto(data,dst)
+                        assert first.recvfrom(65535)==(data,dst)
+                        wait_slots(2)
+                        assert inventory(other)["reserved_connection_slots"]==0
+                        active.shutdown(socket.SHUT_RDWR)
+                        active.close()
+                        wait_slots(1)
+                        second.settimeout(3)
+                        second.sendto(data,dst)
+                        assert second.recvfrom(65535)==(data,dst)
+                        wait_slots(2)
+                        rejected_stream(b["bind_port"])
+                        assert child.poll() is None
+                    stop_run(run)
+                    call(base,udp_path+"/stop",202,"POST",admin,{"request_id":udp_rid})
+                    assert child.wait(timeout=15)==0
+                    wait_slots(0)
+                    assert inventory()["bandwidth_reservations"]==0
+                finally:
+                    stop_echo.set()
+                    echo_thread.join(timeout=2)
+            report["real_tenant_tcp_udp_connection_slots_shared_denied_and_reused"]=True
             # Crash retains an actual open stream slot; offline recovery
             # removes the exact reservation and its child slots together.
             crashed_slots=spawn_tcp(b,"connection_crash")
