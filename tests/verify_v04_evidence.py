@@ -326,6 +326,11 @@ REQUIRED["management-v08"] = {
 
 REQUIRED["management-v09"] = {
     **REQUIRED["management-v08"],
+    "tcp-preview.json": [
+        *REQUIRED["management-v08"]["tcp-preview.json"],
+        "real_node_drain_cancels_unclaimed_and_blocks_new_admission",
+        "real_node_drain_preserves_live_tcp_budget_and_resumes_after_stop",
+    ],
     "relay-identity.json": [
         "real_independent_relay_identity_and_tenant_boundary",
         "real_relay_generation_rotation_and_revocation",

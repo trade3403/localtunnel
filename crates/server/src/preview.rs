@@ -14,6 +14,15 @@ async fn checked_protocol(pool:&SqlitePool,id:&str,revision:i64,protocol:&str)->
     sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname,m.protocol,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps,(SELECT cp.max_monthly_bytes FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS monthly_cap,(SELECT cp.max_concurrent_connections FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS connection_cap FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND (?='web' OR m.protocol=?) AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch() AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()))")
         .bind(id).bind(revision).bind(protocol).bind(protocol).fetch_optional(pool).await.map_err(|_|"mapping read failed")?.ok_or("preview requires current eligible web draft and recent TXT proof")
 }
+// Manual previews remain trusted local commands, not distributed grants.
+// This check is at command admission only; supervised ongoing checks must
+// not revoke a live preview merely because a node enters draining mode.
+async fn manual_admission(pool:&SqlitePool,id:&str,revision:i64)->Result<()>{
+    let allowed=sqlx::query_scalar::<_,i64>("SELECT count(*) FROM mappings m JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND n.enabled=1 AND n.policy_mode='active'")
+        .bind(id).bind(revision).fetch_one(pool).await.map_err(|_|"node admission unavailable")?;
+    if allowed!=1{return Err("node not accepting new previews")}
+    Ok(())
+}
 async fn checked(pool:&SqlitePool,id:&str,revision:i64)->Result<Mapping>{
     checked_protocol(pool,id,revision,"http").await
 }
@@ -57,6 +66,7 @@ fn mkdir(path:&Path)->Result<()>{
 fn mkdir(_path:&Path)->Result<()>{Err("Linux preview only")}
 
 pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,name:&str)->Result<()>{
+    manual_admission(pool,id,revision).await?;
     export_inner(pool,root,id,revision,relay_port,name,None,None,None,None,None).await
 }
 async fn export_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,name:&str,limited_target:Option<u16>,expected_bps:Option<i64>,expected_monthly:Option<i64>,expected_connections:Option<i64>,effective_rate:Option<u32>)->Result<()>{
@@ -95,6 +105,7 @@ async fn export_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_por
 }
 
 pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,mode:&str,expected_file:Option<&str>)->Result<()>{
+    if id!="clear"{manual_admission(pool,id,revision).await?;}
     gateway_inner(pool,root,id,revision,name,listen,mode,expected_file,false).await
 }
 async fn gateway_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,mode:&str,expected_file:Option<&str>,supervised:bool)->Result<()>{
@@ -294,6 +305,7 @@ impl PreviewTransport<'_>{
 /// started an exclusive managed gateway of the selected transport.
 pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>,request:Option<&str>,stop_marker:Option<&Path>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(bundle)||!safe_name(prefix)||bundle==prefix{return Err("invalid supervisor request")}
+    if request.is_none(){manual_admission(pool,id,revision).await?;}
     let m=checked_protocol(pool,id,revision,transport.protocol()).await?;
     if (m.monthly_cap.is_some()||m.connection_cap.is_some())&&request.is_none(){return Err("commercial web quota requires managed request")}
     if relay_port==listen||i64::from(listen)==m.bind_port{return Err("conflicting preview port")}
@@ -436,6 +448,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
 /// TLS preview deliberately requires an immutable, private operator-owned
 /// certificate directory. Empty configurations reject all TLS handshakes.
 pub async fn tls_gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,probe:u16,cert_dir:&str,mode:&str,expected_file:Option<&str>)->Result<()>{
+    if id!="clear"{manual_admission(pool,id,revision).await?;}
     tls_gateway_inner(pool,root,id,revision,name,listen,probe,cert_dir,mode,expected_file,false).await
 }
 async fn tls_gateway_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,probe:u16,cert_dir:&str,mode:&str,expected_file:Option<&str>,supervised:bool)->Result<()>{
@@ -723,6 +736,7 @@ fn udp_echo_probe(socket:&std::net::UdpSocket)->bool{
 /// binaries, keys, unused ports and an actual local UDP echo fixture.
 /// No automatic registration, no public bind, no HTTP activation state.
 pub async fn supervise_udp(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,internal_port:u16,bundle:&str)->Result<()>{
+    manual_admission(pool,id,revision).await?;
     supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,bundle,None,None,None,false).await
 }
 

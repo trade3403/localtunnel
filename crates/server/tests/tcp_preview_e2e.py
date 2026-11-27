@@ -119,6 +119,22 @@ try:
             call(base,route+"/tcp-start",409,"POST",admin,spec)
             assert call(base,route+"/stop",202,"POST",admin,{"request_id":q["request_id"]})["state"]=="stopped"
             report["real_tcp_scoped_queue_and_cancel"]=True
+            def node_policy(expected,mode):
+                result=subprocess.run([exe,"--set-node-policy",str(root),node,str(expected),"0","unassigned",mode],capture_output=True,timeout=20)
+                assert result.returncode==0,"node policy change failed"
+            # A pending but unclaimed request is cancelled atomically.
+            queued=call(base,route+"/tcp-start",202,"POST",admin,spec)
+            node_policy(1,"draining")
+            state=call(base,route+"/runtime",200,token=admin)["request"]
+            assert state["request_id"]==queued["request_id"] and state["state"]=="stopped"
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            new_draft={"device_id":device["id"],"node_id":node,"protocol":"tcp","local_port":local,"bind_port":free(20000,29999,[local,ingress])}
+            call(base,"mappings",409,"POST",admin,new_draft)
+            node_policy(2,"maintenance")
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            call(base,"mappings",409,"POST",admin,new_draft)
+            node_policy(3,"active")
+            report["real_node_drain_cancels_unclaimed_and_blocks_new_admission"]=True
             def start(bundle):
                 q=call(base,route+"/tcp-start",202,"POST",admin,spec)
                 p=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),mid,str(m["revision"]),str(relay),bundle,"240000"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
@@ -156,12 +172,27 @@ try:
             assert 3.8<=elapsed<=30
             report["tcp_bandwidth_measurements"]={"bytes_each_direction":524288,"elapsed_seconds":elapsed}
             report["real_tcp_noise_shared_bidirectional_cap"]=True
+            # Actual forwarding and durable reservations survive drain.
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                before=db.execute("SELECT * FROM bandwidth_reservations WHERE mapping_id=?",(mid,)).fetchall()
+                assert before
+            node_policy(4,"draining")
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            call(base,"mappings",409,"POST",admin,new_draft)
+            exchange(4096)
+            state=call(base,route+"/runtime",200,token=admin)["request"]
+            assert state["request_id"]==rid and state["state"]=="running"
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT * FROM bandwidth_reservations WHERE mapping_id=?",(mid,)).fetchall()==before
             call(base,route+"/stop",404,"POST",other,{"request_id":rid})
             call(base,route+"/stop",409,"POST",admin,{"request_id":secrets.token_hex(16)})
             assert call(base,route+"/stop",202,"POST",admin,{"request_id":rid})["state"]=="stopping"
             closed(p,rid,guard,"tcp_first")
             report["real_tcp_stop_closes_listeners_and_bundle"]=True
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            node_policy(5,"active")
             p,rid,guard=start("tcp_second")
+            report["real_node_drain_preserves_live_tcp_budget_and_resumes_after_stop"]=True
             exchange(1024)
             policy(state="suspended")
             call(base,route+"/tcp-start",409,"POST",admin,spec)

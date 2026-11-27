@@ -50,6 +50,13 @@ pub async fn set_policy(pool:&SqlitePool,id:&str,expected:i64,capacity:i64,regio
     if changed.rows_affected()!=1{return Err(CONFLICT)}
     sqlx::query("INSERT INTO node_policy_audit(node_id,revision,approved_capacity,region,mode) VALUES (?,?,?,?,?)")
         .bind(id).bind(expected+1).bind(capacity).bind(region).bind(mode).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    // A queued request has not been claimed and owns no worker authority.
+    // Serialize cancellation with the claim write. Never touch claimed,
+    // running, stopping or unknown requests, or their resource reservations.
+    if mode!="active"{
+        sqlx::query("UPDATE runtime_requests SET state='stopped',updated_at=unixepoch() WHERE state='queued' AND mapping_id IN (SELECT id FROM mappings WHERE node_id=?)")
+            .bind(id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    }
     tx.commit().await.map_err(|_|INTERNAL)?;
     Ok(())
 }
