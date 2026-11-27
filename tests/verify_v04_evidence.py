@@ -324,6 +324,15 @@ REQUIRED["management-v08"] = {
     ],
 }
 
+REQUIRED["management-v09"] = {
+    **REQUIRED["management-v08"],
+    "relay-identity.json": [
+        "real_independent_relay_identity_and_tenant_boundary",
+        "real_relay_generation_rotation_and_revocation",
+        "real_relay_disable_no_resurrection_and_audit",
+    ],
+}
+
 def unique_object(pairs):
     obj = {}
     for key, value in pairs:
