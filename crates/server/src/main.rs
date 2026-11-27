@@ -5,6 +5,7 @@ mod mappings;
 mod nodes;
 mod scheduling;
 mod grants;
+mod relay_tcp;
 mod relay;
 mod domains;
 mod preview;
@@ -34,10 +35,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat','node_policy_audit','relay_allocations','relay_grants')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat','node_policy_audit','relay_allocations','relay_grants','relay_tcp_intents')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(26) => (StatusCode::OK, "ready"),
+        Ok(27) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -303,6 +304,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .merge(nodes::routes(pool.clone()))
         .merge(scheduling::routes(pool.clone()))
         .merge(grants::routes(pool.clone()))
+        .merge(relay_tcp::routes(pool.clone()))
         .merge(relay::routes(pool.clone()))
         .merge(runtime::routes(pool.clone()))
         .merge(traffic::routes(pool.clone()))
