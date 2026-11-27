@@ -287,6 +287,7 @@ REQUIRED["management-v08"] = {
         "real_monthly_over_budget_closes_real_tcp_without_overspend",
         "real_monthly_debits_survive_management_restart",
         "real_tenant_tcp_connection_slots_shared_denied_and_reused",
+        "real_tenant_tcp_udp_connection_slots_shared_denied_and_reused",
         "real_crashed_connection_slot_retained_until_audited_recovery",
     ],
     "udp-preview.json": [
