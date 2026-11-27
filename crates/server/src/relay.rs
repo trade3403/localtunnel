@@ -11,7 +11,7 @@ const INTERNAL:Failure=(StatusCode::SERVICE_UNAVAILABLE,"relay identity unavaila
 const CONFLICT:Failure=(StatusCode::CONFLICT,"relay identity conflict");
 const PREFIX:&str="ltrelay_";
 
-fn digest(headers:&HeaderMap)->Result<Vec<u8>,Failure>{
+pub(crate) fn digest(headers:&HeaderMap)->Result<Vec<u8>,Failure>{
     let mut values=headers.get_all(header::AUTHORIZATION).iter();
     let raw=values.next().ok_or(DENIED)?.to_str().map_err(|_|DENIED)?;
     if values.next().is_some(){return Err(DENIED)}

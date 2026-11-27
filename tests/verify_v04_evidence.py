@@ -337,6 +337,11 @@ REQUIRED["management-v09"] = {
         "real_relay_disable_no_resurrection_and_audit",
         "real_relay_heartbeat_freshness_generation_and_isolation",
     ],
+    "grants.json": [
+        "real_grant_exact_binding_atomic_generation_and_owner_isolation",
+        "real_grant_policy_generation_expiry_and_no_release",
+        "real_grant_restore_revoked_and_retained",
+    ],
     "scheduling.json": [
         "real_atomic_capacity_and_idempotent_reservation",
         "real_region_port_and_drain_isolation",
