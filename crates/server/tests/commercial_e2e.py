@@ -201,6 +201,23 @@ try:
             call(base,route,405,"POST",customer,{"plan_id":next_pid})
             call(base,route,405,"PATCH",customer,{"plan_id":next_pid})
             report["real_created_account_login_and_no_http_policy_mutation"]=True
+            # A tenant session is never a global commercial operator.
+            # Attempt explicit foreign selectors and every common mutation
+            # verb; compare persisted policy and audit rows before/after.
+            foreign=call(base,route,200,token=admin)["entitlement"]
+            with sqlite3.connect(db_path) as db:
+                snapshot={t:rows(db,t) for t in ("commercial_plans","tenant_entitlements","commercial_operator_audit","management_audit")}
+            for token,expected,other_id in ((customer,own,foreign["tenant_id"]),(admin,foreign,tenant)):
+                for query in ("?tenant_id="+other_id,"?owner_id="+other_id,"?plan_id="+next_pid):
+                    assert call(base,route+query,200,token=token)["entitlement"]==expected
+                for verb in ("POST","PUT","PATCH","DELETE"):
+                    call(base,route,405,verb,token,{"tenant_id":other_id,"plan_id":next_pid,"state":"active","expected_revision":1})
+                for resource in ("plans","accounts","tenants","assign","operator-audit"):
+                    call(base,"/api/v1/commercial/"+resource,404,token=token)
+                    call(base,"/api/v1/commercial/"+resource,404,"POST",token,{"tenant_id":other_id,"plan_id":next_pid})
+            with sqlite3.connect(db_path) as db:
+                assert {t:rows(db,t) for t in snapshot}==snapshot
+            report["real_commercial_foreign_selectors_and_operator_http_boundary"]=True
             spec={"tenant_id":tenant,"plan_id":next_pid,"expected_revision":1,"state":"active","expires_at":1}
             reject("--commercial-assign",{**spec,"expected_revision":2})
             reject("--commercial-assign",{**spec,"plan_id":"f"*32})
@@ -317,4 +334,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==14 and all(value is True for value in report.values())
+assert len(report)==15 and all(value is True for value in report.values())
