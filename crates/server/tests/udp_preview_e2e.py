@@ -6,6 +6,7 @@ import re
 import secrets
 import selectors
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -359,6 +360,72 @@ try:
             policy()
             call(base,endpoint,409,"POST",d2["device_token"],spec)
             report["real_udp_commercial_suspend_revokes_lease_and_closes_relay"]=True
+            # Both the ordinary managed worker and the independent device
+            # lease use the same precharged datagram path and tenant ledger.
+            cap=16384
+            plan={"code":"udp-monthly","version":1,"name":"UDP monthly fixture",
+                  "max_active_devices":64,"max_retained_devices":256,"max_mappings":4096,
+                  "max_bandwidth_bps":None,"max_monthly_bytes":cap,"max_concurrent_connections":None}
+            created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(plan).encode(),capture_output=True,timeout=20)
+            assert created.returncode==0
+            policy(plan_id=created.stdout.decode().strip())
+            def monthly():
+                return call(base,"commercial/entitlement",200,token=admin)["entitlement"]
+            assert monthly()["monthly_charged_bytes"]==0
+            rejected(command(m["revision"],"monthly_manual"))
+            assert not (root/"monthly_manual").exists()
+            q=call(base,route+"/udp-start",202,"POST",admin,{"expected_revision":m["revision"]})
+            p=subprocess.Popen([exe,"--runtime-udp-worker",str(root),mid,str(m["revision"]),str(relay),str(internal),"monthly_udp","4096","1200"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            children.append(p)
+            line(p,"UDP_PREVIEW_READY",45)
+            initial=monthly()["monthly_charged_bytes"]
+            assert initial>=64
+            assert exchange()
+            used=monthly()["monthly_charged_bytes"]
+            assert used>=initial+256 and used<cap
+            assert json.loads((root/"monthly_udp"/"manifest.json").read_text())["monthly_cap"]==cap
+            call(base,route+"/stop",202,"POST",admin,{"request_id":q["request_id"]})
+            assert p.wait(timeout=15)==0
+            closed()
+            previous=monthly()["monthly_charged_bytes"]
+            assert used<=previous<cap
+            report["real_udp_managed_monthly_precharge_and_manual_denial"]=True
+            worker,agent,config_file,monthly_lease=launch_lease()
+            assert monthly()["monthly_charged_bytes"]>=previous+64
+            assert json.loads((root/("udp-device-"+monthly_lease["request_id"])/"manifest.json").read_text())["monthly_cap"]==cap
+            prefix=secrets.token_bytes(16)
+            replies=set()
+            sent=[]
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sender:
+                sender.settimeout(.7)
+                for i in range(32):
+                    if worker.poll() is not None:break
+                    data=prefix+bytes([i])+secrets.token_bytes(983)
+                    sent.append(data)
+                    sender.sendto(data,("127.0.0.1",lease_ingress))
+                    try:
+                        reply,addr=sender.recvfrom(65535)
+                        assert addr==("127.0.0.1",lease_ingress) and reply==data
+                        replies.add(reply)
+                    except socket.timeout:pass
+                    time.sleep(.35)
+            assert worker.wait(timeout=15)==0
+            actual=[v for v in seen if v.startswith(prefix)]
+            assert 0<len(replies)<=len(actual)<32
+            assert set(actual).issubset(set(sent)) and replies.issubset(set(actual))
+            final=monthly()
+            assert cap-1200<final["monthly_charged_bytes"]<=cap
+            assert final["monthly_charged_bytes"]>=previous+1000*(len(actual)+len(replies))
+            assert final["bandwidth_reservations"]==0
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            finish_agent(agent,config_file)
+            assert_clean(monthly_lease)
+            assert call(base,lease_route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT charged_bytes FROM tenant_monthly_usage WHERE tenant_id=? AND month_utc=?",(final["tenant_id"],final["month_utc"])).fetchone()==(final["monthly_charged_bytes"],)
+            policy(plan_id="legacy-v1")
+            assert monthly()["monthly_charged_bytes"]==final["monthly_charged_bytes"]
+            report["real_udp_device_monthly_shared_budget_exhaustion_and_cleanup"]=True
             worker,agent,config_file,lease3=launch_lease()
             call(base,device_route+"/revoke",204,"POST",admin)
             assert worker.wait(timeout=15)!=0
@@ -446,4 +513,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==16 and all(v is True for v in report.values())
+assert len(report)==18 and all(v is True for v in report.values())

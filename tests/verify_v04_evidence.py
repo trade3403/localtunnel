@@ -281,6 +281,7 @@ REQUIRED["management-v08"] = {
         "real_bandwidth_recovery_exact_binding_audit_and_no_adoption",
         "real_bandwidth_recovered_capacity_reused_by_real_workers",
         "real_monthly_shared_tcp_debits_and_previous_month_isolation",
+        "real_monthly_udp_and_tcp_share_durable_tenant_budget",
         "real_monthly_over_budget_closes_real_tcp_without_overspend",
         "real_monthly_debits_survive_management_restart",
     ],
@@ -289,6 +290,8 @@ REQUIRED["management-v08"] = {
         "real_udp_commercial_manual_cap_and_unsupported_rate_denial",
         "real_udp_commercial_cap_tightens_operator_and_limits_payload",
         "real_udp_commercial_plan_change_stops_old_generation",
+        "real_udp_managed_monthly_precharge_and_manual_denial",
+        "real_udp_device_monthly_shared_budget_exhaustion_and_cleanup",
     ],
     "commercial.json": [
         "real_legacy_upgrade_preserves_existing_owner_data",

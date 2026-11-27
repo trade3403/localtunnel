@@ -149,6 +149,12 @@ impl UdpForwarder {
 
     /// Bounded nonblocking work; no payload logging or pending application queue.
     pub fn poll(&mut self) -> Result<(), &'static str> {
+        self.poll_with_charge(|_|Ok(()))
+    }
+    /// Charge only admitted datagrams, immediately before each socket send.
+    /// A rejected charge aborts this poll without forwarding that datagram.
+    /// The metered owner must close this forwarder on error.
+    pub fn poll_with_charge(&mut self, mut charge:impl FnMut(usize)->Result<(), &'static str>) -> Result<(), &'static str> {
         let now = Instant::now();
         self.sessions.retain(|_,s| now.saturating_duration_since(s.last_forwarded)<IDLE);
         self.admission.prune(now);
@@ -187,7 +193,9 @@ impl UdpForwarder {
                     reject(&mut self.stats.byte_limited_from_source);
                     reject(&mut self.stats.rejected_from_source); continue;
                 }
-                // A failed send consumes budget conservatively but is never metered.
+                // Precharge even if the subsequent socket send fails.
+                // Successful-send counters still exclude failed sends.
+                charge(n)?;
                 if s.socket.send(&self.buf[..n]).ok()==Some(n) {
                     s.last_forwarded=now;
                     count(&mut self.stats.to_target_bytes,&mut self.stats.to_target_packets,n);
@@ -208,6 +216,7 @@ impl UdpForwarder {
                     reject(&mut self.stats.byte_limited_from_target);
                     reject(&mut self.stats.rejected_from_target); continue;
                 }
+                charge(n)?;
                 if self.ingress.send_to(&self.buf[..n],peer).ok()==Some(n) {
                     count(&mut self.stats.to_source_bytes,&mut self.stats.to_source_packets,n);
                 } else { reject(&mut self.stats.rejected_from_target); }
@@ -234,6 +243,48 @@ pub fn run_with_limits(listen: SocketAddr, relay: SocketAddr, limits: Option<Byt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn real_datagram_precharge_denial_prevents_each_send(){
+        let target=UdpSocket::bind("127.0.0.1:0").unwrap();
+        target.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let source=UdpSocket::bind("127.0.0.1:0").unwrap();
+        source.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let mut f=UdpForwarder::bind("127.0.0.1:0".parse().unwrap(),target.local_addr().unwrap()).unwrap();
+        let addr=f.local_addr().unwrap();
+        let mut buf=[0;2048];
+        source.send_to(&[7;31],addr).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        loop{
+            match f.poll_with_charge(|n|{assert_eq!(n,31);Err("denied")}){
+                Err("denied")=>break,
+                Ok(())=>{assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(2));},
+                Err(e)=>panic!("unexpected guard error: {e}"),
+            }
+        }
+        assert!(target.recv_from(&mut buf).is_err());
+        assert_eq!(f.stats().to_target_bytes,0);
+        source.send_to(&[9;47],addr).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        let peer=loop{
+            f.poll_with_charge(|n|{assert_eq!(n,47);Ok(())}).unwrap();
+            if let Ok((n,peer))=target.recv_from(&mut buf){
+                assert_eq!(&buf[..n],&[9;47]);break peer
+            }
+            assert!(Instant::now()<until);
+        };
+        target.send_to(&[3;53],peer).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        loop{
+            match f.poll_with_charge(|n|{assert_eq!(n,53);Err("denied")}){
+                Err("denied")=>break,
+                Ok(())=>{assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(2));},
+                Err(e)=>panic!("unexpected guard error: {e}"),
+            }
+        }
+        assert!(source.recv_from(&mut buf).is_err());
+        assert_eq!(f.stats().to_target_bytes,47);
+        assert_eq!(f.stats().to_source_bytes,0);
+    }
     #[test]
     fn deterministic_rate_and_admission_bounds() {
         let now=Instant::now();

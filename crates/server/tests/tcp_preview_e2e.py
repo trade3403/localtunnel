@@ -375,20 +375,43 @@ try:
                 previous=db.execute("SELECT strftime('%Y-%m','now','start of month','-1 month')").fetchone()[0]
                 db.execute("INSERT INTO tenant_monthly_usage VALUES (?,?,?)",(tenant,previous,cap))
             assert inventory()["monthly_charged_bytes"]==0 and inventory()["month_utc"]!=previous
-            # UDP remains fail-closed until a datagram debit path exists.
-            call(base,udp_path+"/udp-start",409,"POST",admin,{"expected_revision":allowed["revision"]})
+            # The now-metered UDP protocol may queue a managed request.
+            # Rebind the earlier fixture's actual target port and prove the
+            # UDP debit persists into the subsequent independent TCP runs.
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp:
+                udp.bind(("127.0.0.1",udp_local))
+                udp.settimeout(.2)
+                stop_echo=threading.Event()
+                echo_thread=threading.Thread(target=udp_echo,daemon=True)
+                echo_thread.start()
+                try:
+                    child,udp_rid,udp_path,rp,ip=spawn_udp(allowed,"monthly_udp_shared")
+                    line(child,"UDP_PREVIEW_READY",45)
+                    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
+                        probe.settimeout(2)
+                        data=secrets.token_bytes(128)
+                        probe.sendto(data,("127.0.0.1",allowed["bind_port"]))
+                        assert probe.recvfrom(65535)==(data,("127.0.0.1",allowed["bind_port"]))
+                    call(base,udp_path+"/stop",202,"POST",admin,{"request_id":udp_rid})
+                    assert child.wait(timeout=15)==0
+                    udp_used=inventory()["monthly_charged_bytes"]
+                    assert 320<=udp_used<cap
+                finally:
+                    stop_echo.set()
+                    echo_thread.join(timeout=2)
             monthly_a=spawn_tcp(b,"monthly_a")
             monthly_b=spawn_tcp(new,"monthly_b")
             ready_tcp(monthly_a)
             ready_tcp(monthly_b)
             initial=inventory()["monthly_charged_bytes"]
-            assert 128<=initial<cap
+            assert udp_used+128<=initial<cap
             exchange(1024,b["bind_port"])
             exchange(1024,new["bind_port"])
             used_bytes=inventory()["monthly_charged_bytes"]
             assert used_bytes>=initial+4096 and used_bytes<cap
             assert inventory(other)["monthly_charged_bytes"]==0
             report["real_monthly_shared_tcp_debits_and_previous_month_isolation"]=True
+            report["real_monthly_udp_and_tcp_share_durable_tenant_budget"]=True
             def until_closed(port):
                 data=secrets.token_bytes(65536)
                 got=bytearray()
@@ -438,4 +461,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len([v for v in report.values() if v is True])==16
+assert len([v for v in report.values() if v is True])==17

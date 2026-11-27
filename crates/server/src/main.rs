@@ -6,6 +6,10 @@ mod nodes;
 mod domains;
 mod preview;
 mod tcp_limit;
+#[path = "../../../src/udp_guard.rs"]
+#[allow(dead_code)]
+mod udp_guard;
+mod udp_monthly;
 mod runtime;
 mod traffic;
 mod audit;
