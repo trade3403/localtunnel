@@ -231,6 +231,7 @@ REQUIRED["management-v05"] = {
         "real_https_commercial_tcp_bandwidth_and_plan_change_cleanup",
         "real_https_monthly_only_plan_debits_and_stops_without_overspend",
         "real_https_connection_only_plan_denies_extra_backend_stream",
+        "real_four_protocol_shared_connection_slots_and_cleanup",
         "real_https_five_minute_resident_soak_and_resource_bounds",
         "real_https_soak_clean_stop_and_listener_release",
     ],
