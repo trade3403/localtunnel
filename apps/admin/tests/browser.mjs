@@ -309,6 +309,66 @@ with sqlite3.connect(sys.argv[1]) as db:
   assert.ok(history.events.some(x=>x.event==='mapping.deleted'))
   assert.ok(history.events.some(x=>x.event==='domain.deleted'))
   report.real_committed_audit_visible_in_browser=true
+  stage='commercial owner inventory'
+  const cli=(action,input)=>{
+    const result=spawnSync(exe,[action,root],{input:JSON.stringify(input),encoding:'utf8',timeout:20000})
+    assert.equal(result.status,0,'commercial CLI failed')
+    return result.stdout.trim()
+  }
+  const plan=cli('--commercial-create-plan',{code:'browser-quota',version:1,name:'Browser quota fixture',max_active_devices:3,max_retained_devices:5,max_mappings:7,max_bandwidth_bps:1048576,max_monthly_bytes:123456,max_concurrent_connections:4})
+  const other=cli('--commercial-create-account',{username:'other-owner',password,plan_id:plan,expires_at:null})
+  const entitlement=async()=>{
+    const r=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/commercial/entitlement',{headers:{Authorization:adminBearer}})
+    assert.equal(r.status,200)
+    return (await r.json()).entitlement
+  }
+  const own=await entitlement()
+  assert.notEqual(own.tenant_id,other)
+  const assign=(state,expires_at,revision)=>cli('--commercial-assign',{tenant_id:own.tenant_id,plan_id:plan,expected_revision:revision,state,expires_at})
+  assign('active',null,own.revision)
+  await menu('套餐与额度').click()
+  const card=page.getByTestId('commercial-entitlement')
+  const usage=page.getByTestId('commercial-usage')
+  await card.getByText('Browser quota fixture',{exact:true}).waitFor()
+  await card.getByText(own.tenant_id,{exact:true}).waitFor()
+  assert.equal(await card.getByText(other,{exact:true}).count(),0)
+  const active=await entitlement()
+  assert.equal(active.plan_id,plan)
+  assert.equal(active.active_devices,1)
+  assert.equal(active.mappings,1)
+  await usage.getByText('1 / 3',{exact:true}).waitFor()
+  await usage.getByText('1 / 5',{exact:true}).waitFor()
+  await usage.getByText('1 / 7',{exact:true}).waitFor()
+  await usage.getByText('0 / 4',{exact:true}).waitFor()
+  await usage.getByText('1,048,576',{exact:true}).waitFor()
+  await usage.getByText(active.month_utc+'：0 / 123,456',{exact:true}).waitFor()
+  assign('suspended',null,active.revision)
+  await page.getByRole('button',{name:'刷新数据'}).click()
+  await card.getByText('已暂停',{exact:true}).waitFor()
+  const suspended=await entitlement()
+  assign('active',Math.floor(Date.now()/1000)-60,suspended.revision)
+  await page.getByRole('button',{name:'刷新数据'}).click()
+  await card.getByText('已过期',{exact:true}).waitFor()
+  report.real_browser_commercial_entitlement_and_refresh=true
+  // Independent browser context and real second owner login.
+  const otherPage=await browser.newPage()
+  try{
+    await otherPage.goto('http://127.0.0.1:1430/')
+    await otherPage.locator('#username').fill('other-owner')
+    await otherPage.locator('#password').fill(password)
+    await otherPage.getByRole('button',{name:'登录',exact:true}).click()
+    await otherPage.getByRole('menuitem',{name:'套餐与额度',exact:true}).click()
+    const otherCard=otherPage.getByTestId('commercial-entitlement')
+    await otherCard.getByText(other,{exact:true}).waitFor()
+    await otherCard.getByText('有效',{exact:true}).waitFor()
+    assert.equal(await otherCard.getByText(own.tenant_id,{exact:true}).count(),0)
+    await otherPage.getByTestId('commercial-usage').getByText('0 / 3',{exact:true}).waitFor()
+    await otherPage.getByTestId('commercial-usage').getByText('0 / 7',{exact:true}).waitFor()
+    await otherPage.getByRole('button',{name:'退出登录'}).click()
+    await otherCard.waitFor({state:'hidden'})
+    assert.equal(await otherPage.evaluate(()=>localStorage.length+sessionStorage.length),0)
+  }finally{await otherPage.close()}
+  report.real_browser_commercial_owner_isolation=true
   stage='logout'
   await page.getByRole('button',{name:'退出登录'}).click()
   await page.getByRole('heading',{name:'管理后台登录'}).waitFor()
