@@ -15,6 +15,8 @@ import urllib.error
 import urllib.request
 import http.server
 import threading
+import socketserver
+import struct
 import re
 
 exe=Path(sys.argv[1]).resolve()
@@ -39,8 +41,46 @@ def port():
         s.bind(("127.0.0.1",0));return s.getsockname()[1]
 def openssl(*args):
     subprocess.run(["openssl",*map(str,args)],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=20)
+records={}
+queries=[]
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        def read(n):
+            b=b""
+            while len(b)<n:
+                part=self.request.recv(n-len(b))
+                if not part:
+                    raise EOFError()
+                b+=part
+            return b
+        self.request.settimeout(4)
+        raw=read(struct.unpack("!H",read(2))[0])
+        pos=12
+        labels=[]
+        while raw[pos]:
+            n=raw[pos]
+            pos+=1
+            labels.append(raw[pos:pos+n].decode("ascii"))
+            pos+=n
+        pos+=1
+        assert raw[pos:pos+4]==b"\x00\x10\x00\x01"
+        qname=".".join(labels)+"."
+        queries.append(qname)
+        value=records.get(qname)
+        question=raw[12:pos+4]
+        answer=b""
+        if value is not None:
+            txt=value.encode("ascii")
+            data=bytes([len(txt)])+txt
+            answer=b"\xc0\x0c"+struct.pack("!HHIH",16,1,30,len(data))+data
+        response=raw[:2]+struct.pack("!HHHHH",0x8180,1,int(bool(answer)),0,0)+question+answer
+        self.request.sendall(struct.pack("!H",len(response))+response)
+
 try:
-    with tempfile.TemporaryDirectory() as tmp:
+    with socketserver.ThreadingTCPServer(("127.0.0.1",0),Handler) as dns,tempfile.TemporaryDirectory() as tmp:
+        dns.daemon_threads=True
+        dns_thread=threading.Thread(target=dns.serve_forever,daemon=True);dns_thread.start()
+        resolver="127.0.0.1:"+str(dns.server_address[1])
         root=Path(tmp)
         center=root/"center";center.mkdir(mode=0o700)
         def cmd(*args,data=None):
@@ -51,7 +91,7 @@ try:
         cmd("--init-admin",data={"username":"owner","password":password})
         nodes=[cmd("--add-node","TLS relay "+str(i)) for i in range(3)]
         tokens.extend(cmd("--relay-issue",n) for n in nodes)
-        p=subprocess.Popen([str(exe),str(center),"0"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        p=subprocess.Popen([str(exe),str(center),"0"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,LOCALTUNNEL_DNS_RESOLVER=resolver))
         children.append(p)
         with selectors.DefaultSelector() as s:
             s.register(p.stdout,selectors.EVENT_READ);assert s.select(20)
@@ -390,6 +430,82 @@ try:
                 report["real_independent_udp_expiry_closes_transport_and_datagram_port"]=True
             finally:
                 done.set();worker.join(timeout=3)
+        # HTTP data path: real DNS proof, verified TLS claim, independent
+        # gateway and Noise agent. Unknown hosts never reach the target.
+        http_token=secrets.token_hex(32);tokens.append(http_token)
+        path=dirs[1]/"http.token";path.write_text(http_token+"\n");path.chmod(0o600)
+        web=admin("domains",{"hostname":"relay-web.example.test"},owner,201)
+        records[web["txt_name"]+"."]=web["txt_value"]
+        proof=admin("domains/verify",{"domain_id":web["id"]},owner)
+        assert proof["verified_at"] is not None
+        web_relay=free_range(30000,59999)
+        while web_relay in (relay_port,udp_relay):web_relay=free_range(30000,59999)
+        web_bind=free_range(20001,29999)
+        while web_bind in (bind_port,udp_bind):web_bind=free_range(20001,29999)
+        gateway_port=free_range(60000,64999)
+        hits=[]
+        class WebTarget(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                body=json.dumps({"path":self.path,"host":self.headers.get("Host"),"xff":self.headers.get("X-Forwarded-For"),
+                    "proto":self.headers.get("X-Forwarded-Proto"),"forwarded":self.headers.get("Forwarded")}).encode()
+                self.send_response(200);self.send_header("Content-Length",str(len(body)));self.end_headers();self.wfile.write(body)
+            def log_message(self,*args):pass
+        target=http.server.ThreadingHTTPServer(("127.0.0.1",0),WebTarget)
+        worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
+        try:
+            a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":device,"node_id":nodes[1],
+                "protocol":"http","domain_id":web["id"],"local_port":target.server_port,"bind_port":web_bind},owner,201)
+            config=root/"http-agent.toml"
+            subprocess.run([str(core_test.CLI),"client-config",str(config),f"127.0.0.1:{web_relay}","m_"+a["mapping_id"],
+                f"127.0.0.1:{target.server_port}"],env=dict(os.environ,LOCALTUNNEL_TOKEN=http_token,LOCALTUNNEL_SERVER_PUBLIC_KEY=public),
+                check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            g=admin("allocations/"+a["id"]+"/grant",{"expected_generation":1,"expected_mapping_revision":1},owner,201)
+            admin("allocations/"+a["id"]+"/http-intent",{"grant_id":g["id"],"expected_generation":g["generation"],
+                "relay_port":web_relay,"gateway_port":gateway_port},owner,201)
+            def start_web(host=web["hostname"]):
+                p=subprocess.Popen([str(relay),"--http-preview",str(dirs[1]),"localhost",str(tp),nodes[1],"1","6",
+                    a["id"],a["mapping_id"],"1",str(g["generation"]),g["id"],str(web_relay),str(web_bind),str(engine),
+                    str(gateway_port),host],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                children.append(p);return p
+            wrong=start_web("other.example.test");fails(wrong)
+            assert "relay HTTP engine started" not in wrong.stdout.read()
+            running=start_web()
+            with selectors.DefaultSelector() as sel:
+                sel.register(running.stdout,selectors.EVENT_READ);assert sel.select(5)
+            assert running.stdout.readline().strip()=="relay HTTP engine started"
+            agent=subprocess.Popen([str(engine),str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,RUST_LOG="warn"))
+            children.append(agent)
+            body="/"+secrets.token_hex(24)
+            def web_request(host):
+                req=urllib.request.Request(f"http://127.0.0.1:{gateway_port}"+body,headers={"Host":host,"X-Forwarded-For":"203.0.113.9","Forwarded":"for=203.0.113.9"})
+                try:
+                    with urllib.request.urlopen(req,timeout=.5) as r:return r.status,json.load(r)
+                except urllib.error.HTTPError as ex:return ex.code,None
+                except OSError:return None,None
+            def transfer_web():
+                return web_request(web["hostname"])==(200,{"path":body,"host":web["hostname"],"xff":"127.0.0.1","proto":"http","forwarded":None})
+            wait(transfer_web,9)
+            before=len(hits)
+            assert web_request("other.example.test")[0]==421 and len(hits)==before
+            replay=start_web();fails(replay)
+            assert "relay HTTP engine started" not in replay.stdout.read()
+            assert running.poll() is None and agent.poll() is None
+            report["real_independent_http_dns_host_routing_and_header_isolation"]=True
+            out,err=running.communicate(timeout=20)
+            assert running.returncode==0 and out.strip()=="relay HTTP engine expired and stopped"
+            assert not any(t in out+err for t in tokens)
+            for n in (web_relay,web_bind,gateway_port):
+                with socket.socket() as check:
+                    check.settimeout(.5);assert check.connect_ex(("127.0.0.1",n))!=0
+            assert not (dirs[1]/("http-"+g["id"]+".toml")).exists()
+            assert not (dirs[1]/("http-"+g["id"]+".gateway")).exists()
+            with sqlite3.connect(center/"control.sqlite3") as db:
+                assert db.execute("SELECT claimed_at IS NOT NULL FROM relay_http_intents WHERE grant_id=?",(g["id"],)).fetchone()==(1,)
+            report["real_independent_http_expiry_closes_gateway_and_noise_engine"]=True
+        finally:
+            target.shutdown();target.server_close();worker.join(timeout=3)
+        dns.shutdown();dns_thread.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
         assert request("/api/v1/relay/identity",tokens[1])[0]==401
@@ -401,4 +517,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==12 and all(report.values())
+assert len(report)==14 and all(report.values())
