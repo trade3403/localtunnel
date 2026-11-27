@@ -297,6 +297,7 @@ REQUIRED["management-v08"] = {
         "real_udp_commercial_plan_change_stops_old_generation",
         "real_udp_managed_monthly_precharge_and_manual_denial",
         "real_udp_device_monthly_shared_budget_exhaustion_and_cleanup",
+        "real_udp_device_connection_quota_probe_exempt_and_cleanup",
     ],
     "commercial.json": [
         "real_legacy_upgrade_preserves_existing_owner_data",
