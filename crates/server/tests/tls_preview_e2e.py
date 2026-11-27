@@ -566,6 +566,118 @@ try:
                 rejects(gp,hostname,ca2)
                 assert request(bp,hostname) is None
                 report["real_https_connection_only_plan_denies_extra_backend_stream"]=True
+                # Four independent managed workers, one real tenant budget.
+                mixed_plan={**conn_plan,"version":4,"name":"Four protocol fixture","max_concurrent_connections":4}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(mixed_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                policy(plan_id=created.stdout.decode().strip())
+                def mixed_bind(kind):
+                    for port in range(26000,29000):
+                        if port in ports:continue
+                        with socket.socket(socket.AF_INET,kind) as check:
+                            try:check.bind(("127.0.0.1",port))
+                            except OSError:continue
+                            ports.add(port)
+                            return port
+                    raise AssertionError("no mixed fixture port")
+                http_host="mixed.example.test"
+                hd=expect(call(base,"domains","POST",admin,{"hostname":http_host}),201)
+                records[hd["txt_name"]+"."]=hd["txt_value"]
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":hd["id"]}),200)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                mixed_device=expect(enroll(base,issue(base,admin)),201)
+                def mixed_mapping(protocol,target,domain_id=None):
+                    spec={"device_id":mixed_device["id"],"node_id":nid,"protocol":protocol,"local_port":target,"bind_port":mixed_bind(socket.SOCK_DGRAM if protocol=="udp" else socket.SOCK_STREAM)}
+                    if domain_id is not None:spec["domain_id"]=domain_id
+                    return expect(call(base,"mappings","POST",admin,spec),201)
+                hp=unique_port()
+                http_prefix=root/"mixed_gateway"
+                http_prefix.mkdir(mode=0o700)
+                assert operator("--preview-gateway","clear",0,"mixed_gateway",hp,"init").returncode==0
+                nginx=subprocess.Popen(["/usr/sbin/nginx","-p",str(http_prefix)+"/","-c",str(http_prefix/"nginx.conf"),"-g","daemon off;"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                processes.append(nginx)
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    if request(hp,http_host) is not None:break
+                    time.sleep(.2)
+                else:raise AssertionError("mixed HTTP gateway unavailable")
+                mixed_runs=[]
+                def mixed_start(item,action,route,*args):
+                    mp="mappings/"+item["id"]
+                    req=expect(call(base,mp+route,"POST",admin,{"expected_revision":item["revision"]}),202)
+                    proc=subprocess.Popen([exe,action,str(root),item["id"],str(item["revision"]),*map(str,args)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    processes.append(proc)
+                    mixed_runs.append((proc,mp,req["request_id"]))
+                    deadline=time.monotonic()+45
+                    while time.monotonic()<deadline:
+                        assert proc.poll() is None,"mixed worker exited"
+                        if expect(call(base,mp+"/runtime",token=admin),200)["request"]["state"]=="running":return
+                        time.sleep(.2)
+                    raise AssertionError("mixed worker not running")
+                with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp_target:
+                    udp_target.bind(("127.0.0.1",0))
+                    udp_target.settimeout(.2)
+                    done=threading.Event()
+                    def echo_udp():
+                        while not done.is_set():
+                            try:
+                                data,peer=udp_target.recvfrom(65535)
+                                udp_target.sendto(data,peer)
+                            except socket.timeout:continue
+                            except OSError:return
+                    echo_thread=threading.Thread(target=echo_udp,daemon=True)
+                    echo_thread.start()
+                    try:
+                        hm=mixed_mapping("http",fixture.server_port,hd["id"])
+                        tm=mixed_mapping("tcp",fixture.server_port)
+                        um=mixed_mapping("udp",udp_target.getsockname()[1])
+                        mixed_start(mapping3,"--runtime-tls-worker","/start",rp,"mixed_tls","tls_gateway",gp,"expected_body",probe,"cert_v2")
+                        mixed_start(hm,"--runtime-worker","/start",unique_port(),"mixed_http","mixed_gateway",hp,"expected_body")
+                        mixed_start(tm,"--runtime-tcp-worker","/tcp-start",unique_port(),"mixed_tcp",65536)
+                        mixed_start(um,"--runtime-udp-worker","/udp-start",unique_port(),unique_port(),"mixed_udp",65536,1200)
+                        assert request(hp,http_host)==(200,body)
+                        assert tls_request(gp,hostname,ca2)==(200,body)
+                        wait_connection_slots(0)
+                        def hold_web(port,host):
+                            sock=socket.create_connection(("127.0.0.1",port),timeout=5)
+                            sock.sendall(("GET / HTTP/1.1\\r\\nHost: "+host+"\\r\\n").encode())
+                            return sock
+                        with hold_web(bp,hostname) as a, hold_web(hm["bind_port"],http_host) as b, hold_web(tm["bind_port"],http_host) as c, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as d:
+                            wait_connection_slots(3)
+                            d.settimeout(3)
+                            dst=("127.0.0.1",um["bind_port"])
+                            data=secrets.token_bytes(64)
+                            d.sendto(data,dst)
+                            assert d.recvfrom(65535)==(data,dst)
+                            wait_connection_slots(4)
+                            assert monthly_inventory()["bandwidth_reservations"]==4
+                            result=request(hp,http_host)
+                            assert result is None or result[0]!=200
+                            try:result=tls_request(gp,hostname,ca2)
+                            except (OSError,http.client.HTTPException):result=None
+                            assert result is None or result[0]!=200
+                            for sock in (a,b,c):
+                                sock.sendall(b"Connection: close\\r\\n\\r\\n")
+                                with http.client.HTTPResponse(sock) as response:
+                                    response.begin()
+                                    assert response.status==200 and response.read()==body
+                            wait_connection_slots(1)
+                            assert request(hp,http_host)==(200,body)
+                            assert tls_request(gp,hostname,ca2)==(200,body)
+                            wait_connection_slots(1)
+                            assert all(proc.poll() is None for proc,_,_ in mixed_runs)
+                    finally:
+                        for proc,mp,rid in reversed(mixed_runs):
+                            if proc.poll() is None:
+                                expect(call(base,mp+"/stop","POST",admin,{"request_id":rid}),202)
+                                assert proc.wait(timeout=40)==0
+                        done.set()
+                        echo_thread.join(timeout=2)
+                wait_connection_slots(0)
+                assert monthly_inventory()["bandwidth_reservations"]==0
+                stop(nginx)
+                policy(plan_id="legacy-v1")
+                report["real_four_protocol_shared_connection_slots_and_cleanup"]=True
                 # Exercise the shared recovery mechanism with actual HTTPS,
                 # a verified certificate and two owned encrypted tunnel children.
                 import signal
