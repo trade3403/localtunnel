@@ -291,9 +291,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let listen=arg(7)?.parse()?;
             let expected_file=arg(8)?;
             if resident || tls_resident{
-                preview::resident(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await?;
+                preview::resident(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await.map_err(|reason|{
+                    eprintln!("Web resident stopped: {reason}");
+                    reason
+                })?;
             }else if worker || tls_worker{
-                preview::worker(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await?;
+                preview::worker(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await.map_err(|reason|{
+                    eprintln!("Web worker stopped: {reason}");
+                    reason
+                })?;
             }else{
                 preview::supervise(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport,None,None).await?;
             }

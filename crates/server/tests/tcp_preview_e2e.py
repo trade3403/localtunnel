@@ -39,9 +39,10 @@ def call(base,path,status,method="GET",token=None,data=None):
     if code in (200,201,202):return json.loads(raw)
 
 def free(lo,hi,exclude,kind=socket.SOCK_STREAM):
-    for _ in range(200):
-        port=lo+secrets.randbelow(hi-lo+1)
-        if port in exclude:continue
+    low,high=map(int,Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split())
+    candidates=[p for p in range(lo,hi+1) if p not in exclude and not low<=p<=high]
+    while candidates:
+        port=candidates.pop(secrets.randbelow(len(candidates)))
         with socket.socket(socket.AF_INET,kind) as s:
             try:s.bind(("127.0.0.1",port))
             except OSError:continue
