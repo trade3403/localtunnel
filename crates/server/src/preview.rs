@@ -661,13 +661,13 @@ pub async fn recover(pool:&SqlitePool,root:&Path,prefix:&str,rid:&str)->Result<(
 // Local operator preview only. Never claims the HTTP runtime request state,
 // which is still reserved for the web gateway executor.
 #[derive(sqlx::FromRow)]
-struct UdpDraft { id:String, local_port:i64, bind_port:i64, device_id:String, device_revision:i64, bandwidth_bps:Option<i64>, monthly_cap:Option<i64> }
+struct UdpDraft { id:String, local_port:i64, bind_port:i64, device_id:String, device_revision:i64, bandwidth_bps:Option<i64>, monthly_cap:Option<i64>, connection_cap:Option<i64> }
 
 async fn checked_udp(pool:&SqlitePool,id:&str,revision:i64,rid:Option<&str>)->Result<UdpDraft>{
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
         return Err("invalid UDP mapping identity")
     }
-    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps,(SELECT cp.max_monthly_bytes FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS monthly_cap FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND cp.max_concurrent_connections IS NULL AND (e.expires_at IS NULL OR e.expires_at>unixepoch())) AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
+    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps,(SELECT cp.max_monthly_bytes FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS monthly_cap,(SELECT cp.max_concurrent_connections FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS connection_cap FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND cp.max_concurrent_connections IS NULL AND (e.expires_at IS NULL OR e.expires_at>unixepoch())) AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
         .bind(id).bind(revision).bind(rid).bind(rid).fetch_optional(pool).await.map_err(|_|"UDP draft read failed")?.ok_or("UDP preview requires current authorized draft")
 }
 
@@ -786,8 +786,9 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     }
     private_dir(root)?;
     let m=checked_udp(pool,id,revision,rid).await?;
-    if m.monthly_cap.is_some()&&rid.is_none(){return Err("commercial monthly UDP budget requires managed request")}
+    if (m.monthly_cap.is_some()||m.connection_cap.is_some())&&rid.is_none(){return Err("commercial monthly UDP budget requires managed request")}
     let limits=effective_udp_limits(limits,m.bandwidth_bps)?;
+    if m.connection_cap.is_some() && device_lease{return Err("finite UDP device connection policy not yet enabled")}
     if device_lease!=bundle.starts_with("udp-device-"){return Err("reserved UDP device bundle name")}
     if [relay_port,internal_port,m.bind_port as u16].contains(&(m.local_port as u16)){
         return Err("conflicting UDP preview ports")
@@ -833,7 +834,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
         opts.write(true).create_new(true);
         #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
         let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"UDP manifest unavailable")?;
-        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port,"request_id":rid,"byte_rate":limits.map(|v|v.0),"burst_bytes":limits.map(|v|v.1),"commercial_bandwidth_bps":m.bandwidth_bps,"monthly_cap":m.monthly_cap,"byte_limit_scope":"per_mapping_per_direction_application_payload"});
+        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port,"request_id":rid,"byte_rate":limits.map(|v|v.0),"burst_bytes":limits.map(|v|v.1),"commercial_bandwidth_bps":m.bandwidth_bps,"monthly_cap":m.monthly_cap,"connection_cap":m.connection_cap,"byte_limit_scope":"per_mapping_per_direction_application_payload"});
         file.write_all(data.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"UDP manifest write failed")?;
         Ok(())
     })();
@@ -850,15 +851,18 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     let mut monthly_guard=None;
     let result=async{
         let current=checked_udp(pool,id,revision,rid).await?;
-        if (current.bandwidth_bps,current.monthly_cap)!=(m.bandwidth_bps,m.monthly_cap){return Ok(())}
+        if (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap){return Ok(())}
         if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
         if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}}
-        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,rid,m.bandwidth_bps,if m.bandwidth_bps.is_some(){limits.map(|v|v.0)}else{None},m.monthly_cap,None).await?);
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,rid,m.bandwidth_bps,if m.bandwidth_bps.is_some(){limits.map(|v|v.0)}else{None},m.monthly_cap,m.connection_cap).await?);
         tunnel.start(&engine,&dir.join("server.toml"))?;
         if !device_lease{tunnel.start(&engine,&dir.join("client.toml"))?;}
-        if let Some(cap)=m.monthly_cap{
+        let probe=std::net::UdpSocket::bind("127.0.0.1:0").map_err(|_|"UDP probe bind failed")?;
+        probe.connect(&ingress).map_err(|_|"UDP probe connect failed")?;
+        if m.monthly_cap.is_some()||m.connection_cap.is_some(){
             let (rate,burst)=limits.ok_or("missing managed UDP limits")?;
-            monthly_guard=Some(crate::udp_monthly::Guard::start(pool,id,revision,rid.ok_or("missing managed request")?,cap,
+            monthly_guard=Some(crate::udp_monthly::Guard::start_with_policy(pool,id,revision,rid.ok_or("missing managed request")?,m.monthly_cap,m.connection_cap,
+                if m.connection_cap.is_some(){Some(probe.try_clone().map_err(|_|"UDP probe clone failed")?)}else{None},
                 ingress.parse().map_err(|_|"invalid UDP ingress")?,internal.parse().map_err(|_|"invalid UDP internal port")?,rate,burst)?);
         }else{
             let mut cmd=Command::new(&core);
@@ -872,8 +876,6 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
             protect_child(&mut cmd)?;
             entrance.0.push(cmd.spawn().map_err(|_|"UDP guard launch failed")?);
         }
-        let probe=std::net::UdpSocket::bind("127.0.0.1:0").map_err(|_|"UDP probe bind failed")?;
-        probe.connect(&ingress).map_err(|_|"UDP probe connect failed")?;
         let deadline=Instant::now()+Duration::from_secs(30);
         let lease_deadline=Instant::now()+Duration::from_secs(crate::devices::UDP_LEASE_SECONDS as u64);
         if device_lease{
@@ -901,7 +903,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
             let current=checked_udp(pool,id,revision,rid).await?;
             // No live reconfiguration or silent continuation on a changed
             // rate. Close the owned ingress and relay; require a fresh run.
-            if (current.bandwidth_bps,current.monthly_cap)!=(m.bandwidth_bps,m.monthly_cap){return Ok(())}
+            if (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap){return Ok(())}
             if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
             let healthy=if device_lease{tunnel.0.len()==1&&matches!(tunnel.0[0].try_wait(),Ok(None))}else{tunnel.healthy()};
             let entrance_healthy=match monthly_guard.as_ref(){
