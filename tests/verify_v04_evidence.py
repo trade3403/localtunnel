@@ -278,6 +278,9 @@ REQUIRED["management-v08"] = {
         "real_bandwidth_recovery_refuses_live_worker",
         "real_bandwidth_recovery_exact_binding_audit_and_no_adoption",
         "real_bandwidth_recovered_capacity_reused_by_real_workers",
+        "real_monthly_shared_tcp_debits_and_previous_month_isolation",
+        "real_monthly_over_budget_closes_real_tcp_without_overspend",
+        "real_monthly_debits_survive_management_restart",
     ],
     "udp-preview.json": [
         "real_udp_commercial_suspend_revokes_lease_and_closes_relay",

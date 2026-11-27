@@ -11,7 +11,7 @@ async fn checked_protocol(pool:&SqlitePool,id:&str,revision:i64,protocol:&str)->
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{return Err("invalid mapping identity")}
     // Only web protocols, disabled draft, currently enabled owner/device/node and a
     // recent successful TXT observation. This is not continuous DNS proof.
-    sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname,m.protocol,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND (?='web' OR m.protocol=?) AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch() AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()))")
+    sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname,m.protocol,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND (?='web' OR m.protocol=?) AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch() AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND cp.max_monthly_bytes IS NULL AND (e.expires_at IS NULL OR e.expires_at>unixepoch()))")
         .bind(id).bind(revision).bind(protocol).bind(protocol).fetch_optional(pool).await.map_err(|_|"mapping read failed")?.ok_or("preview requires current eligible web draft and recent TXT proof")
 }
 async fn checked(pool:&SqlitePool,id:&str,revision:i64)->Result<Mapping>{
@@ -352,7 +352,7 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
         if checked_protocol(pool,id,revision,transport.protocol()).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
-        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,request,m.bandwidth_bps,m.bandwidth_bps.map(|bps|(bps/8).min(125000000) as u32)).await?);
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,request,m.bandwidth_bps,m.bandwidth_bps.map(|bps|(bps/8).min(125000000) as u32),None).await?);
         children.start(&engine,&root.join(bundle).join("server.toml"))?;
         children.start(&engine,&root.join(bundle).join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
@@ -647,7 +647,7 @@ async fn checked_udp(pool:&SqlitePool,id:&str,revision:i64,rid:Option<&str>)->Re
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
         return Err("invalid UDP mapping identity")
     }
-    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch())) AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
+    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND cp.max_monthly_bytes IS NULL AND (e.expires_at IS NULL OR e.expires_at>unixepoch())) AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
         .bind(id).bind(revision).bind(rid).bind(rid).fetch_optional(pool).await.map_err(|_|"UDP draft read failed")?.ok_or("UDP preview requires current authorized draft")
 }
 
@@ -831,7 +831,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
         if current.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
         if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
         if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}}
-        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,rid,m.bandwidth_bps,if m.bandwidth_bps.is_some(){limits.map(|v|v.0)}else{None}).await?);
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,rid,m.bandwidth_bps,if m.bandwidth_bps.is_some(){limits.map(|v|v.0)}else{None},None).await?);
         tunnel.start(&engine,&dir.join("server.toml"))?;
         if !device_lease{tunnel.start(&engine,&dir.join("client.toml"))?;}
         let mut cmd=Command::new(&core);
@@ -940,9 +940,9 @@ pub async fn udp_device_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,
 // Independent raw TCP loopback echo preview. Never infer reachability from
 // an open relay control socket: prove a nonce round trip through the guard.
 #[derive(sqlx::FromRow)]
-struct TcpDraft{local_port:i64,bind_port:i64,bandwidth_bps:Option<i64>}
+struct TcpDraft{local_port:i64,bind_port:i64,bandwidth_bps:Option<i64>,monthly_cap:Option<i64>}
 async fn checked_tcp(pool:&SqlitePool,id:&str,revision:i64,rid:&str)->Result<TcpDraft>{
-    sqlx::query_as::<_,TcpDraft>("SELECT m.local_port,m.bind_port,cp.max_bandwidth_bps AS bandwidth_bps FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id JOIN runtime_requests r ON r.mapping_id=m.id WHERE m.id=? AND m.revision=? AND m.protocol='tcp' AND m.enabled=0 AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')")
+    sqlx::query_as::<_,TcpDraft>("SELECT m.local_port,m.bind_port,cp.max_bandwidth_bps AS bandwidth_bps,cp.max_monthly_bytes AS monthly_cap FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id JOIN runtime_requests r ON r.mapping_id=m.id WHERE m.id=? AND m.revision=? AND m.protocol='tcp' AND m.enabled=0 AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')")
         .bind(id).bind(revision).bind(rid).fetch_optional(pool).await.map_err(|_|"TCP draft read failed")?.ok_or("TCP draft authorization changed")
 }
 fn tcp_echo_probe(port:u16)->bool{
@@ -1005,7 +1005,8 @@ async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16
         tcp.bind(std::net::SocketAddr::from(([127,0,0,1],p))).map_err(|_|"TCP preview port unavailable")?;
         let _listener=tcp.listen(1).map_err(|_|"TCP preview listener unavailable")?;
     }
-    let mut guard=crate::tcp_limit::Guard::start(local,rate)?;
+    let meter=m.monthly_cap.map(|cap|crate::tcp_limit::MonthlyMeter::new(pool.clone(),id.into(),revision,rid.into(),cap));
+    let mut guard=crate::tcp_limit::Guard::start_metered(local,rate,meter)?;
     if [bind,relay_port,local].contains(&guard.port()){return Err("TCP limiter port collision")}
     let dir=root.join(bundle);
     mkdir(&dir)?;
@@ -1021,7 +1022,7 @@ async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16
         opts.write(true).create_new(true);
         #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
         let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"TCP manifest unavailable")?;
-        let manifest=serde_json::json!({"mapping_id":id,"revision":revision,"request_id":rid,"protocol":"tcp","scope":"operator_loopback_tcp_echo_preview","bind_port":bind,"relay_port":relay_port,"tcp_limiter_port":guard.port(),"byte_rate":rate,"commercial_bandwidth_bps":m.bandwidth_bps,"byte_limit_scope":"per_mapping_per_direction_tcp_stream"});
+        let manifest=serde_json::json!({"mapping_id":id,"revision":revision,"request_id":rid,"protocol":"tcp","scope":"operator_loopback_tcp_echo_preview","bind_port":bind,"relay_port":relay_port,"tcp_limiter_port":guard.port(),"byte_rate":rate,"commercial_bandwidth_bps":m.bandwidth_bps,"monthly_cap":m.monthly_cap,"byte_limit_scope":"per_mapping_per_direction_tcp_stream"});
         file.write_all(manifest.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"TCP manifest write failed")?;
         Ok(())
     })();
@@ -1030,15 +1031,16 @@ async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16
     let mut reservation=None;
     let result=async{
         if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
-        if checked_tcp(pool,id,revision,rid).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
-        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,Some(rid),m.bandwidth_bps,m.bandwidth_bps.map(|_|rate)).await?);
+        if {let current=checked_tcp(pool,id,revision,rid).await?; (current.bandwidth_bps,current.monthly_cap)!=(m.bandwidth_bps,m.monthly_cap)}{return Ok(())}
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,Some(rid),m.bandwidth_bps,m.bandwidth_bps.map(|_|rate),m.monthly_cap).await?);
         children.start(&engine,&dir.join("server.toml"))?;
         children.start(&engine,&dir.join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
         let mut ready=false;
         loop{
             if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
-            if checked_tcp(pool,id,revision,rid).await?.bandwidth_bps!=m.bandwidth_bps{return Ok(())}
+            if {let current=checked_tcp(pool,id,revision,rid).await?; (current.bandwidth_bps,current.monthly_cap)!=(m.bandwidth_bps,m.monthly_cap)}{return Ok(())}
+            if guard.quota_denied(){return Ok(())}
             if !children.healthy()||!guard.healthy(){return Err("TCP worker child or guard exited")}
             if !ready{
                 if tcp_echo_probe(bind){

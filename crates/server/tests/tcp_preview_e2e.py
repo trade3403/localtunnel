@@ -362,6 +362,71 @@ try:
             stop_run(recovered_b)
             assert reservations()==[]
             report["real_bandwidth_recovered_capacity_reused_by_real_workers"]=True
+            # Real finite monthly plan. Both directions and both independent
+            # TCP workers share one durable UTC-month debit row.
+            cap=32768
+            monthly=command("--commercial-create-plan",{"code":"tcp-fixture","version":2,"name":"Monthly fixture","max_active_devices":4,
+                "max_retained_devices":8,"max_mappings":8,"max_bandwidth_bps":1048576,"max_monthly_bytes":cap,"max_concurrent_connections":None})
+            policy(monthly)
+            tenant=inventory()["tenant_id"]
+            # Seed only a prior calendar month as a migration/history fixture.
+            # The product uses its real UTC clock; no test clock override.
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                previous=db.execute("SELECT strftime('%Y-%m','now','start of month','-1 month')").fetchone()[0]
+                db.execute("INSERT INTO tenant_monthly_usage VALUES (?,?,?)",(tenant,previous,cap))
+            assert inventory()["monthly_charged_bytes"]==0 and inventory()["month_utc"]!=previous
+            # UDP remains fail-closed until a datagram debit path exists.
+            call(base,udp_path+"/udp-start",409,"POST",admin,{"expected_revision":allowed["revision"]})
+            monthly_a=spawn_tcp(b,"monthly_a")
+            monthly_b=spawn_tcp(new,"monthly_b")
+            ready_tcp(monthly_a)
+            ready_tcp(monthly_b)
+            initial=inventory()["monthly_charged_bytes"]
+            assert 128<=initial<cap
+            exchange(1024,b["bind_port"])
+            exchange(1024,new["bind_port"])
+            used_bytes=inventory()["monthly_charged_bytes"]
+            assert used_bytes>=initial+4096 and used_bytes<cap
+            assert inventory(other)["monthly_charged_bytes"]==0
+            report["real_monthly_shared_tcp_debits_and_previous_month_isolation"]=True
+            def until_closed(port):
+                data=secrets.token_bytes(65536)
+                got=bytearray()
+                with socket.create_connection(("127.0.0.1",port),timeout=10) as conn:
+                    try:
+                        conn.sendall(data)
+                        while len(got)<len(data):
+                            chunk=conn.recv(4096)
+                            if not chunk:break
+                            got.extend(chunk)
+                    except (ConnectionResetError,BrokenPipeError):pass
+                assert bytes(got)==data[:len(got)] and len(got)<len(data)
+                return len(got)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                forwarded=list(pool.map(until_closed,[b["bind_port"],new["bind_port"]]))
+            for run in (monthly_a,monthly_b):
+                assert run[0].wait(timeout=20)==0
+                assert call(base,run[2]+"/runtime",200,token=admin)["request"]["state"]=="stopped"
+                assert not (root/run[4]).exists()
+            consumed=inventory()["monthly_charged_bytes"]
+            assert cap-4096<consumed<=cap and consumed>=used_bytes+sum(forwarded)
+            assert inventory()["bandwidth_reservations"]==0
+            report["real_monthly_over_budget_closes_real_tcp_without_overspend"]=True
+            # Restart the actual management process and check the same
+            # current-month debit row remains, with the prior month intact.
+            core_test.terminate(management)
+            management=subprocess.Popen([exe,str(root),"0"],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            with selectors.DefaultSelector() as sel:
+                sel.register(management.stdout,selectors.EVENT_READ)
+                assert sel.select(20)
+            address=management.stdout.readline().strip()
+            assert address.startswith("LISTENING 127.0.0.1:")
+            base="http://"+address.split()[1]
+            assert inventory()["monthly_charged_bytes"]==consumed
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT charged_bytes FROM tenant_monthly_usage WHERE tenant_id=? AND month_utc=?",(tenant,previous)).fetchone()==(cap,)
+                assert db.execute("SELECT count(*) FROM tenant_monthly_usage WHERE tenant_id=?",(tenant,)).fetchone()==(2,)
+            report["real_monthly_debits_survive_management_restart"]=True
         finally:
             for p in reversed(children):
                 if p.poll() is None:
@@ -373,4 +438,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len([v for v in report.values() if v is True])==13
+assert len([v for v in report.values() if v is True])==16

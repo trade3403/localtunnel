@@ -19,10 +19,30 @@ impl Bucket{
     fn debit(&mut self,n:usize){self.tokens-=n as f64;}
 }
 fn retry(e:&io::Error)->bool{matches!(e.kind(),io::ErrorKind::WouldBlock|io::ErrorKind::Interrupted)}
+/// A finite-plan guard commits a conservative debit before each write.
+/// The blocking call runs on the dedicated guard thread, not Tokio's
+/// executor. No reusable byte credit survives a month boundary or crash.
+pub(crate) struct MonthlyMeter{
+    pool:sqlx::SqlitePool, handle:tokio::runtime::Handle,
+    mapping:String,revision:i64,rid:String,cap:i64,denied:bool,failed:bool,
+}
+impl MonthlyMeter{
+    pub(crate) fn new(pool:sqlx::SqlitePool,mapping:String,revision:i64,rid:String,cap:i64)->Self{
+        Self{pool,handle:tokio::runtime::Handle::current(),mapping,revision,rid,cap,denied:false,failed:false}
+    }
+    fn charge(&mut self,n:usize)->io::Result<()>{
+        if self.denied||self.failed{return Err(io::ErrorKind::PermissionDenied.into())}
+        match self.handle.block_on(crate::commercial::charge_monthly(&self.pool,&self.mapping,self.revision,&self.rid,self.cap,n)){
+            Ok(true)=>Ok(()),
+            Ok(false)=>{self.denied=true;Err(io::ErrorKind::PermissionDenied.into())},
+            Err(_)=>{self.failed=true;Err(io::Error::other("monthly debit unavailable"))},
+        }
+    }
+}
 struct Direction{buf:[u8;BURST],start:usize,end:usize,eof:bool}
 impl Direction{
     fn new()->Self{Self{buf:[0;BURST],start:0,end:0,eof:false}}
-    fn step(&mut self,from:&mut TcpStream,to:&mut TcpStream,budget:&mut Bucket)->io::Result<bool>{
+    fn step(&mut self,from:&mut TcpStream,to:&mut TcpStream,budget:&mut Bucket,meter:&mut Option<MonthlyMeter>)->io::Result<bool>{
         if self.eof{return Ok(false)}
         if self.start==self.end{
             match from.read(&mut self.buf){
@@ -34,6 +54,7 @@ impl Direction{
         }
         let n=budget.available().min(self.end-self.start);
         if n==0{return Ok(false)}
+        if let Some(meter)=meter.as_mut(){meter.charge(n)?;}
         match to.write(&self.buf[self.start..self.start+n]){
             Ok(0)=>Err(io::ErrorKind::WriteZero.into()),
             Ok(n)=>{budget.debit(n);self.start+=n;Ok(true)}
@@ -52,10 +73,10 @@ impl Connection{
         target.set_nodelay(true)?;
         Ok(Self{source,target,up:Direction::new(),down:Direction::new(),last:Instant::now()})
     }
-    fn poll(&mut self,up:&mut Bucket,down:&mut Bucket)->bool{
+    fn poll(&mut self,up:&mut Bucket,down:&mut Bucket,meter:&mut Option<MonthlyMeter>)->bool{
         let result=(||->io::Result<bool>{
-            let a=self.up.step(&mut self.source,&mut self.target,up)?;
-            let b=self.down.step(&mut self.target,&mut self.source,down)?;
+            let a=self.up.step(&mut self.source,&mut self.target,up,meter)?;
+            let b=self.down.step(&mut self.target,&mut self.source,down,meter)?;
             Ok(a||b)
         })();
         match result{
@@ -67,9 +88,12 @@ impl Connection{
         }
     }
 }
-pub(crate) struct Guard{port:u16,stop:Arc<AtomicBool>,thread:Option<JoinHandle<io::Result<()>>>}
+pub(crate) struct Guard{port:u16,stop:Arc<AtomicBool>,quota_denied:Arc<AtomicBool>,thread:Option<JoinHandle<io::Result<()>>>}
 impl Guard{
     pub(crate) fn start(target:u16,rate:u32)->Result<Self,&'static str>{
+        Self::start_metered(target,rate,None)
+    }
+    pub(crate) fn start_metered(target:u16,rate:u32,mut meter:Option<MonthlyMeter>)->Result<Self,&'static str>{
         if target==0||!(65536..=125_000_000).contains(&rate){return Err("unsupported TCP preview byte rate")}
         let listener=TcpListener::bind((Ipv4Addr::LOCALHOST,0)).map_err(|_|"TCP limiter bind failed")?;
         let port=listener.local_addr().map_err(|_|"TCP limiter address unavailable")?.port();
@@ -78,6 +102,8 @@ impl Guard{
         let target=SocketAddr::from(([127,0,0,1],target));
         let stop=Arc::new(AtomicBool::new(false));
         let signal=stop.clone();
+        let quota_denied=Arc::new(AtomicBool::new(false));
+        let denied=quota_denied.clone();
         let thread=thread::Builder::new().name("mapping-tcp-limit".into()).spawn(move||{
             let mut up=Bucket::new(rate);
             let mut down=Bucket::new(rate);
@@ -92,7 +118,9 @@ impl Guard{
                     Err(e) if retry(&e)=>{},
                     Err(e)=>return Err(e),
                 }
-                connections.retain_mut(|c|c.poll(&mut up,&mut down));
+                connections.retain_mut(|c|c.poll(&mut up,&mut down,&mut meter));
+                if meter.as_ref().is_some_and(|m|m.failed){return Err(io::Error::other("monthly debit unavailable"))}
+                if meter.as_ref().is_some_and(|m|m.denied){denied.store(true,Ordering::Release);return Ok(())}
                 // Rotate servicing order so the same connection does not
                 // always claim the first replenished tokens.
                 if connections.len()>1{connections.rotate_left(1)}
@@ -100,9 +128,10 @@ impl Guard{
             }
             Ok(())
         }).map_err(|_|"TCP limiter thread unavailable")?;
-        Ok(Self{port,stop,thread:Some(thread)})
+        Ok(Self{port,stop,quota_denied,thread:Some(thread)})
     }
     pub(crate) fn port(&self)->u16{self.port}
+    pub(crate) fn quota_denied(&self)->bool{self.quota_denied.load(Ordering::Acquire)}
     pub(crate) fn healthy(&self)->bool{self.thread.as_ref().is_some_and(|t|!t.is_finished())}
     pub(crate) fn stop(&mut self)->Result<(),&'static str>{
         self.stop.store(true,Ordering::Relaxed);
