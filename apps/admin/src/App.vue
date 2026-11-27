@@ -7,6 +7,15 @@ type Node = {id:string;name:string;enabled:boolean}
 type Domain = {id:string;hostname:string;verified_at:number|null;txt_name:string;txt_value:string|null}
 type Mapping = {id:string;device_id:string;node_id:string;domain_id:string|null;protocol:string;local_host:string;local_port:number;bind_port:number;enabled:boolean;revision:number}
 type Runtime = {request:{request_id:string;state:string;updated_at:number}|null;worker_recent:boolean}
+type Entitlement = {tenant_id:string;plan_id:string;plan_code:string;plan_version:number;plan_name:string;revision:number;state:string;effective_state:string;expires_at:number|null;max_active_devices:number;max_retained_devices:number;max_mappings:number;max_bandwidth_bps:number|null;max_monthly_bytes:number|null;max_concurrent_connections:number|null;active_devices:number;retained_devices:number;mappings:number;bandwidth_reservations:number;reserved_bytes_per_second:number|null;month_utc:string;monthly_charged_bytes:number;reserved_connection_slots:number}
+const commercial=ref<Entitlement|null>(null)
+async function loadCommercial(){
+  commercial.value=null
+  const result=await get<{scope:string;commercial_enforcement:boolean;entitlement:Entitlement}>('/commercial/entitlement')
+  if(result.scope!=='owner_inventory_only')throw Error('unexpected commercial scope')
+  commercial.value=result.entitlement
+}
+const formatCount=(n:number|null)=>n===null?'不限额':n.toLocaleString('zh-CN')
 const token = ref('')
 const user = ref('')
 const username = ref('')
@@ -39,18 +48,18 @@ async function loadAudit(append=false){
   auditEvents.value=append?[...auditEvents.value,...result.events]:result.events
   auditBefore.value=result.next_before
 }
-const auditLabels:Record<string,string>={'session.created':'会话创建','session.replaced':'会话替换','session.removed':'会话移除','pairing.issued':'配对码签发','pairing.replaced':'配对码替换','device.created':'设备创建','device.authorization_changed':'设备授权变更','domain.created':'域名创建','domain.proof_changed':'域名证明变更','domain.deleted':'域名删除','mapping.created':'映射创建','mapping.updated':'映射更新','mapping.deleted':'映射删除','runtime.transition':'执行状态变更'}
+const auditLabels:Record<string,string>={'commercial.account_created':'商业账户创建','commercial.entitlement_assigned':'套餐授权变更','session.created':'会话创建','session.replaced':'会话替换','session.removed':'会话移除','pairing.issued':'配对码签发','pairing.replaced':'配对码替换','device.created':'设备创建','device.authorization_changed':'设备授权变更','domain.created':'域名创建','domain.proof_changed':'域名证明变更','domain.deleted':'域名删除','mapping.created':'映射创建','mapping.updated':'映射更新','mapping.deleted':'映射删除','runtime.transition':'执行状态变更'}
 async function readTraffic(id:string){
   traffic.value=(await get<{observations:TrafficObservation[]}>('/mappings/'+id+'/traffic')).observations
 }
 const deviceStatus = ref<Record<string,unknown>|null>(null)
 const create = reactive({device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
-const nav = [{key:'dashboard',label:'仪表盘'},{key:'devices',label:'设备管理'},{key:'mappings',label:'映射管理'},{key:'domains',label:'域名管理'},{key:'nodes',label:'节点管理'},{key:'audit',label:'操作审计'}]
+const nav = [{key:'dashboard',label:'仪表盘'},{key:'devices',label:'设备管理'},{key:'mappings',label:'映射管理'},{key:'domains',label:'域名管理'},{key:'nodes',label:'节点管理'},{key:'audit',label:'操作审计'},{key:'commercial',label:'套餐与额度'}]
 const title = computed(() => nav.find(n=>n.key===page.value)?.label)
 const labels:Record<string,string> = {queued:'等待执行器',starting:'启动中',running:'已应用（执行器报告）',stopping:'停止中',stopped:'已停止',failed_or_unknown:'失败或未知'}
 function clearPair(){pairing.value='';if(pairTimer) clearTimeout(pairTimer)}
 function reset(){
-  auditEvents.value=[];auditBefore.value=null
+  auditEvents.value=[];auditBefore.value=null;commercial.value=null
   token.value='';user.value='';password.value='';devices.value=[];nodes.value=[];domains.value=[];mappings.value=[];
   selectedMapping.value=null;runtime.value=null;traffic.value=[];deviceStatus.value=null;clearPair();notice.value='';page.value='dashboard'
   Object.assign(create,{device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
@@ -69,6 +78,7 @@ async function get<T>(path:string){return api<T>(path,token.value)}
 async function send<T>(path:string,method:string,body?:unknown){return api<T>(path,token.value,method,body)}
 async function refresh(){
   if(page.value==='audit'){await loadAudit();return}
+  if(page.value==='commercial'){await loadCommercial();return}
   const [d,n,h,m]=await Promise.all([get<Device[]>('/devices'),get<Node[]>('/nodes'),get<Domain[]>('/domains'),get<Mapping[]>('/mappings')])
   devices.value=d;nodes.value=n;domains.value=h;mappings.value=m
   more.devices=d.length===100;more.nodes=n.length===100;more.domains=h.length===100;more.mappings=m.length===100
@@ -96,7 +106,7 @@ async function login(){await run(async()=>{
   try{user.value=(await get<{username:string}>('/auth/me')).username;await refresh()}catch(e){reset();throw e}
 })}
 async function logout(){await run(async()=>{try{await send('/auth/logout','POST')}finally{reset()}})}
-function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value='';auditEvents.value=[];auditBefore.value=null;if(key==='audit')void run(()=>loadAudit())}
+function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value='';auditEvents.value=[];auditBefore.value=null;commercial.value=null;if(key==='audit')void run(()=>loadAudit());if(key==='commercial')void run(loadCommercial)}
 async function issue(){await run(async()=>{clearPair();const p=await send<{pairing_code:string;expires_in:number}>('/devices/pairing-code','POST');pairing.value=p.pairing_code;pairTimer=setTimeout(clearPair,p.expires_in*1000)})}
 async function revoke(d:Device){await run(async()=>{await send('/devices/'+d.id+'/revoke','POST');await refresh();deviceStatus.value=null;notice.value='设备凭据已吊销'})}
 async function inspectDevice(d:Device){await run(async()=>{deviceStatus.value=await get('/devices/'+d.id+'/status')})}
@@ -171,6 +181,33 @@ onBeforeUnmount(clearPair)
         <template v-if="page==='dashboard'">
           <div class="metrics"><a-card v-for="s in [{label:'设备（已加载）',value:devices.length},{label:'映射草稿（已加载）',value:mappings.length},{label:'域名（已加载）',value:domains.length},{label:'节点（已加载）',value:nodes.length}]" :key="s.label"><a-statistic :title="s.label" :value="s.value"/></a-card></div>
           <a-card title="管理操作"><a-space wrap><a-button v-for="n in nav.slice(1)" :key="n.key" @click="go(n.key)">{{n.label}}</a-button></a-space><p class="muted">数据来自当前管理员已加载的可见记录，不是全局统计。刷新会重新读取第一页。</p></a-card>
+        </template>
+        <template v-if="page==='commercial'">
+          <a-alert type="info" show-icon message="仅显示当前租户的套餐和额度；套餐发布、账户创建与授权变更由可信本地操作员执行。"/>
+          <a-card v-if="commercial" title="当前套餐" data-testid="commercial-entitlement">
+            <a-descriptions bordered :column="2" size="small">
+              <a-descriptions-item label="套餐名称">{{commercial.plan_name}}</a-descriptions-item>
+              <a-descriptions-item label="套餐版本">{{commercial.plan_code}} / {{commercial.plan_version}}</a-descriptions-item>
+              <a-descriptions-item label="有效状态"><a-tag :color="commercial.effective_state==='active'?'green':'red'">{{({active:'有效',suspended:'已暂停',expired:'已过期'} as Record<string,string>)[commercial.effective_state]||commercial.effective_state}}</a-tag></a-descriptions-item>
+              <a-descriptions-item label="到期时间">{{commercial.expires_at===null?'无固定到期时间':time(commercial.expires_at)}}</a-descriptions-item>
+              <a-descriptions-item label="授权版本">{{commercial.revision}}</a-descriptions-item>
+              <a-descriptions-item label="租户 ID">{{commercial.tenant_id}}</a-descriptions-item>
+            </a-descriptions>
+          </a-card>
+          <a-card v-if="commercial" title="额度与使用情况" data-testid="commercial-usage">
+            <a-descriptions bordered :column="1" size="small">
+              <a-descriptions-item label="启用设备">{{formatCount(commercial.active_devices)}} / {{formatCount(commercial.max_active_devices)}}</a-descriptions-item>
+              <a-descriptions-item label="保留设备">{{formatCount(commercial.retained_devices)}} / {{formatCount(commercial.max_retained_devices)}}</a-descriptions-item>
+              <a-descriptions-item label="映射">{{formatCount(commercial.mappings)}} / {{formatCount(commercial.max_mappings)}}</a-descriptions-item>
+              <a-descriptions-item label="套餐带宽上限 (bit/s)">{{formatCount(commercial.max_bandwidth_bps)}}</a-descriptions-item>
+              <a-descriptions-item label="每方向预留带宽 (B/s)">{{commercial.reserved_bytes_per_second===null?'存在不限额预留':formatCount(commercial.reserved_bytes_per_second)}}</a-descriptions-item>
+              <a-descriptions-item label="运行预算预留数">{{formatCount(commercial.bandwidth_reservations)}}</a-descriptions-item>
+              <a-descriptions-item label="月度预扣字节 (UTC)">{{commercial.month_utc}}：{{formatCount(commercial.monthly_charged_bytes)}} / {{formatCount(commercial.max_monthly_bytes)}}</a-descriptions-item>
+              <a-descriptions-item label="并发预留槽位">{{formatCount(commercial.reserved_connection_slots)}} / {{formatCount(commercial.max_concurrent_connections)}}</a-descriptions-item>
+            </a-descriptions>
+            <p class="muted">带宽为同库固定预算预留，不是实时速率；月度预扣不等于实际送达或账单，不限额流量未计入。并发槽位包含受控 TCP 后端流、UDP 来源及未确认释放的槽位。当前并非生产级计费或跨节点额度系统。</p>
+          </a-card>
+          <a-card v-if="!commercial&&!busy&&!error"><p>暂无套餐数据，请刷新重试。</p></a-card>
         </template>
         <template v-if="page==='devices'">
           <a-card title="设备列表"><template #extra><a-button type="primary" :loading="busy" @click="issue">生成配对码</a-button></template>
