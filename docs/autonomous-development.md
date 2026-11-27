@@ -671,3 +671,11 @@
 - commercial/entitlement返回month_utc、monthly_charged_bytes和明确monthly_quota_scope，仍commercial_enforcement=false。readiness新增表，迁移检查1-16。备份快照保留月度记录，不提供删除或重置账本接口；旧备份恢复可能回滚用量，尚非生产级防回滚计费。
 - 扩展真实TCP测试至16组布尔门禁：两个独立worker真实回显，双方向预扣、其他owner及已满上一月记录隔离；实际并发超额转发终止、核查内容前缀及不超预算，UDP未计量路径拒绝；真实管理服务重启后当前月和历史月记录保留。上一月使用历史数据库测试记录，不宣称实际跨月长跑测试。保留旧门禁，未本地编译或运行服务，待CI验收。
 - 下一增量：HTTP/HTTPS与UDP月度预扣路径、全协议准入和真实计量测试，然后并发套餐额度及商业后台。未改main、未新增依赖；保持V0.9控制/数据面解耦与单机兼容要求。
+
+## V0.8 第十一增量：HTTP/HTTPS 管理隧道月度预扣额度（待 CI）
+- 基线 `b1d1d478cb5633fabf7d4d1d4e84685161ef79e4` 同SHA 7/7成功：[Hosted PR](https://github.com/trade3403/localtunnel/actions/runs/45915062250)/[push](https://github.com/trade3403/localtunnel/actions/runs/45915056065)，[Gateway](https://github.com/trade3403/localtunnel/actions/runs/45915061120)，[Native](https://github.com/trade3403/localtunnel/actions/runs/45915061078)，[Windows](https://github.com/trade3403/localtunnel/actions/runs/45915061148)，[Management PR](https://github.com/trade3403/localtunnel/actions/runs/45915061208)/[push](https://github.com/trade3403/localtunnel/actions/runs/45915056077)。独立TCP有限月度预算、真实超额停止、管理重启持久化已通过。
+- HTTP/HTTPS有限月额度套餐开放受管理启动请求，复用原TCP guard与tenant_monthly_usage原子预扣，写入前检查owner、device/node、mapping revision、当前套餐额度、精确请求、已登记预算及近期有效域名验证。HTTP/HTTPS/TCP双向应用流共用同库同租户UTC自然月账本；无新迁移或依赖。TLS在网关终止后计量业务端TCP流（含HTTP头及探测），不是外层TLS/Noise线路字节。有限月额度即使未设置商业带宽上限也必须安装guard，内部默认125000000 B/s上限及原32连接保护；不把该内部上限误报为商业带宽预留。
+- 仅有精确管理请求的web supervisor可使用有限月额度，手工export、独立非清空gateway apply及无管理请求的supervisor继续拒绝。启动前预留记录绑定月额度，拒绝与旧不兼容预留共存，检查当前月未满；每次写入前原子扣减，失败/部分写入不退款。启动/运行期间复查带宽与月额度，拒绝后停止guard、引擎并清空独占网关；清理不成功保留未知状态。现有套换停止、恢复及带宽预算门禁保留。UDP仍拒绝有限月额度，待实际数据报计量接入；不能宣称全协议流量额度已经完成。
+- commercial/entitlement 的monthly_quota_scope更新为finite_plan_managed_tcp_http_https_precharged_stream_both_directions，commercial_enforcement仍false；manifest记录实际guard速率和月额度。月度预扣不是精确计费，存在小于4096字节不可一次使用的尾额、写入前后跨月短窗口、探测消耗及逐次SQL写入性能代价；未配置月额度的会话不计入此账本。旧独立引擎、外部进程及多节点生产隔离不在本轮保证范围。
+- HTTP及HTTPS真实集成分别增加1组强制验收：真实CLI发布仅有限月额度650000字节的套餐；独立导出/apply/手工supervisor拒绝；管理worker实际通过Noise和Nginx业务探测，确认私有client配置连接guard；真实256KiB随机数据双向完整回显及SHA256验证，账本至少扣524288字节；后续超额请求不得完整回显，实际worker停止、数据库额度不超上限且余量不足4096字节、网关清空、guard关闭、预留释放；切回legacy账本不清零。新增两组必需证据字段。测试由GitHub CI实际执行，本轮未本地编译或运行，未降低原门禁。
+- 下一增量：UDP真实数据报月度预扣及有限月套餐准入；后续套餐并发额度、商业后台与V0.8验收。保持V0.9控制与中转完全解耦、兼容单机要求。未改main。

@@ -217,6 +217,7 @@ REQUIRED["management-v05"] = {
         "real_http_noise_concurrent_bidirectional_payload_integrity",
         "real_http_commercial_expiry_and_queued_cancellation",
         "real_http_commercial_tcp_bandwidth_and_plan_change_cleanup",
+        "real_http_monthly_only_plan_debits_and_stops_without_overspend",
     ],
     "tls-preview.json": [
         *REQUIRED["management"]["tls-preview.json"],
@@ -227,6 +228,7 @@ REQUIRED["management-v05"] = {
         "real_https_noise_concurrent_bidirectional_payload_integrity",
         "real_https_commercial_suspend_latches_stop_across_renewal",
         "real_https_commercial_tcp_bandwidth_and_plan_change_cleanup",
+        "real_https_monthly_only_plan_debits_and_stops_without_overspend",
         "real_https_five_minute_resident_soak_and_resource_bounds",
         "real_https_soak_clean_stop_and_listener_release",
     ],

@@ -84,3 +84,31 @@ def transfer(port, hostname, processes, ca=None, *, workers=WORKERS, rounds=ROUN
             "max": round(max(ordered), 3),
         },
     }
+
+
+def quota_rejects_transfer(port, hostname, ca=None):
+    """A real oversized echo must not complete. Caller verifies the ledger
+    and owned process cleanup separately; a generic request failure alone
+    is not evidence of quota enforcement."""
+    payload = secrets.token_bytes(PAYLOAD_BYTES)
+    headers = (
+        f"POST {PATH} HTTP/1.1\r\nHost: {hostname}\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        "Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    ctx = ssl.create_default_context(cafile=str(ca)) if ca is not None else None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=15) as raw:
+            conn = ctx.wrap_socket(raw, server_hostname=hostname) if ctx else raw
+            with closing(conn):
+                conn.sendall(headers + payload)
+                with http.client.HTTPResponse(conn) as response:
+                    response.begin()
+                    if response.status != 200:
+                        return response.status
+                    echoed = response.read(PAYLOAD_BYTES + 1)
+                    assert len(echoed) < len(payload), "full echo exceeded monthly quota"
+                    assert echoed == payload[:len(echoed)], "corrupt partial response"
+                    return 200
+    except (OSError, http.client.HTTPException):
+        return None

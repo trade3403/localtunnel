@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import http.server
-from tunnel_load_fixture import EchoFixture, transfer
+from tunnel_load_fixture import EchoFixture, transfer, quota_rejects_transfer
 import re
 import socket
 import time
@@ -475,6 +475,59 @@ try:
                     check.settimeout(.5)
                     assert check.connect_ex(("127.0.0.1",guard_port))!=0
                 report["real_http_commercial_tcp_bandwidth_and_plan_change_cleanup"]=True
+                # A finite monthly-only plan must still install a guard
+                # even without any commercial bandwidth cap.
+                cap=650000
+                monthly_plan={**plan,"version":2,"name":"Web monthly fixture","max_bandwidth_bps":None,"max_monthly_bytes":cap}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(monthly_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                monthly_id=created.stdout.decode().strip()
+                policy(plan_id=monthly_id)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"monthly_bypass").returncode!=0
+                assert not (root/"monthly_bypass").exists()
+                assert operator("--preview-gateway",mid3,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
+                assert operator("--supervise-preview",mid3,1,rp,"monthly_manual","gateway",gp,"expected_body").returncode!=0
+                assert not (root/"monthly_manual").exists()
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"monthly_web","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                    if current["state"]=="running":break
+                    time.sleep(.2)
+                else: raise AssertionError("monthly HTTP worker not running")
+                manifest=json.loads((root/"monthly_web"/"manifest.json").read_text())
+                assert manifest["monthly_cap"]==cap and manifest["commercial_bandwidth_bps"] is None
+                guard_port=manifest["tcp_limiter_port"]
+                assert guard_port not in (bp,rp,gp,fixture.server_port)
+                assert ("127.0.0.1:"+str(guard_port)) in (root/"monthly_web"/"client.toml").read_text()
+                def monthly_inventory():
+                    return expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
+                before=monthly_inventory()
+                assert 0<before["monthly_charged_bytes"]<cap-524288
+                measured=transfer(gp,"preview.example.test",[*processes,supervisor],workers=1,rounds=1)
+                assert measured["bytes_uploaded"]==measured["bytes_downloaded"]==262144
+                after=monthly_inventory()
+                assert before["monthly_charged_bytes"]+524288<=after["monthly_charged_bytes"]<cap
+                assert after["month_utc"]==before["month_utc"]
+                quota_rejects_transfer(gp,"preview.example.test")
+                assert supervisor.wait(timeout=40)==0
+                current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                assert current["request_id"]==queued["request_id"] and current["state"]=="stopped"
+                final=monthly_inventory()
+                assert cap-4096<final["monthly_charged_bytes"]<=cap
+                assert final["bandwidth_reservations"]==0
+                with sqlite3.connect(root/"control.sqlite3") as db:
+                    assert db.execute("SELECT charged_bytes FROM tenant_monthly_usage WHERE tenant_id=? AND month_utc=?",(final["tenant_id"],final["month_utc"])).fetchone()==(final["monthly_charged_bytes"],)
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                with socket.socket() as check:
+                    check.settimeout(.5)
+                    assert check.connect_ex(("127.0.0.1",guard_port))!=0
+                policy(plan_id="legacy-v1")
+                assert monthly_inventory()["monthly_charged_bytes"]==final["monthly_charged_bytes"]
+                report["real_http_monthly_only_plan_debits_and_stops_without_overspend"]=True
                 # Resident owns a single fixed mapping, but accepts multiple
                 # independently authorized requests without operator relaunch.
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
