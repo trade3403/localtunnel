@@ -696,6 +696,12 @@ try:
                 wait_connection_slots(0)
                 assert monthly_inventory()["bandwidth_reservations"]==0
                 stop(nginx)
+                # The mixed fixture is finished; keep only live baseline
+                # processes in the subsequent HTTPS recovery health checks.
+                processes.remove(nginx)
+                for proc,_,_ in mixed_runs:
+                    assert proc.poll()==0
+                    processes.remove(proc)
                 policy(plan_id="legacy-v1")
                 report["real_four_protocol_shared_connection_slots_and_cleanup"]=True
                 # Exercise the shared recovery mechanism with actual HTTPS,
