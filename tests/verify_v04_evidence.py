@@ -337,6 +337,12 @@ REQUIRED["management-v09"] = {
         "real_relay_disable_no_resurrection_and_audit",
         "real_relay_heartbeat_freshness_generation_and_isolation",
     ],
+    "scheduling.json": [
+        "real_atomic_capacity_and_idempotent_reservation",
+        "real_region_port_and_drain_isolation",
+        "real_allocation_owner_boundary_and_cancel",
+        "real_allocation_restore_retains_reservation",
+    ],
     "node-policy.json": [
         "real_node_policy_upgrade_and_constraints",
         "real_operator_policy_revision_audit_and_isolation",
