@@ -1,7 +1,7 @@
 //! Node-only identity. No tenant or runtime authority is granted here.
 use crate::auth;
-use axum::{extract::State,http::{header,HeaderMap,StatusCode},response::Response,routing::get,Json,Router};
-use serde::Serialize;
+use axum::{extract::{DefaultBodyLimit,State},http::{header,HeaderMap,StatusCode},response::Response,routing::{get,post},Json,Router};
+use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
 use sqlx::SqlitePool;
 
@@ -23,12 +23,36 @@ fn digest(headers:&HeaderMap)->Result<Vec<u8>,Failure>{
 #[derive(Serialize,sqlx::FromRow)]
 struct Identity{node_id:String,generation:i64}
 pub fn routes(pool:SqlitePool)->Router{
-    Router::new().route("/api/v1/relay/identity",get(identity)).with_state(pool)
+    Router::new().route("/api/v1/relay/identity",get(identity))
+        .route("/api/v1/relay/heartbeat",post(heartbeat).get(health))
+        .layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 async fn identity(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Response,Failure>{
     let id=sqlx::query_as::<_,Identity>("SELECT r.node_id,r.generation FROM relay_identities r JOIN nodes n ON n.id=r.node_id WHERE r.token_digest=? AND n.enabled=1")
         .bind(digest(&headers)?).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
     Ok(auth::uncached(Json(id)))
+}
+
+const BAD:Failure=(StatusCode::BAD_REQUEST,"invalid relay heartbeat");
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Heartbeat{protocol_version:i64,generation:i64,capacity:i64}
+#[derive(Serialize,sqlx::FromRow)]
+struct Health{node_id:String,generation:i64,received_at:Option<i64>,capacity:Option<i64>,fresh:bool}
+async fn heartbeat(State(pool):State<SqlitePool>,headers:HeaderMap,Json(body):Json<Heartbeat>)->Result<Response,Failure>{
+    let credential=digest(&headers)?;
+    if body.protocol_version!=1||body.generation<1||!(0..=65536).contains(&body.capacity){return Err(BAD)}
+    // Authorization and observation update are one SQLite statement, not
+    // a lookup followed by an unchecked write. No client-supplied node ID or time.
+    let changed=sqlx::query("INSERT INTO relay_heartbeat(node_id,generation,received_at,protocol_version,capacity) SELECT r.node_id,r.generation,unixepoch(),1,? FROM relay_identities r JOIN nodes n ON n.id=r.node_id WHERE r.token_digest=? AND n.enabled=1 AND r.generation=? ON CONFLICT(node_id) DO UPDATE SET generation=excluded.generation,received_at=excluded.received_at,protocol_version=excluded.protocol_version,capacity=excluded.capacity")
+        .bind(body.capacity).bind(&credential).bind(body.generation).execute(&pool).await.map_err(|_|INTERNAL)?;
+    if changed.rows_affected()!=1{return Err(DENIED)}
+    Ok(auth::uncached(StatusCode::NO_CONTENT))
+}
+async fn health(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Response,Failure>{
+    let value=sqlx::query_as::<_,Health>("SELECT r.node_id,r.generation,h.received_at,h.capacity,COALESCE(h.received_at BETWEEN unixepoch()-15 AND unixepoch(),0) AS fresh FROM relay_identities r JOIN nodes n ON n.id=r.node_id LEFT JOIN relay_heartbeat h ON h.node_id=r.node_id AND h.generation=r.generation WHERE r.token_digest=? AND n.enabled=1")
+        .bind(digest(&headers)?).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
+    Ok(auth::uncached(Json(value)))
 }
 
 // First issuance is distinct from rotation. The latter requires an exact
