@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import http.server
-from tunnel_load_fixture import EchoFixture, transfer
+from tunnel_load_fixture import EchoFixture, transfer, quota_rejects_transfer
 import re
 import socket
 import time
@@ -400,6 +400,183 @@ try:
                 assert last["sampling_state"]=="partial" and last["requests"]>=rows[0]["requests"]
                 report["real_gateway_observed_bytes_and_owner_isolation"]=True
                 report["api_start_stop_scoped_request_real_worker"]=True
+                def policy(state="active",expires_at=None,plan_id=None):
+                    e=expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
+                    spec={"tenant_id":e["tenant_id"],"plan_id":plan_id or e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                    p=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
+                    assert p.returncode==0,"commercial assignment failed"
+                # A pending request cannot be revived by suspend/renew.
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                policy("suspended")
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["state"]=="stopped"
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),409)
+                policy()
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["request_id"]==queued["request_id"]
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"commercial_expiry","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    state=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                    if state["state"]=="running":break
+                    time.sleep(.2)
+                else: raise AssertionError("commercial HTTP worker not running")
+                # Actual wall-clock expiry, no DB timestamp mutation or stop API.
+                expiry=int(time.time())+8
+                policy(expires_at=expiry)
+                assert request(gp,"preview.example.test")== (200,body)
+                assert supervisor.wait(timeout=40)==0 and time.time()>=expiry
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["state"]=="stopped"
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),409)
+                policy()
+                report["real_http_commercial_expiry_and_queued_cancellation"]=True
+                # Use an actual published policy and the real supervised
+                # Noise tunnel, not a mocked bandwidth or gateway response.
+                plan={"code":"http-preview","version":1,"name":"Web bandwidth fixture",
+                      "max_active_devices":64,"max_retained_devices":256,"max_mappings":4096,
+                      "max_bandwidth_bps":1048576,"max_monthly_bytes":None,"max_concurrent_connections":None}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                capped=created.stdout.decode().strip()
+                policy(plan_id=capped)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"unlimited_bypass").returncode!=0
+                assert not (root/"unlimited_bypass").exists()
+                assert operator("--preview-gateway",mid3,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"commercial_bandwidth","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                    if current["state"]=="running":break
+                    time.sleep(.2)
+                else: raise AssertionError("capped HTTP worker not running")
+                manifest=json.loads((root/"commercial_bandwidth"/"manifest.json").read_text())
+                assert manifest["commercial_bandwidth_bps"]==1048576 and manifest["byte_rate"]==131072
+                assert manifest["byte_limit_scope"]=="per_mapping_per_direction_tcp_stream"
+                guard_port=manifest["tcp_limiter_port"]
+                assert guard_port not in (bp,rp,gp,fixture.server_port)
+                assert ("127.0.0.1:"+str(guard_port)) in (root/"commercial_bandwidth"/"client.toml").read_text()
+                measured=transfer(gp,"preview.example.test",[*processes,supervisor],workers=2,rounds=1)
+                assert measured["bytes_uploaded"]==measured["bytes_downloaded"]==524288
+                # Two independent sockets share one 131072 B/s direction
+                # budget; a 4096-byte initial burst is allowed.
+                assert 3.8<=measured["elapsed_seconds"]<=30
+                report["http_commercial_bandwidth_measurements"]=measured
+                policy(plan_id="legacy-v1")
+                assert supervisor.wait(timeout=40)==0
+                current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                assert current["request_id"]==queued["request_id"] and current["state"]=="stopped"
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                with socket.socket() as check:
+                    check.settimeout(.5)
+                    assert check.connect_ex(("127.0.0.1",guard_port))!=0
+                report["real_http_commercial_tcp_bandwidth_and_plan_change_cleanup"]=True
+                # A finite monthly-only plan must still install a guard
+                # even without any commercial bandwidth cap.
+                cap=650000
+                monthly_plan={**plan,"version":2,"name":"Web monthly fixture","max_bandwidth_bps":None,"max_monthly_bytes":cap}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(monthly_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                monthly_id=created.stdout.decode().strip()
+                policy(plan_id=monthly_id)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"monthly_bypass").returncode!=0
+                assert not (root/"monthly_bypass").exists()
+                assert operator("--preview-gateway",mid3,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
+                assert operator("--supervise-preview",mid3,1,rp,"monthly_manual","gateway",gp,"expected_body").returncode!=0
+                assert not (root/"monthly_manual").exists()
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"monthly_web","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                    if current["state"]=="running":break
+                    time.sleep(.2)
+                else: raise AssertionError("monthly HTTP worker not running")
+                manifest=json.loads((root/"monthly_web"/"manifest.json").read_text())
+                assert manifest["monthly_cap"]==cap and manifest["commercial_bandwidth_bps"] is None
+                guard_port=manifest["tcp_limiter_port"]
+                assert guard_port not in (bp,rp,gp,fixture.server_port)
+                assert ("127.0.0.1:"+str(guard_port)) in (root/"monthly_web"/"client.toml").read_text()
+                def monthly_inventory():
+                    return expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
+                before=monthly_inventory()
+                assert 0<before["monthly_charged_bytes"]<cap-524288
+                measured=transfer(gp,"preview.example.test",[*processes,supervisor],workers=1,rounds=1)
+                assert measured["bytes_uploaded"]==measured["bytes_downloaded"]==262144
+                after=monthly_inventory()
+                assert before["monthly_charged_bytes"]+524288<=after["monthly_charged_bytes"]<cap
+                assert after["month_utc"]==before["month_utc"]
+                quota_rejects_transfer(gp,"preview.example.test")
+                assert supervisor.wait(timeout=40)==0
+                current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                assert current["request_id"]==queued["request_id"] and current["state"]=="stopped"
+                final=monthly_inventory()
+                assert cap-4096<final["monthly_charged_bytes"]<=cap
+                assert final["bandwidth_reservations"]==0
+                with sqlite3.connect(root/"control.sqlite3") as db:
+                    assert db.execute("SELECT charged_bytes FROM tenant_monthly_usage WHERE tenant_id=? AND month_utc=?",(final["tenant_id"],final["month_utc"])).fetchone()==(final["monthly_charged_bytes"],)
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                with socket.socket() as check:
+                    check.settimeout(.5)
+                    assert check.connect_ex(("127.0.0.1",guard_port))!=0
+                policy(plan_id="legacy-v1")
+                assert monthly_inventory()["monthly_charged_bytes"]==final["monthly_charged_bytes"]
+                report["real_http_monthly_only_plan_debits_and_stops_without_overspend"]=True
+                conn_plan={**plan,"version":3,"name":"Web connection fixture","max_bandwidth_bps":None,"max_monthly_bytes":None,"max_concurrent_connections":1}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(conn_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                policy(plan_id=created.stdout.decode().strip())
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"connection_bypass").returncode!=0
+                assert not (root/"connection_bypass").exists()
+                assert operator("--preview-gateway",mid3,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
+                queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"connection_web","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
+                end=time.monotonic()+10
+                while time.monotonic()<end:
+                    current=expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]
+                    if current["state"]=="running":break
+                    time.sleep(.2)
+                else: raise AssertionError("connection HTTP worker not running")
+                manifest=json.loads((root/"connection_web"/"manifest.json").read_text())
+                assert manifest["connection_cap"]==1 and manifest["commercial_bandwidth_bps"] is None and manifest["monthly_cap"] is None
+                def wait_connection_slots(expected):
+                    until=time.monotonic()+8
+                    while time.monotonic()<until:
+                        if monthly_inventory()["reserved_connection_slots"]==expected:return
+                        time.sleep(.05)
+                    raise AssertionError("web connection slot mismatch")
+                wait_connection_slots(0)
+                # Hold a real upstream TCP stream via the owned Noise relay,
+                # then issue a distinct request through the actual gateway.
+                with socket.create_connection(("127.0.0.1",bp),timeout=5) as held:
+                    held.sendall(("GET / HTTP/1.1\r\nHost: "+"preview.example.test"+"\r\n").encode())
+                    wait_connection_slots(1)
+                    try:
+                        result=request(gp,"preview.example.test")
+                    except (OSError,http.client.HTTPException):
+                        result=None
+                    assert result is None or result[0]!=200
+                    assert supervisor.poll() is None
+                    held.sendall(b"Connection: close\r\n\r\n")
+                    with http.client.HTTPResponse(held) as response:
+                        response.begin()
+                        assert response.status==200 and response.read()==body
+                wait_connection_slots(0)
+                assert request(gp,"preview.example.test")==(200,body)
+                wait_connection_slots(0)
+                policy(plan_id="legacy-v1")
+                assert supervisor.wait(timeout=40)==0
+                assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["state"]=="stopped"
+                assert request(gp,"preview.example.test")[0]==421 and request(bp,"preview.example.test") is None
+                report["real_http_connection_only_plan_denies_extra_backend_stream"]=True
                 # Resident owns a single fixed mapping, but accepts multiple
                 # independently authorized requests without operator relaunch.
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)

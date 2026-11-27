@@ -6,6 +6,7 @@ import re
 import secrets
 import selectors
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -287,7 +288,7 @@ try:
                         if kind==socket.SOCK_STREAM:
                             sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
                         sock.bind(("127.0.0.1",port))
-            def launch_lease():
+            def launch_lease(finite=False):
                 request=call(base,lease_route+"/udp-start",202,"POST",admin,{"expected_revision":lm["revision"]})
                 rid=request["request_id"]
                 worker=subprocess.Popen([exe,"--runtime-udp-device-worker",str(root),lm["id"],str(lm["revision"]),str(relay),str(internal),"4096","1200"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
@@ -302,7 +303,10 @@ try:
                 call(base,endpoint,409,"POST",d2["device_token"],{**spec,"device_revision":cfg["revision"]+1})
                 call(base,endpoint,409,"POST",d2["device_token"],{**spec,"mapping_revision":lm["revision"]+1})
                 call(base,endpoint,401,"POST",admin,spec)
-                assert not lease_echo()
+                # A pre-agent user datagram reserves a real source slot even
+                # without a reply. For finite tests preserve the pristine
+                # quota to distinguish the internal probe from user traffic.
+                if not finite:assert not lease_echo()
                 # Independent process configured exclusively from the authenticated response.
                 config_file=root/("lease-agent-"+rid+".toml")
                 generated=subprocess.run([str(core_test.CLI.resolve()),"client-udp-config",str(config_file),"127.0.0.1:"+str(lease["relay_port"]),"m_"+lease["mapping_id"],"127.0.0.1:"+str(lease["local_port"])],
@@ -311,7 +315,8 @@ try:
                 agent=subprocess.Popen([str(engine),str(config_file)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
                 children.append(agent)
                 line(worker,"UDP_PREVIEW_READY",35)
-                assert agent.poll() is None and lease_echo()
+                assert agent.poll() is None
+                if not finite:assert lease_echo()
                 state=call(base,lease_route+"/runtime",200,token=admin)
                 assert state["request"]["request_id"]==rid and state["request"]["state"]=="running"
                 return worker,agent,config_file,lease
@@ -342,6 +347,124 @@ try:
             assert_clean(lease2)
             assert call(base,lease_route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
             report["real_udp_device_lease_actual_expiry_closes_relay"]=True
+            def policy(state="active",expires_at=None,plan_id=None):
+                e=call(base,"commercial/entitlement",200,token=admin)["entitlement"]
+                spec={"tenant_id":e["tenant_id"],"plan_id":plan_id or e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                result=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
+                assert result.returncode==0,"commercial assignment failed"
+            worker,agent,config_file,commercial_lease=launch_lease()
+            policy("suspended")
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            call(base,lease_route+"/udp-start",409,"POST",admin,{"expected_revision":lm["revision"]})
+            assert worker.wait(timeout=15)==0
+            finish_agent(agent,config_file)
+            assert_clean(commercial_lease)
+            assert call(base,lease_route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
+            rejected(command(m["revision"],"commercial_suspended"))
+            policy()
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            report["real_udp_commercial_suspend_revokes_lease_and_closes_relay"]=True
+            # Both the ordinary managed worker and the independent device
+            # lease use the same precharged datagram path and tenant ledger.
+            cap=16384
+            plan={"code":"udp-monthly","version":1,"name":"UDP monthly fixture",
+                  "max_active_devices":64,"max_retained_devices":256,"max_mappings":4096,
+                  "max_bandwidth_bps":None,"max_monthly_bytes":cap,"max_concurrent_connections":None}
+            created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(plan).encode(),capture_output=True,timeout=20)
+            assert created.returncode==0
+            policy(plan_id=created.stdout.decode().strip())
+            def monthly():
+                return call(base,"commercial/entitlement",200,token=admin)["entitlement"]
+            assert monthly()["monthly_charged_bytes"]==0
+            rejected(command(m["revision"],"monthly_manual"))
+            assert not (root/"monthly_manual").exists()
+            q=call(base,route+"/udp-start",202,"POST",admin,{"expected_revision":m["revision"]})
+            p=subprocess.Popen([exe,"--runtime-udp-worker",str(root),mid,str(m["revision"]),str(relay),str(internal),"monthly_udp","4096","1200"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            children.append(p)
+            line(p,"UDP_PREVIEW_READY",45)
+            initial=monthly()["monthly_charged_bytes"]
+            assert initial>=64
+            assert exchange()
+            used=monthly()["monthly_charged_bytes"]
+            assert used>=initial+256 and used<cap
+            assert json.loads((root/"monthly_udp"/"manifest.json").read_text())["monthly_cap"]==cap
+            call(base,route+"/stop",202,"POST",admin,{"request_id":q["request_id"]})
+            assert p.wait(timeout=15)==0
+            closed()
+            previous=monthly()["monthly_charged_bytes"]
+            assert used<=previous<cap
+            report["real_udp_managed_monthly_precharge_and_manual_denial"]=True
+            worker,agent,config_file,monthly_lease=launch_lease()
+            assert monthly()["monthly_charged_bytes"]>=previous+64
+            assert json.loads((root/("udp-device-"+monthly_lease["request_id"])/"manifest.json").read_text())["monthly_cap"]==cap
+            prefix=secrets.token_bytes(16)
+            replies=set()
+            sent=[]
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sender:
+                sender.settimeout(.7)
+                for i in range(32):
+                    if worker.poll() is not None:break
+                    data=prefix+bytes([i])+secrets.token_bytes(983)
+                    sent.append(data)
+                    sender.sendto(data,("127.0.0.1",lease_ingress))
+                    try:
+                        reply,addr=sender.recvfrom(65535)
+                        assert addr==("127.0.0.1",lease_ingress) and reply==data
+                        replies.add(reply)
+                    except socket.timeout:pass
+                    time.sleep(.35)
+            assert worker.wait(timeout=15)==0
+            actual=[v for v in seen if v.startswith(prefix)]
+            assert 0<len(replies)<=len(actual)<32
+            assert set(actual).issubset(set(sent)) and replies.issubset(set(actual))
+            final=monthly()
+            assert cap-1200<final["monthly_charged_bytes"]<=cap
+            assert final["monthly_charged_bytes"]>=previous+1000*(len(actual)+len(replies))
+            assert final["bandwidth_reservations"]==0
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            finish_agent(agent,config_file)
+            assert_clean(monthly_lease)
+            assert call(base,lease_route+"/runtime",200,token=admin)["request"]["state"]=="stopped"
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT charged_bytes FROM tenant_monthly_usage WHERE tenant_id=? AND month_utc=?",(final["tenant_id"],final["month_utc"])).fetchone()==(final["monthly_charged_bytes"],)
+            policy(plan_id="legacy-v1")
+            assert monthly()["monthly_charged_bytes"]==final["monthly_charged_bytes"]
+            report["real_udp_device_monthly_shared_budget_exhaustion_and_cleanup"]=True
+            connection_plan={**plan,"code":"udp-connections","max_monthly_bytes":None,"max_concurrent_connections":1}
+            created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(connection_plan).encode(),capture_output=True,timeout=20)
+            assert created.returncode==0
+            policy(plan_id=created.stdout.decode().strip())
+            rejected(command(m["revision"],"connection_manual"))
+            assert not (root/"connection_manual").exists()
+            # Avoid the helper's extra user echo so the probe exemption
+            # is tested before any actual client claims a slot.
+            worker,agent,config_file,connection_lease=launch_lease(finite=True)
+            assert monthly()["reserved_connection_slots"]==0
+            assert json.loads((root/("udp-device-"+connection_lease["request_id"])/"manifest.json").read_text())["connection_cap"]==1
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as first, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as second:
+                first.settimeout(3)
+                second.settimeout(.5)
+                dst=("127.0.0.1",lease_ingress)
+                data=secrets.token_bytes(64)
+                first.sendto(data,dst)
+                assert first.recvfrom(65535)==(data,dst)
+                assert monthly()["reserved_connection_slots"]==1
+                second.sendto(data,dst)
+                try:second.recvfrom(65535)
+                except socket.timeout:pass
+                else:raise AssertionError("over-limit device UDP source received data")
+                first.sendto(data,dst)
+                assert first.recvfrom(65535)==(data,dst)
+                assert worker.poll() is None
+                call(base,endpoint,200,"POST",d2["device_token"],spec)
+                call(base,lease_route+"/stop",202,"POST",admin,{"request_id":connection_lease["request_id"]})
+                assert worker.wait(timeout=15)==0
+            assert monthly()["reserved_connection_slots"]==0 and monthly()["bandwidth_reservations"]==0
+            call(base,endpoint,409,"POST",d2["device_token"],spec)
+            finish_agent(agent,config_file)
+            assert_clean(connection_lease)
+            policy(plan_id="legacy-v1")
+            report["real_udp_device_connection_quota_probe_exempt_and_cleanup"]=True
             worker,agent,config_file,lease3=launch_lease()
             call(base,device_route+"/revoke",204,"POST",admin)
             assert worker.wait(timeout=15)!=0
@@ -349,6 +472,66 @@ try:
             finish_agent(agent,config_file)
             assert_clean(lease3)
             report["real_udp_device_lease_revocation_closes_relay"]=True
+            # Publish actual commercial policies, never fake the policy
+            # response or replace the real guard with a test implementation.
+            def publish(version,bps):
+                plan={"code":"udp-preview","version":version,"name":"UDP fixture",
+                      "max_active_devices":64,"max_retained_devices":256,"max_mappings":4096,
+                      "max_bandwidth_bps":bps,"max_monthly_bytes":None,"max_concurrent_connections":None}
+                result=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(plan).encode(),capture_output=True,timeout=20)
+                assert result.returncode==0
+                return result.stdout.decode().strip()
+            capped=publish(1,16384)
+            too_low=publish(2,8191)
+            policy(plan_id=capped)
+            p=launch("commercial_manual")
+            manifest=json.loads((root/"commercial_manual"/"manifest.json").read_text())
+            assert manifest["commercial_bandwidth_bps"]==16384 and manifest["byte_rate"]==2048 and manifest["burst_bytes"]==1200
+            assert manifest["byte_limit_scope"]=="per_mapping_per_direction_application_payload"
+            assert exchange()
+            (root/"udp-stop-commercial_manual").touch(mode=0o600)
+            assert p.wait(timeout=15)==0
+            closed()
+            policy(plan_id=too_low)
+            rejected(command(m["revision"],"commercial_too_low"))
+            assert not (root/"commercial_too_low").exists()
+            policy(plan_id=capped)
+            report["real_udp_commercial_manual_cap_and_unsupported_rate_denial"]=True
+            queued=call(base,route+"/udp-start",202,"POST",admin,{"expected_revision":m["revision"]})
+            p=subprocess.Popen([exe,"--runtime-udp-worker",str(root),mid,str(m["revision"]),str(relay),str(internal),"commercial_rate","240000","76800"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+            children.append(p)
+            line(p,"UDP_PREVIEW_READY",45)
+            manifest=json.loads((root/"commercial_rate"/"manifest.json").read_text())
+            assert manifest["request_id"]==queued["request_id"] and manifest["byte_rate"]==2048 and manifest["burst_bytes"]==1200
+            assert exchange()
+            prefix=secrets.token_bytes(16)
+            with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as sender:
+                sender.bind(("127.0.0.1",0))
+                sender.settimeout(.1)
+                start=time.monotonic()
+                for n in range(5):
+                    sender.sendto(prefix+bytes([n])+secrets.token_bytes(783),("127.0.0.1",ingress))
+                replies=set()
+                while time.monotonic()-start<.3:
+                    try:
+                        reply,addr=sender.recvfrom(65535)
+                        assert addr==("127.0.0.1",ingress) and reply.startswith(prefix) and len(reply)==800
+                        replies.add(reply[16])
+                    except socket.timeout: pass
+                elapsed=time.monotonic()-start
+                actual=sum(v.startswith(prefix) and len(v)==800 for v in seen)
+                assert 0<len(replies)<=actual<5
+                assert actual*800<=1200+2048*elapsed and len(replies)*800<=1200+2048*elapsed
+            assert exchange()
+            report["real_udp_commercial_cap_tightens_operator_and_limits_payload"]=True
+            # Any managed UDP plan change latches stop; no live policy swap.
+            policy(plan_id=too_low)
+            policy(plan_id="legacy-v1")
+            assert p.wait(timeout=15)==0
+            closed()
+            state=call(base,route+"/runtime",200,token=admin)["request"]
+            assert state["request_id"]==queued["request_id"] and state["state"]=="stopped"
+            report["real_udp_commercial_plan_change_stops_old_generation"]=True
             p=launch("udp_second")
             assert exchange()
             call(base,"devices/"+device["id"]+"/revoke",204,"POST",admin)
@@ -369,4 +552,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==12 and all(v is True for v in report.values())
+assert len(report)==19 and all(v is True for v in report.values())

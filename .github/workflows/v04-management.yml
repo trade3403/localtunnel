@@ -1,7 +1,7 @@
 name: V0.4 Management API CI
 on:
   push:
-    branches: ['feat/v0.4-management-api', 'feat/v0.5-security-stability', 'feat/v0.6-cross-platform', 'feat/v0.7-udp-quic']
+    branches: ['feat/v0.4-management-api', 'feat/v0.5-security-stability', 'feat/v0.6-cross-platform', 'feat/v0.7-udp-quic', 'feat/v0.8-commercial-management']
   pull_request:
     paths:
       - 'crates/server/**'
@@ -43,6 +43,8 @@ jobs:
         run: python3 crates/server/tests/sync_e2e.py crates/server/target/release/localtunnel-server management-evidence/sync.json
       - name: Real administrator mapping CRUD and revision lifecycle
         run: python3 crates/server/tests/mappings_e2e.py crates/server/target/release/localtunnel-server management-evidence/mappings.json
+      - name: Real commercial inventory upgrade and owner isolation
+        run: python3 crates/server/tests/commercial_e2e.py crates/server/target/release/localtunnel-server management-evidence/commercial.json
       - name: Real legacy SQLite migration and UDP desired metadata lifecycle
         run: python3 crates/server/tests/udp_metadata_e2e.py crates/server/target/release/localtunnel-server management-evidence/udp-metadata.json
       - name: Install DNS query utility
@@ -53,6 +55,8 @@ jobs:
         run: python3 crates/server/tests/domains_e2e.py crates/server/target/release/localtunnel-server management-evidence/domains.json
       - name: Build existing core CLI for preview integration
         run: cargo build --release --locked
+      - name: Real authorized TCP management draft to guarded Noise echo preview
+        run: python3 crates/server/tests/tcp_preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/tcp-preview.json
       - name: Real authorized UDP management draft to guarded Noise echo preview
         run: python3 crates/server/tests/udp_preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/udp-preview.json
       - name: Actual management draft to encrypted tunnel and gateway preview
@@ -75,7 +79,7 @@ jobs:
         working-directory: apps/admin
         run: npm run test:e2e -- ../../crates/server/target/release/localtunnel-server ../../management-evidence/admin-browser.json
       - name: Require complete V0.4 and V0.5 management evidence
-        run: python3 tests/verify_v04_evidence.py management-v05 management-evidence
+        run: python3 tests/verify_v04_evidence.py management-v08 management-evidence
       - name: Collect admin dependency lock and build
         if: always()
         run: |

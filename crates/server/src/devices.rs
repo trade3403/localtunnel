@@ -15,7 +15,7 @@ const LIMITED:Failure=(StatusCode::TOO_MANY_REQUESTS,"try again later");
 const PAIR_TTL:i64=600;
 const ACTIVE_DEVICE_LIMIT:i64=64;
 const TOTAL_DEVICE_LIMIT:i64=256;
-const QUOTA:Failure=(StatusCode::CONFLICT,"device quota reached");
+const QUOTA:Failure=(StatusCode::CONFLICT,"device quota reached or commercial entitlement inactive");
 
 #[derive(Clone)]
 struct DeviceState {pool:SqlitePool,budget:Arc<Mutex<(Instant,u32)>>,root:std::path::PathBuf}
@@ -94,13 +94,13 @@ async fn enroll(State(s):State<DeviceState>,Json(c):Json<Enrollment>)->Result<Re
     // the same transaction; failure rolls consumption back.
     let owner=sqlx::query_scalar::<_,String>("DELETE FROM device_pairings WHERE code_digest=? AND expires_at>unixepoch() AND EXISTS (SELECT 1 FROM users WHERE id=device_pairings.owner_id AND role='admin' AND enabled=1) RETURNING owner_id")
         .bind(code_digest).fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
-    // The pairing DELETE acquired the SQLite write transaction. Check both
-    // quotas in the INSERT, including retained revoked rows. Bounded indexed
-    // lookups need not count the entire owner inventory.
-    let inserted=sqlx::query("INSERT INTO devices(id,owner_id,name,credential_digest) SELECT ?,?,?,? WHERE NOT EXISTS (SELECT 1 FROM devices WHERE owner_id=? AND enabled=1 LIMIT 1 OFFSET ?) AND NOT EXISTS (SELECT 1 FROM devices WHERE owner_id=? LIMIT 1 OFFSET ?)")
-        .bind(&id).bind(&owner).bind(name).bind(digest(&token,"ltdev_")?)
-        .bind(&owner).bind(ACTIVE_DEVICE_LIMIT-1)
-        .bind(&owner).bind(TOTAL_DEVICE_LIMIT-1)
+    // The pairing DELETE acquired the SQLite write transaction. Policy,
+    // expiry and both owner quotas are checked in the actual INSERT.
+    // Preserve the pre-existing hard caps even for a malformed local policy.
+    // A missing tenant or entitlement denies admission, never defaults open.
+    let inserted=sqlx::query("INSERT INTO devices(id,owner_id,name,credential_digest) SELECT ?,t.owner_id,?,? FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id WHERE t.owner_id=? AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND (SELECT count(*) FROM devices d WHERE d.owner_id=t.owner_id AND d.enabled=1)<min(p.max_active_devices,?) AND (SELECT count(*) FROM devices d WHERE d.owner_id=t.owner_id)<min(p.max_retained_devices,?)")
+        .bind(&id).bind(name).bind(digest(&token,"ltdev_")?)
+        .bind(&owner).bind(ACTIVE_DEVICE_LIMIT).bind(TOTAL_DEVICE_LIMIT)
         .execute(&mut *tx).await.map_err(|_|INTERNAL)?;
     if inserted.rows_affected()!=1{
         // Do not consume the pairing or emit a successful device audit on
@@ -225,7 +225,7 @@ struct LeaseRequest {mapping_id:String,device_revision:i64,mapping_revision:i64}
 #[derive(sqlx::FromRow)]
 struct LeaseEligibility {request_id:String,local_port:i64,now:i64}
 async fn lease_eligibility(pool:&SqlitePool,id:&str,c:&LeaseRequest,token:&[u8])->Result<LeaseEligibility,Failure>{
-    sqlx::query_as("SELECT r.request_id,m.local_port,unixepoch() AS now FROM devices d JOIN users u ON u.id=d.owner_id JOIN mappings m ON m.device_id=d.id AND m.owner_id=d.owner_id JOIN nodes n ON n.id=m.node_id JOIN runtime_requests r ON r.mapping_id=m.id WHERE d.id=? AND d.credential_digest=? AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND d.revision=? AND m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND n.enabled=1 AND r.mapping_revision=m.revision AND r.state IN ('starting','running') AND r.updated_at BETWEEN unixepoch()-10 AND unixepoch()")
+    sqlx::query_as("SELECT r.request_id,m.local_port,unixepoch() AS now FROM devices d JOIN users u ON u.id=d.owner_id JOIN mappings m ON m.device_id=d.id AND m.owner_id=d.owner_id JOIN nodes n ON n.id=m.node_id JOIN runtime_requests r ON r.mapping_id=m.id WHERE d.id=? AND d.credential_digest=? AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND d.revision=? AND m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND n.enabled=1 AND r.mapping_revision=m.revision AND r.state IN ('starting','running') AND r.updated_at BETWEEN unixepoch()-10 AND unixepoch() AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (cp.max_concurrent_connections IS NULL OR EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.mapping_id=m.id AND b.mapping_revision=m.revision AND b.request_id=r.request_id AND b.connection_cap=cp.max_concurrent_connections)) AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND (cp.max_monthly_bytes IS NULL OR (EXISTS(SELECT 1 FROM bandwidth_reservations b WHERE b.tenant_id=t.id AND b.mapping_id=m.id AND b.mapping_revision=m.revision AND b.request_id=r.request_id AND b.monthly_cap=cp.max_monthly_bytes) AND coalesce((SELECT charged_bytes FROM tenant_monthly_usage q WHERE q.tenant_id=t.id AND q.month_utc=strftime('%Y-%m','now')),0)<cp.max_monthly_bytes)))")
         .bind(id).bind(token).bind(c.device_revision).bind(&c.mapping_id).bind(c.mapping_revision)
         .fetch_optional(pool).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)
 }

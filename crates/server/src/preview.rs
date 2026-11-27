@@ -6,12 +6,12 @@ use std::{ffi::OsString,fs,path::{Path,PathBuf},process::{Child,Command,Stdio},t
 
 type Result<T> = std::result::Result<T,&'static str>;
 #[derive(sqlx::FromRow)]
-struct Mapping {id:String,revision:i64,local_port:i64,bind_port:i64,hostname:String,protocol:String}
+struct Mapping {id:String,revision:i64,local_port:i64,bind_port:i64,hostname:String,protocol:String,bandwidth_bps:Option<i64>,monthly_cap:Option<i64>,connection_cap:Option<i64>}
 async fn checked_protocol(pool:&SqlitePool,id:&str,revision:i64,protocol:&str)->Result<Mapping>{
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{return Err("invalid mapping identity")}
     // Only web protocols, disabled draft, currently enabled owner/device/node and a
     // recent successful TXT observation. This is not continuous DNS proof.
-    sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname,m.protocol FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND (?='web' OR m.protocol=?) AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch()")
+    sqlx::query_as::<_,Mapping>("SELECT m.id,m.revision,m.local_port,m.bind_port,h.hostname,m.protocol,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps,(SELECT cp.max_monthly_bytes FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS monthly_cap,(SELECT cp.max_concurrent_connections FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS connection_cap FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN domains h ON h.id=m.domain_id AND h.owner_id=m.owner_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol IN ('http','https') AND (?='web' OR m.protocol=?) AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND h.verification_token IS NOT NULL AND h.verified_at BETWEEN unixepoch()-300 AND unixepoch() AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()))")
         .bind(id).bind(revision).bind(protocol).bind(protocol).fetch_optional(pool).await.map_err(|_|"mapping read failed")?.ok_or("preview requires current eligible web draft and recent TXT proof")
 }
 async fn checked(pool:&SqlitePool,id:&str,revision:i64)->Result<Mapping>{
@@ -57,8 +57,13 @@ fn mkdir(path:&Path)->Result<()>{
 fn mkdir(_path:&Path)->Result<()>{Err("Linux preview only")}
 
 pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,name:&str)->Result<()>{
+    export_inner(pool,root,id,revision,relay_port,name,None,None,None,None,None).await
+}
+async fn export_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,name:&str,limited_target:Option<u16>,expected_bps:Option<i64>,expected_monthly:Option<i64>,expected_connections:Option<i64>,effective_rate:Option<u32>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(name){return Err("invalid preview request")}
     let m=checked_protocol(pool,id,revision,"web").await?;
+    if m.bandwidth_bps!=expected_bps||m.monthly_cap!=expected_monthly||m.connection_cap!=expected_connections||(m.bandwidth_bps.is_some()||m.monthly_cap.is_some()||m.connection_cap.is_some())!=limited_target.is_some()||limited_target.is_some()!=effective_rate.is_some(){return Err("commercial web export requires supervised TCP limiter")}
+    let local_port=limited_target.map(i64::from).unwrap_or(m.local_port);
     let relay=port(relay_port)?;
     if i64::from(relay_port)==m.bind_port{return Err("conflicting relay port")}
     let core=core()?;
@@ -73,7 +78,7 @@ pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:
         let service=format!("m_{}",m.id);
         invoke(&core,&["server-config".into(),dir.join("server.toml").into_os_string(),relay.clone().into(),service.clone().into(),m.bind_port.to_string().into()],
             &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PRIVATE_KEY",&private)])?;
-        invoke(&core,&["client-config".into(),dir.join("client.toml").into_os_string(),relay.into(),service.into(),format!("127.0.0.1:{}",m.local_port).into()],
+        invoke(&core,&["client-config".into(),dir.join("client.toml").into_os_string(),relay.into(),service.into(),format!("127.0.0.1:{}",local_port).into()],
             &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PUBLIC_KEY",&public)])?;
         // Non-secret snapshot descriptor; do not claim runtime application.
         use std::io::Write;
@@ -81,7 +86,7 @@ pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:
         options.write(true).create_new(true);
         #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
         let mut file=options.open(dir.join("manifest.json")).map_err(|_|"manifest creation failed")?;
-        let manifest=serde_json::json!({"mapping_id":m.id,"revision":m.revision,"hostname":m.hostname,"bind_port":m.bind_port,"protocol":m.protocol,"scope":"operator_loopback_preview"});
+        let manifest=serde_json::json!({"mapping_id":m.id,"revision":m.revision,"hostname":m.hostname,"bind_port":m.bind_port,"protocol":m.protocol,"scope":"operator_loopback_preview","commercial_bandwidth_bps":expected_bps,"tcp_limiter_port":limited_target,"byte_rate":effective_rate,"monthly_cap":expected_monthly,"connection_cap":expected_connections,"byte_limit_scope":"per_mapping_per_direction_tcp_stream"});
         file.write_all(manifest.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"manifest write failed")?;
         Ok(())
     })();
@@ -90,6 +95,9 @@ pub async fn export(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:
 }
 
 pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,mode:&str,expected_file:Option<&str>)->Result<()>{
+    gateway_inner(pool,root,id,revision,name,listen,mode,expected_file,false).await
+}
+async fn gateway_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,mode:&str,expected_file:Option<&str>,supervised:bool)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(name)||!matches!(mode,"init"|"apply"|"apply-checked")||(mode=="apply-checked")!=expected_file.is_some(){return Err("invalid preview request")}
     let dir=root.join(name);
     private_dir(&dir)?;
@@ -99,6 +107,7 @@ pub async fn gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,
         if revision!=0||expected_file.is_some(){return Err("invalid clear revision")}
     }else{
         let m=checked(pool,id,revision).await?;
+        if (m.bandwidth_bps.is_some()||m.monthly_cap.is_some()||m.connection_cap.is_some())&&!supervised{return Err("commercial web gateway requires supervised TCP limiter")}
         if i64::from(listen)==m.bind_port{return Err("conflicting gateway port")}
         args.push(m.hostname.into());
         args.push(m.bind_port.to_string().into());
@@ -191,6 +200,10 @@ fn protect_child(_: &mut Command)->Result<()>{Err("Linux supervisor only")}
 // process death. A separate create_new marker retains crash evidence.
 #[cfg(target_os="linux")]
 fn guard(root:&Path,kind:&str,prefix:&str)->Result<fs::File>{
+    file_guard(root,kind,prefix,true)
+}
+#[cfg(target_os="linux")]
+fn file_guard(root:&Path,kind:&str,prefix:&str,exclusive:bool)->Result<fs::File>{
     use std::os::{fd::AsRawFd,unix::fs::{OpenOptionsExt,PermissionsExt}};
     if !safe_name(prefix){return Err("invalid guard prefix")}
     let file=fs::OpenOptions::new().read(true).write(true).create(true)
@@ -198,11 +211,21 @@ fn guard(root:&Path,kind:&str,prefix:&str)->Result<fs::File>{
         .open(root.join(format!("{kind}-{prefix}.guard"))).map_err(|_|"guard unavailable")?;
     let m=file.metadata().map_err(|_|"guard metadata unavailable")?;
     if !m.is_file()||m.permissions().mode()&0o077!=0{return Err("unsafe guard")}
-    if unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err("worker or supervisor still holds guard")}
+    if unsafe{libc::flock(file.as_raw_fd(),(if exclusive{libc::LOCK_EX}else{libc::LOCK_SH})|libc::LOCK_NB)}!=0{return Err("worker or supervisor still holds guard")}
     Ok(file)
 }
 #[cfg(not(target_os="linux"))]
 fn guard(_: &Path,_:&str,_:&str)->Result<fs::File>{Err("Linux supervisor only")}
+/// All current supervised processes (including waiting residents) hold
+/// this shared lock. Exact offline release requires the exclusive form.
+/// Never unlink the persistent guard inode.
+#[cfg(target_os="linux")]
+pub fn bandwidth_guard(root:&Path,exclusive:bool)->Result<fs::File>{
+    private_dir(root)?;
+    file_guard(root,"commercial","bandwidth",exclusive)
+}
+#[cfg(not(target_os="linux"))]
+pub fn bandwidth_guard(_root:&Path,_exclusive:bool)->Result<fs::File>{Err("Linux bandwidth recovery only")}
 struct PreviewLock{path:PathBuf,_guard:fs::File}
 impl Drop for PreviewLock {fn drop(&mut self){let _=fs::remove_file(&self.path);}}
 fn acquire_lock(root:&Path,kind:&str,prefix:&str)->Result<PreviewLock>{
@@ -261,8 +284,8 @@ impl PreviewTransport<'_>{
     }
     async fn gateway(self,pool:&SqlitePool,root:&Path,id:&str,revision:i64,prefix:&str,listen:u16,mode:&str,expected_file:Option<&str>)->Result<()>{
         match self{
-            Self::Http=>gateway(pool,root,id,revision,prefix,listen,mode,expected_file).await,
-            Self::Https{probe,cert_dir}=>tls_gateway(pool,root,id,revision,prefix,listen,probe,cert_dir,mode,expected_file).await,
+            Self::Http=>gateway_inner(pool,root,id,revision,prefix,listen,mode,expected_file,true).await,
+            Self::Https{probe,cert_dir}=>tls_gateway_inner(pool,root,id,revision,prefix,listen,probe,cert_dir,mode,expected_file,true).await,
         }
     }
 }
@@ -272,6 +295,7 @@ impl PreviewTransport<'_>{
 pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,prefix:&str,listen:u16,expected_file:&str,transport:PreviewTransport<'_>,request:Option<&str>,stop_marker:Option<&Path>)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(bundle)||!safe_name(prefix)||bundle==prefix{return Err("invalid supervisor request")}
     let m=checked_protocol(pool,id,revision,transport.protocol()).await?;
+    if (m.monthly_cap.is_some()||m.connection_cap.is_some())&&request.is_none(){return Err("commercial web quota requires managed request")}
     if relay_port==listen||i64::from(listen)==m.bind_port{return Err("conflicting preview port")}
     port(listen)?;
     port(relay_port)?;
@@ -304,14 +328,47 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     // Preserve recovery metadata and the empty gateway even when a prior
     // run's retained log inventory prevents admitting a new generation.
     crate::traffic::check_log_budget(&root.join(prefix),true)?;
-    export(pool,root,id,revision,relay_port,bundle).await?;
+    // Bind the guard before generating the client configuration. The
+    // encrypted tunnel can only reach the business fixture via this guard.
+    // The guard lives in this supervisor, not an independently orphanable process.
+    let rate=match m.bandwidth_bps{
+        Some(bps) if bps<524288=>return Err("commercial TCP bandwidth below preview minimum"),
+        Some(bps)=>Some((bps/8).min(125000000) as u32),
+        None if m.monthly_cap.is_some()||m.connection_cap.is_some()=>Some(125000000),
+        None=>None,
+    };
+    let mut limiter=match rate{
+        None=>None,
+        Some(rate)=>{
+            let monthly=match m.monthly_cap{
+                Some(cap)=>Some(crate::tcp_limit::MonthlyMeter::new(pool.clone(),id.into(),revision,request.ok_or("missing managed request")?.into(),cap)),
+                None=>None,
+            };
+            let quota=match m.connection_cap{
+                Some(cap)=>Some(crate::tcp_limit::ConnectionQuota::new(pool.clone(),id.into(),revision,request.ok_or("missing managed request")?.into(),cap)),
+                None=>None,
+            };
+            let guard=if monthly.is_some()||quota.is_some(){
+                crate::tcp_limit::Guard::start_controlled(m.local_port as u16,rate,monthly,quota)?
+            }else{crate::tcp_limit::Guard::start(m.local_port as u16,rate)?};
+            if [relay_port,listen,m.bind_port as u16].contains(&guard.port())||
+                matches!(transport,PreviewTransport::Https{probe,..} if probe==guard.port()){
+                return Err("TCP limiter port conflicts with preview")
+            }
+            Some(guard)
+        },
+    };
+    export_inner(pool,root,id,revision,relay_port,bundle,limiter.as_ref().map(|g|g.port()),m.bandwidth_bps,m.monthly_cap,m.connection_cap,rate).await?;
     let mut children=TunnelChildren(Vec::new());
     let mut meter=None;
+    let mut reservation=None;
     let result=async {
         if stop_requested(stop_marker)?{return Ok(())}
         if let Some(rid)=request{
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
+        if {let current=checked_protocol(pool,id,revision,transport.protocol()).await?; (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap)}{return Ok(())}
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,request,m.bandwidth_bps,m.bandwidth_bps.map(|bps|(bps/8).min(125000000) as u32),m.monthly_cap,m.connection_cap).await?);
         children.start(&engine,&root.join(bundle).join("server.toml"))?;
         children.start(&engine,&root.join(bundle).join("client.toml"))?;
         let deadline=Instant::now()+Duration::from_secs(30);
@@ -320,7 +377,9 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
             if let Some(rid)=request{
                 if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
             }
-            checked_protocol(pool,id,revision,transport.protocol()).await?;
+            if {let current=checked_protocol(pool,id,revision,transport.protocol()).await?; (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap)}{return Ok(())}
+            if limiter.as_ref().is_some_and(|g|g.quota_denied()){return Ok(())}
+            if limiter.as_ref().is_some_and(|g|!g.healthy()){return Err("TCP limiter exited")}
             if !children.healthy(){return Err("tunnel child exited")}
             if relay_probe(&m,&expected){break}
             if Instant::now()>=deadline{return Err("relay business probe timeout")}
@@ -330,13 +389,21 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
         if let Some(rid)=request{
             if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
         }
-        transport.gateway(pool,root,id,revision,prefix,listen,"apply-checked",Some(expected_file)).await?;
+        if {let current=checked_protocol(pool,id,revision,transport.protocol()).await?; (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap)}{return Ok(())}
+        let applied=transport.gateway(pool,root,id,revision,prefix,listen,"apply-checked",Some(expected_file)).await;
+        if limiter.as_ref().is_some_and(|g|g.quota_denied()){return Ok(())}
+        applied?;
         if request.is_some(){meter=Some(crate::traffic::Meter::new(&root.join(prefix)));}
         // Authorization is re-read after apply and every 500ms. Database
         // errors also fail closed. DNS age is checked, not continuous DNS.
         loop{
             if stop_requested(stop_marker)?{return Ok(())}
-            if checked_protocol(pool,id,revision,transport.protocol()).await.is_err(){return Ok(())}
+            match checked_protocol(pool,id,revision,transport.protocol()).await{
+                Ok(current) if (current.bandwidth_bps,current.monthly_cap,current.connection_cap)==(m.bandwidth_bps,m.monthly_cap,m.connection_cap)=>{},
+                _=>return Ok(()),
+            }
+            if limiter.as_ref().is_some_and(|g|g.quota_denied()){return Ok(())}
+            if limiter.as_ref().is_some_and(|g|!g.healthy()){return Err("TCP limiter exited")}
             if !children.healthy(){return Err("tunnel child exited")}
             // Sampled every supervisor iteration. This is a soft admission
             // threshold, not a filesystem-enforced hard byte quota.
@@ -350,10 +417,13 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
     }.await;
     // Stop owned tunnel processes even if the gateway clear fails.
     let stopped=children.stop();
+    let limited=match limiter.as_mut(){Some(g)=>g.stop(),None=>Ok(())};
     let cleared=transport.gateway(pool,root,"clear",0,prefix,listen,"apply",None).await;
     if let (Some(meter),Some(rid))=(meter.as_mut(),request){meter.sample(pool,id,revision,rid,true).await;}
     stopped?;
+    limited?;
     cleared?;
+    crate::commercial::release_bandwidth(pool,reservation.as_deref()).await?;
     // Only resident-owned, freshly created bundle is removed after a known
     // clean result. Failed/unknown runs retain evidence for the operator.
     if stop_marker.is_some()&&result.is_ok(){
@@ -366,6 +436,9 @@ pub async fn supervise(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_po
 /// TLS preview deliberately requires an immutable, private operator-owned
 /// certificate directory. Empty configurations reject all TLS handshakes.
 pub async fn tls_gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,probe:u16,cert_dir:&str,mode:&str,expected_file:Option<&str>)->Result<()>{
+    tls_gateway_inner(pool,root,id,revision,name,listen,probe,cert_dir,mode,expected_file,false).await
+}
+async fn tls_gateway_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&str,listen:u16,probe:u16,cert_dir:&str,mode:&str,expected_file:Option<&str>,supervised:bool)->Result<()>{
     if !cfg!(target_os="linux")||!safe_name(name)||!safe_name(cert_dir)||name==cert_dir||listen==probe||
         !matches!((mode,id),("init","clear")|("apply","clear")|("apply-checked",_))||
         (mode=="apply-checked")!=expected_file.is_some(){return Err("invalid TLS preview request")}
@@ -390,6 +463,7 @@ pub async fn tls_gateway(pool:&SqlitePool,root:&Path,id:&str,revision:i64,name:&
         if revision!=0||expected_file.is_some(){return Err("invalid clear revision")}
     }else{
         let m=checked_protocol(pool,id,revision,"https").await?;
+        if (m.bandwidth_bps.is_some()||m.monthly_cap.is_some()||m.connection_cap.is_some())&&!supervised{return Err("commercial TLS gateway requires supervised TCP limiter")}
         if i64::from(listen)==m.bind_port||i64::from(probe)==m.bind_port{return Err("conflicting TLS gateway port")}
         args.push(m.hostname.into());
         args.push(m.bind_port.to_string().into());
@@ -587,14 +661,45 @@ pub async fn recover(pool:&SqlitePool,root:&Path,prefix:&str,rid:&str)->Result<(
 // Local operator preview only. Never claims the HTTP runtime request state,
 // which is still reserved for the web gateway executor.
 #[derive(sqlx::FromRow)]
-struct UdpDraft { id:String, local_port:i64, bind_port:i64, device_id:String, device_revision:i64 }
+struct UdpDraft { id:String, local_port:i64, bind_port:i64, device_id:String, device_revision:i64, bandwidth_bps:Option<i64>, monthly_cap:Option<i64>, connection_cap:Option<i64> }
 
 async fn checked_udp(pool:&SqlitePool,id:&str,revision:i64,rid:Option<&str>)->Result<UdpDraft>{
     if id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1{
         return Err("invalid UDP mapping identity")
     }
-    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
+    sqlx::query_as::<_,UdpDraft>("SELECT m.id,m.local_port,m.bind_port,d.id AS device_id,d.revision AS device_revision,(SELECT cp.max_bandwidth_bps FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS bandwidth_bps,(SELECT cp.max_monthly_bytes FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS monthly_cap,(SELECT cp.max_concurrent_connections FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id) AS connection_cap FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id WHERE m.id=? AND m.revision=? AND m.enabled=0 AND m.protocol='udp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND EXISTS(SELECT 1 FROM tenants t JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id WHERE t.owner_id=m.owner_id AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch())) AND ((? IS NULL AND NOT EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.state<>'stopped')) OR EXISTS (SELECT 1 FROM runtime_requests r WHERE r.mapping_id=m.id AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')))")
         .bind(id).bind(revision).bind(rid).bind(rid).fetch_optional(pool).await.map_err(|_|"UDP draft read failed")?.ok_or("UDP preview requires current authorized draft")
+}
+
+/// One mapping, each direction separately, application payload only.
+/// A commercial cap may tighten but never relax the operator's budget.
+/// The preview needs at least 1024 B/s for its mandatory echo probes.
+fn effective_udp_limits(operator:Option<(u32,u32)>,bps:Option<i64>)->Result<Option<(u32,u32)>>{
+    match bps{
+        None=>Ok(operator),
+        Some(bps)=>{
+            if bps<8192{return Err("commercial UDP bandwidth below preview minimum")}
+            let rate=(bps/8).min(240000) as u32;
+            let operator_rate=operator.map_or(240000,|v|v.0);
+            Ok(Some((rate.min(operator_rate),1200)))
+        }
+    }
+}
+
+#[cfg(test)]
+mod commercial_udp_tests{
+    use super::effective_udp_limits;
+    #[test]
+    fn commercial_cap_tightens_operator_and_manual_udp(){
+        assert_eq!(effective_udp_limits(None,None).unwrap(),None);
+        assert_eq!(effective_udp_limits(Some((4096,2400)),None).unwrap(),Some((4096,2400)));
+        assert_eq!(effective_udp_limits(None,Some(16385)).unwrap(),Some((2048,1200)));
+        assert_eq!(effective_udp_limits(Some((4096,2400)),Some(16384)).unwrap(),Some((2048,1200)));
+        assert_eq!(effective_udp_limits(Some((1024,1200)),Some(16384)).unwrap(),Some((1024,1200)));
+        assert_eq!(effective_udp_limits(None,Some(i64::MAX)).unwrap(),Some((240000,1200)));
+        assert!(effective_udp_limits(None,Some(8191)).is_err());
+        assert!(effective_udp_limits(Some((4096,1200)),Some(1)).is_err());
+    }
 }
 
 fn udp_echo_probe(socket:&std::net::UdpSocket)->bool{
@@ -681,6 +786,8 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     }
     private_dir(root)?;
     let m=checked_udp(pool,id,revision,rid).await?;
+    if (m.monthly_cap.is_some()||m.connection_cap.is_some())&&rid.is_none(){return Err("commercial UDP quota requires managed request")}
+    let limits=effective_udp_limits(limits,m.bandwidth_bps)?;
     if device_lease!=bundle.starts_with("udp-device-"){return Err("reserved UDP device bundle name")}
     if [relay_port,internal_port,m.bind_port as u16].contains(&(m.local_port as u16)){
         return Err("conflicting UDP preview ports")
@@ -726,7 +833,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
         opts.write(true).create_new(true);
         #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
         let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"UDP manifest unavailable")?;
-        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port,"request_id":rid,"byte_rate":limits.map(|v|v.0),"burst_bytes":limits.map(|v|v.1)});
+        let data=serde_json::json!({"mapping_id":id,"revision":revision,"protocol":"udp","scope":"operator_loopback_udp_echo_preview","ingress_port":m.bind_port,"internal_port":internal_port,"relay_port":relay_port,"request_id":rid,"byte_rate":limits.map(|v|v.0),"burst_bytes":limits.map(|v|v.1),"commercial_bandwidth_bps":m.bandwidth_bps,"monthly_cap":m.monthly_cap,"connection_cap":m.connection_cap,"byte_limit_scope":"per_mapping_per_direction_application_payload"});
         file.write_all(data.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"UDP manifest write failed")?;
         Ok(())
     })();
@@ -739,24 +846,35 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     if device_lease{fs::remove_file(dir.join("client.toml")).map_err(|_|"unused client config cleanup failed")?;}
     let mut tunnel=TunnelChildren(Vec::new());
     let mut entrance=TunnelChildren(Vec::new());
+    let mut reservation=None;
+    let mut monthly_guard=None;
     let result=async{
         let current=checked_udp(pool,id,revision,rid).await?;
+        if (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap){return Ok(())}
         if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
         if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}}
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,rid,m.bandwidth_bps,if m.bandwidth_bps.is_some(){limits.map(|v|v.0)}else{None},m.monthly_cap,m.connection_cap).await?);
         tunnel.start(&engine,&dir.join("server.toml"))?;
         if !device_lease{tunnel.start(&engine,&dir.join("client.toml"))?;}
-        let mut cmd=Command::new(&core);
-        if let Some((rate,burst))=limits{
-            cmd.args(["udp-guard-limited",&ingress,&internal,&rate.to_string(),&burst.to_string()]);
-        }else{
-            cmd.args(["udp-guard",&ingress,&internal]);
-        }
-        cmd.env_clear().env("PATH","/usr/bin:/bin")
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-        protect_child(&mut cmd)?;
-        entrance.0.push(cmd.spawn().map_err(|_|"UDP guard launch failed")?);
         let probe=std::net::UdpSocket::bind("127.0.0.1:0").map_err(|_|"UDP probe bind failed")?;
         probe.connect(&ingress).map_err(|_|"UDP probe connect failed")?;
+        if m.monthly_cap.is_some()||m.connection_cap.is_some(){
+            let (rate,burst)=limits.ok_or("missing managed UDP limits")?;
+            monthly_guard=Some(crate::udp_monthly::Guard::start_with_policy(pool,id,revision,rid.ok_or("missing managed request")?,m.monthly_cap,m.connection_cap,
+                if m.connection_cap.is_some(){Some(probe.try_clone().map_err(|_|"UDP probe clone failed")?)}else{None},
+                ingress.parse().map_err(|_|"invalid UDP ingress")?,internal.parse().map_err(|_|"invalid UDP internal port")?,rate,burst)?);
+        }else{
+            let mut cmd=Command::new(&core);
+            if let Some((rate,burst))=limits{
+                cmd.args(["udp-guard-limited",&ingress,&internal,&rate.to_string(),&burst.to_string()]);
+            }else{
+                cmd.args(["udp-guard",&ingress,&internal]);
+            }
+            cmd.env_clear().env("PATH","/usr/bin:/bin")
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            protect_child(&mut cmd)?;
+            entrance.0.push(cmd.spawn().map_err(|_|"UDP guard launch failed")?);
+        }
         let deadline=Instant::now()+Duration::from_secs(30);
         let lease_deadline=Instant::now()+Duration::from_secs(crate::devices::UDP_LEASE_SECONDS as u64);
         if device_lease{
@@ -782,11 +900,17 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
                 if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
             }
             let current=checked_udp(pool,id,revision,rid).await?;
+            // No live reconfiguration or silent continuation on a changed
+            // rate. Close the owned ingress and relay; require a fresh run.
+            if (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap){return Ok(())}
             if device_lease&&current.device_revision!=m.device_revision{return Err("device revision changed")}
             let healthy=if device_lease{tunnel.0.len()==1&&matches!(tunnel.0[0].try_wait(),Ok(None))}else{tunnel.healthy()};
-            if !healthy||!matches!(entrance.0[0].try_wait(),Ok(None)){
-                return Err("UDP preview child exited")
-            }
+            let entrance_healthy=match monthly_guard.as_ref(){
+                Some(g)=>g.healthy(),
+                None=>matches!(entrance.0[0].try_wait(),Ok(None)),
+            };
+            if monthly_guard.as_ref().is_some_and(|g|g.denied()){return Ok(())}
+            if !healthy||!entrance_healthy{return Err("UDP preview child exited")}
             if udp_echo_probe(&probe){
                 if !ready{
                     if let Some(rid)=rid{if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}}
@@ -795,7 +919,8 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
                     std::io::stdout().flush().map_err(|_|"UDP preview output failed")?;
                     ready=true;
                 }
-            }else if ready||Instant::now()>=deadline{
+            }else if monthly_guard.as_ref().is_some_and(|g|g.denied()){return Ok(())}
+            else if ready||Instant::now()>=deadline{
                 return Err("UDP echo probe failed")
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -803,7 +928,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     }.await;
     // Close admission before relay and agent. Do not remove retained secrets
     // or mark a preview stopped if owned children cannot be reaped.
-    let entrance_stopped=entrance.stop();
+    let entrance_stopped=match monthly_guard.as_mut(){Some(g)=>g.stop(),None=>entrance.stop()};
     let tunnel_stopped=tunnel.stop();
     if device_lease{
         for name in ["lease.json","lease.pending"]{
@@ -812,6 +937,7 @@ async fn supervise_udp_inner(pool:&SqlitePool,root:&Path,id:&str,revision:i64,re
     }
     entrance_stopped?;
     tunnel_stopped?;
+    crate::commercial::release_bandwidth(pool,reservation.as_deref()).await?;
     if device_lease{
         fs::remove_file(dir.join("server.toml")).map_err(|_|"UDP relay configuration cleanup failed")?;
     }
@@ -840,5 +966,137 @@ pub async fn udp_device_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,
     let bundle=format!("udp-device-{rid}");
     let result=supervise_udp_inner(pool,root,id,revision,relay_port,internal_port,&bundle,Some(&rid),Some((rate,burst)),None,true).await;
     crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+    result
+}
+
+
+// Independent raw TCP loopback echo preview. Never infer reachability from
+// an open relay control socket: prove a nonce round trip through the guard.
+#[derive(sqlx::FromRow)]
+struct TcpDraft{local_port:i64,bind_port:i64,bandwidth_bps:Option<i64>,monthly_cap:Option<i64>,connection_cap:Option<i64>}
+async fn checked_tcp(pool:&SqlitePool,id:&str,revision:i64,rid:&str)->Result<TcpDraft>{
+    sqlx::query_as::<_,TcpDraft>("SELECT m.local_port,m.bind_port,cp.max_bandwidth_bps AS bandwidth_bps,cp.max_monthly_bytes AS monthly_cap,cp.max_concurrent_connections AS connection_cap FROM mappings m JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=m.node_id JOIN tenants t ON t.owner_id=m.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans cp ON cp.id=e.plan_id JOIN runtime_requests r ON r.mapping_id=m.id WHERE m.id=? AND m.revision=? AND m.protocol='tcp' AND m.enabled=0 AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.local_port BETWEEN 1 AND 65535 AND m.bind_port BETWEEN 20000 AND 29999 AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND n.enabled=1 AND e.state='active' AND (e.expires_at IS NULL OR e.expires_at>unixepoch()) AND r.request_id=? AND r.mapping_revision=m.revision AND r.state IN ('starting','running','stopping')")
+        .bind(id).bind(revision).bind(rid).fetch_optional(pool).await.map_err(|_|"TCP draft read failed")?.ok_or("TCP draft authorization changed")
+}
+fn tcp_echo_probe(port:u16)->bool{
+    use std::io::{Read,Write};
+    let Ok(nonce)=auth::random::<32>() else{return false};
+    let Ok(mut s)=std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127,0,0,1],port)),Duration::from_millis(500)) else{return false};
+    if s.set_write_timeout(Some(Duration::from_millis(500))).is_err()||s.set_read_timeout(Some(Duration::from_millis(500))).is_err(){return false}
+    if s.write_all(&nonce).is_err(){return false}
+    // Bounded read count as well as timeout; a slowly trickling peer may
+    // not hold the authorization loop indefinitely.
+    let deadline=Instant::now()+Duration::from_millis(500);
+    let mut buf=[0;32];
+    let mut n=0;
+    while n<buf.len(){
+        let remaining=deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()||s.set_read_timeout(Some(remaining)).is_err(){return false}
+        match s.read(&mut buf[n..]){Ok(k) if k>0=>n+=k,_=>return false}
+    }
+    buf==nonce
+}
+pub async fn tcp_worker(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,operator_rate:u32)->Result<()>{
+    if !cfg!(target_os="linux")||!safe_name(bundle)||id.len()!=32||!id.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||revision<1||relay_port<30000||!(65536..=125000000).contains(&operator_rate){return Err("invalid TCP worker parameters")}
+    private_dir(root)?;
+    let _lock=acquire_lock(root,"tcp-worker",id)?;
+    let deadline=Instant::now()+Duration::from_secs(60);
+    let rid=loop{
+        match crate::runtime::resident_state(pool,id,revision,"tcp").await?.as_deref(){
+            None|Some("stopped")|Some("queued")=>{},
+            _=>return Err("claimed or unknown TCP request requires local inspection"),
+        }
+        if let Some(rid)=crate::runtime::claim(pool,id,revision).await?{break rid}
+        if Instant::now()>=deadline{return Err("no fresh TCP start request")}
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let result=tcp_run(pool,root,id,revision,relay_port,bundle,operator_rate,&rid).await;
+    crate::runtime::finish(pool,id,&rid,result.is_ok()).await?;
+    result
+}
+async fn tcp_run(pool:&SqlitePool,root:&Path,id:&str,revision:i64,relay_port:u16,bundle:&str,operator_rate:u32,rid:&str)->Result<()>{
+    let m=checked_tcp(pool,id,revision,rid).await?;
+    let bind=m.bind_port as u16;
+    let local=m.local_port as u16;
+    if local==bind||local==relay_port{return Err("TCP worker port collision")}
+    let rate=match m.bandwidth_bps{
+        Some(bps) if bps<524288=>return Err("commercial TCP bandwidth below preview minimum"),
+        Some(bps)=>operator_rate.min((bps/8).min(125000000) as u32),
+        None=>operator_rate,
+    };
+    let core=core()?;
+    let engine=PathBuf::from(std::env::var_os("LOCALTUNNEL_ENGINE").ok_or("set trusted engine path")?);
+    if !engine.is_absolute()||!engine.is_file(){return Err("invalid engine path")}
+    let engine=engine.canonicalize().map_err(|_|"invalid engine path")?;
+    let private=key("LOCALTUNNEL_SERVER_PRIVATE_KEY")?;
+    let public=key("LOCALTUNNEL_SERVER_PUBLIC_KEY")?;
+    let token=hex::encode(auth::random::<32>().map_err(|_|"random generation failed")?);
+    // Reject occupied listeners before creating any secret material.
+    for p in [relay_port,bind]{
+        let tcp=tokio::net::TcpSocket::new_v4().map_err(|_|"TCP preflight socket unavailable")?;
+        tcp.set_reuseaddr(true).map_err(|_|"TCP preflight setup failed")?;
+        tcp.bind(std::net::SocketAddr::from(([127,0,0,1],p))).map_err(|_|"TCP preview port unavailable")?;
+        let _listener=tcp.listen(1).map_err(|_|"TCP preview listener unavailable")?;
+    }
+    let meter=m.monthly_cap.map(|cap|crate::tcp_limit::MonthlyMeter::new(pool.clone(),id.into(),revision,rid.into(),cap));
+    let quota=m.connection_cap.map(|cap|crate::tcp_limit::ConnectionQuota::new(pool.clone(),id.into(),revision,rid.into(),cap));
+    let mut guard=crate::tcp_limit::Guard::start_controlled(local,rate,meter,quota)?;
+    if [bind,relay_port,local].contains(&guard.port()){return Err("TCP limiter port collision")}
+    let dir=root.join(bundle);
+    mkdir(&dir)?;
+    let created=(||{
+        let service=format!("m_{id}");
+        let relay=port(relay_port)?;
+        invoke(&core,&["server-config".into(),dir.join("server.toml").into_os_string(),relay.clone().into(),service.clone().into(),bind.to_string().into()],
+            &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PRIVATE_KEY",&private)])?;
+        invoke(&core,&["client-config".into(),dir.join("client.toml").into_os_string(),relay.into(),service.into(),format!("127.0.0.1:{}",guard.port()).into()],
+            &[("LOCALTUNNEL_TOKEN",&token),("LOCALTUNNEL_SERVER_PUBLIC_KEY",&public)])?;
+        use std::io::Write;
+        let mut opts=fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;opts.mode(0o600);}
+        let mut file=opts.open(dir.join("manifest.json")).map_err(|_|"TCP manifest unavailable")?;
+        let manifest=serde_json::json!({"mapping_id":id,"revision":revision,"request_id":rid,"protocol":"tcp","scope":"operator_loopback_tcp_echo_preview","bind_port":bind,"relay_port":relay_port,"tcp_limiter_port":guard.port(),"byte_rate":rate,"commercial_bandwidth_bps":m.bandwidth_bps,"monthly_cap":m.monthly_cap,"connection_cap":m.connection_cap,"byte_limit_scope":"per_mapping_per_direction_tcp_stream"});
+        file.write_all(manifest.to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"TCP manifest write failed")?;
+        Ok(())
+    })();
+    if let Err(e)=created{let _=fs::remove_dir_all(&dir);return Err(e)}
+    let mut children=TunnelChildren(Vec::new());
+    let mut reservation=None;
+    let result=async{
+        if !crate::runtime::keep(pool,id,rid,"starting").await?{return Ok(())}
+        if {let current=checked_tcp(pool,id,revision,rid).await?; (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap)}{return Ok(())}
+        reservation=Some(crate::commercial::reserve_bandwidth(pool,id,revision,Some(rid),m.bandwidth_bps,m.bandwidth_bps.map(|_|rate),m.monthly_cap,m.connection_cap).await?);
+        children.start(&engine,&dir.join("server.toml"))?;
+        children.start(&engine,&dir.join("client.toml"))?;
+        let deadline=Instant::now()+Duration::from_secs(30);
+        let mut ready=false;
+        loop{
+            if !crate::runtime::keep(pool,id,rid,if ready{"running"}else{"starting"}).await?{return Ok(())}
+            if {let current=checked_tcp(pool,id,revision,rid).await?; (current.bandwidth_bps,current.monthly_cap,current.connection_cap)!=(m.bandwidth_bps,m.monthly_cap,m.connection_cap)}{return Ok(())}
+            if guard.quota_denied(){return Ok(())}
+            if !children.healthy()||!guard.healthy(){return Err("TCP worker child or guard exited")}
+            if !ready{
+                if tcp_echo_probe(bind){
+                    if !crate::runtime::keep(pool,id,rid,"running").await?{return Ok(())}
+                    println!("TCP_PREVIEW_READY");
+                    use std::io::Write;
+                    std::io::stdout().flush().map_err(|_|"TCP readiness output failed")?;
+                    ready=true;
+                }else if Instant::now()>=deadline{return Err("TCP echo readiness timeout")}
+            }
+            // After actual startup proof, monitor authorization and child
+            // health, not arbitrary application protocol liveness.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }.await;
+    let stopped=children.stop();
+    let limited=guard.stop();
+    stopped?;
+    limited?;
+    crate::commercial::release_bandwidth(pool,reservation.as_deref()).await?;
+    if result.is_ok(){
+        fs::remove_dir_all(&dir).map_err(|_|"TCP bundle cleanup failed")?;
+    }
     result
 }

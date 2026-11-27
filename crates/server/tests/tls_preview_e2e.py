@@ -3,7 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import http.server
-from tunnel_load_fixture import EchoFixture, transfer
+from tunnel_load_fixture import EchoFixture, transfer, quota_rejects_transfer
 import re
 import socket
 import ssl
@@ -383,6 +383,327 @@ try:
                 assert request(bp,hostname) is None
                 assert request(probe,"localtunnel-probe.invalid")[0]==421
                 report["real_https_runtime_api_start_stop"]=True
+                def policy(state="active",expires_at=None,plan_id=None):
+                    e=expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
+                    spec={"tenant_id":e["tenant_id"],"plan_id":plan_id or e["plan_id"],"expected_revision":e["revision"],"state":state,"expires_at":expires_at}
+                    p=subprocess.run([exe,"--commercial-assign",str(root)],input=json.dumps(spec).encode(),capture_output=True,timeout=20)
+                    assert p.returncode==0,"commercial assignment failed"
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                queued=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-tls-worker",str(root),mid3,"1",str(rp),"commercial_suspend","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                end=time.monotonic()+45
+                while time.monotonic()<end:
+                    assert supervisor.poll() is None
+                    state=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                    try:
+                        if state["state"]=="running" and tls_request(gp,hostname,ca2)==(200,body):break
+                    except (OSError,http.client.HTTPException):pass
+                    time.sleep(.25)
+                else: raise AssertionError("commercial HTTPS worker not running")
+                policy("suspended")
+                expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),409)
+                policy() # Rapid renewal cannot cancel the already latched stop.
+                assert supervisor.wait(timeout=40)==0
+                state=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                assert state["state"]=="stopped" and state["request_id"]==queued["request_id"]
+                rejects(gp,hostname,ca2)
+                assert request(bp,hostname) is None
+                assert request(probe,"localtunnel-probe.invalid")[0]==421
+                report["real_https_commercial_suspend_latches_stop_across_renewal"]=True
+                # Use an actual published policy and the real supervised
+                # Noise tunnel, not a mocked bandwidth or gateway response.
+                plan={"code":"https-preview","version":1,"name":"Web bandwidth fixture",
+                      "max_active_devices":64,"max_retained_devices":256,"max_mappings":4096,
+                      "max_bandwidth_bps":1048576,"max_monthly_bytes":None,"max_concurrent_connections":None}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                capped=created.stdout.decode().strip()
+                policy(plan_id=capped)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"unlimited_bypass").returncode!=0
+                assert not (root/"unlimited_bypass").exists()
+                assert operator("--preview-tls-gateway",mid3,1,"tls_gateway",gp,probe,"cert_v2","apply-checked","expected_body").returncode!=0
+                queued=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-tls-worker",str(root),mid3,"1",str(rp),"commercial_bandwidth","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                end=time.monotonic()+45
+                while time.monotonic()<end:
+                    assert supervisor.poll() is None
+                    current=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                    try:
+                        if current["state"]=="running" and tls_request(gp,hostname,ca2)==(200,body):break
+                    except (OSError,http.client.HTTPException):pass
+                    time.sleep(.25)
+                else: raise AssertionError("capped HTTPS worker not running")
+                manifest=json.loads((root/"commercial_bandwidth"/"manifest.json").read_text())
+                assert manifest["commercial_bandwidth_bps"]==1048576 and manifest["byte_rate"]==131072
+                assert manifest["byte_limit_scope"]=="per_mapping_per_direction_tcp_stream"
+                guard_port=manifest["tcp_limiter_port"]
+                assert guard_port not in (bp,rp,gp,fixture.server_port)
+                assert ("127.0.0.1:"+str(guard_port)) in (root/"commercial_bandwidth"/"client.toml").read_text()
+                measured=transfer(gp,hostname,[*processes,supervisor],ca2,workers=2,rounds=1)
+                assert measured["bytes_uploaded"]==measured["bytes_downloaded"]==524288
+                # Two independent sockets share one 131072 B/s direction
+                # budget; a 4096-byte initial burst is allowed.
+                assert 3.8<=measured["elapsed_seconds"]<=30
+                report["https_commercial_bandwidth_measurements"]=measured
+                policy(plan_id="legacy-v1")
+                assert supervisor.wait(timeout=40)==0
+                current=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                assert current["request_id"]==queued["request_id"] and current["state"]=="stopped"
+                rejects(gp,hostname,ca2)
+                assert request(bp,hostname) is None
+                assert request(probe,"localtunnel-probe.invalid")[0]==421
+                with socket.socket() as check:
+                    check.settimeout(.5)
+                    assert check.connect_ex(("127.0.0.1",guard_port))!=0
+                report["real_https_commercial_tcp_bandwidth_and_plan_change_cleanup"]=True
+                # A finite monthly-only plan must still install a guard
+                # even without any commercial bandwidth cap.
+                cap=650000
+                monthly_plan={**plan,"version":2,"name":"Web monthly fixture","max_bandwidth_bps":None,"max_monthly_bytes":cap}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(monthly_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                monthly_id=created.stdout.decode().strip()
+                policy(plan_id=monthly_id)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"monthly_bypass").returncode!=0
+                assert not (root/"monthly_bypass").exists()
+                assert operator("--preview-tls-gateway",mid3,1,"tls_gateway",gp,probe,"cert_v2","apply-checked","expected_body").returncode!=0
+                assert operator("--supervise-tls-preview",mid3,1,rp,"monthly_manual","tls_gateway",gp,"expected_body",probe,"cert_v2").returncode!=0
+                assert not (root/"monthly_manual").exists()
+                queued=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-tls-worker",str(root),mid3,"1",str(rp),"monthly_web","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                end=time.monotonic()+45
+                while time.monotonic()<end:
+                    assert supervisor.poll() is None
+                    current=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                    try:
+                        if current["state"]=="running" and tls_request(gp,hostname,ca2)==(200,body):break
+                    except (OSError,http.client.HTTPException):pass
+                    time.sleep(.25)
+                else: raise AssertionError("monthly HTTPS worker not running")
+                manifest=json.loads((root/"monthly_web"/"manifest.json").read_text())
+                assert manifest["monthly_cap"]==cap and manifest["commercial_bandwidth_bps"] is None
+                guard_port=manifest["tcp_limiter_port"]
+                assert guard_port not in (bp,rp,gp,fixture.server_port)
+                assert ("127.0.0.1:"+str(guard_port)) in (root/"monthly_web"/"client.toml").read_text()
+                def monthly_inventory():
+                    return expect(call(base,"commercial/entitlement",token=admin),200)["entitlement"]
+                before=monthly_inventory()
+                assert 0<before["monthly_charged_bytes"]<cap-524288
+                measured=transfer(gp,hostname,[*processes,supervisor],ca2,workers=1,rounds=1)
+                assert measured["bytes_uploaded"]==measured["bytes_downloaded"]==262144
+                after=monthly_inventory()
+                assert before["monthly_charged_bytes"]+524288<=after["monthly_charged_bytes"]<cap
+                assert after["month_utc"]==before["month_utc"]
+                quota_rejects_transfer(gp,hostname,ca2)
+                assert supervisor.wait(timeout=40)==0
+                current=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                assert current["request_id"]==queued["request_id"] and current["state"]=="stopped"
+                final=monthly_inventory()
+                assert cap-4096<final["monthly_charged_bytes"]<=cap
+                assert final["bandwidth_reservations"]==0
+                with sqlite3.connect(root/"control.sqlite3") as db:
+                    assert db.execute("SELECT charged_bytes FROM tenant_monthly_usage WHERE tenant_id=? AND month_utc=?",(final["tenant_id"],final["month_utc"])).fetchone()==(final["monthly_charged_bytes"],)
+                rejects(gp,hostname,ca2)
+                assert request(bp,hostname) is None
+                assert request(probe,"localtunnel-probe.invalid")[0]==421
+                with socket.socket() as check:
+                    check.settimeout(.5)
+                    assert check.connect_ex(("127.0.0.1",guard_port))!=0
+                policy(plan_id="legacy-v1")
+                assert monthly_inventory()["monthly_charged_bytes"]==final["monthly_charged_bytes"]
+                report["real_https_monthly_only_plan_debits_and_stops_without_overspend"]=True
+                conn_plan={**plan,"version":3,"name":"Web connection fixture","max_bandwidth_bps":None,"max_monthly_bytes":None,"max_concurrent_connections":1}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(conn_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                policy(plan_id=created.stdout.decode().strip())
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                assert operator("--export-preview",mid3,1,rp,"connection_bypass").returncode!=0
+                assert not (root/"connection_bypass").exists()
+                assert operator("--preview-tls-gateway",mid3,1,"tls_gateway",gp,probe,"cert_v2","apply-checked","expected_body").returncode!=0
+                queued=expect(call(base,path+"/start","POST",admin,{"expected_revision":1}),202)
+                supervisor=subprocess.Popen([exe,"--runtime-tls-worker",str(root),mid3,"1",str(rp),"connection_web","tls_gateway",str(gp),"expected_body",str(probe),"cert_v2"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                end=time.monotonic()+45
+                while time.monotonic()<end:
+                    assert supervisor.poll() is None
+                    current=expect(call(base,path+"/runtime",token=admin),200)["request"]
+                    try:
+                        if current["state"]=="running" and tls_request(gp,hostname,ca2)==(200,body):break
+                    except (OSError,http.client.HTTPException):pass
+                    time.sleep(.25)
+                else: raise AssertionError("connection HTTPS worker not running")
+                manifest=json.loads((root/"connection_web"/"manifest.json").read_text())
+                assert manifest["connection_cap"]==1 and manifest["commercial_bandwidth_bps"] is None and manifest["monthly_cap"] is None
+                def wait_connection_slots(expected):
+                    until=time.monotonic()+8
+                    while time.monotonic()<until:
+                        if monthly_inventory()["reserved_connection_slots"]==expected:return
+                        time.sleep(.05)
+                    raise AssertionError(f"web connection slot mismatch: expected {expected}, actual {monthly_inventory()['reserved_connection_slots']}")
+                wait_connection_slots(0)
+                # Hold a real upstream TCP stream via the owned Noise relay,
+                # then issue a distinct request through the actual gateway.
+                with socket.create_connection(("127.0.0.1",bp),timeout=5) as held:
+                    held.sendall(("GET / HTTP/1.1\r\nHost: "+hostname+"\r\n").encode())
+                    wait_connection_slots(1)
+                    try:
+                        result=tls_request(gp,hostname,ca2)
+                    except (OSError,http.client.HTTPException):
+                        result=None
+                    assert result is None or result[0]!=200
+                    assert supervisor.poll() is None
+                    held.sendall(b"Connection: close\r\n\r\n")
+                    with http.client.HTTPResponse(held) as response:
+                        response.begin()
+                        assert response.status==200 and response.read()==body
+                wait_connection_slots(0)
+                assert tls_request(gp,hostname,ca2)==(200,body)
+                wait_connection_slots(0)
+                policy(plan_id="legacy-v1")
+                assert supervisor.wait(timeout=40)==0
+                assert expect(call(base,path+"/runtime",token=admin),200)["request"]["state"]=="stopped"
+                rejects(gp,hostname,ca2)
+                assert request(bp,hostname) is None
+                report["real_https_connection_only_plan_denies_extra_backend_stream"]=True
+                # Four independent managed workers, one real tenant budget.
+                mixed_plan={**conn_plan,"version":4,"name":"Four protocol fixture","max_concurrent_connections":4}
+                created=subprocess.run([exe,"--commercial-create-plan",str(root)],input=json.dumps(mixed_plan).encode(),capture_output=True,timeout=20)
+                assert created.returncode==0
+                policy(plan_id=created.stdout.decode().strip())
+                def mixed_bind(kind):
+                    for port in range(26000,29000):
+                        if port in ports:continue
+                        with socket.socket(socket.AF_INET,kind) as check:
+                            try:check.bind(("127.0.0.1",port))
+                            except OSError:continue
+                            ports.add(port)
+                            return port
+                    raise AssertionError("no mixed fixture port")
+                http_host="mixed.example.test"
+                hd=expect(call(base,"domains","POST",admin,{"hostname":http_host}),201)
+                records[hd["txt_name"]+"."]=hd["txt_value"]
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":hd["id"]}),200)
+                expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
+                mixed_device=expect(enroll(base,issue(base,admin)),201)
+                def mixed_mapping(protocol,target,domain_id=None):
+                    spec={"device_id":mixed_device["id"],"node_id":nid,"protocol":protocol,"local_port":target,"bind_port":mixed_bind(socket.SOCK_DGRAM if protocol=="udp" else socket.SOCK_STREAM)}
+                    if domain_id is not None:spec["domain_id"]=domain_id
+                    return expect(call(base,"mappings","POST",admin,spec),201)
+                hp=unique_port()
+                http_prefix=root/"mixed_gateway"
+                http_prefix.mkdir(mode=0o700)
+                assert operator("--preview-gateway","clear",0,"mixed_gateway",hp,"init").returncode==0
+                nginx=subprocess.Popen(["/usr/sbin/nginx","-p",str(http_prefix)+"/","-c",str(http_prefix/"nginx.conf"),"-g","daemon off;"],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                processes.append(nginx)
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    if request(hp,http_host) is not None:break
+                    time.sleep(.2)
+                else:raise AssertionError("mixed HTTP gateway unavailable")
+                mixed_runs=[]
+                def mixed_start(item,action,route,*args):
+                    mp="mappings/"+item["id"]
+                    req=expect(call(base,mp+route,"POST",admin,{"expected_revision":item["revision"]}),202)
+                    proc=subprocess.Popen([exe,action,str(root),item["id"],str(item["revision"]),*map(str,args)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True)
+                    processes.append(proc)
+                    mixed_runs.append((proc,mp,req["request_id"]))
+                    deadline=time.monotonic()+45
+                    while time.monotonic()<deadline:
+                        assert proc.poll() is None, f"mixed {action} worker exited: {proc.stderr.read() if proc.poll() is not None else ''}"
+                        if expect(call(base,mp+"/runtime",token=admin),200)["request"]["state"]=="running":return
+                        time.sleep(.2)
+                    raise AssertionError("mixed worker not running")
+                class MixedEcho(socketserver.BaseRequestHandler):
+                    def handle(self):
+                        self.request.settimeout(20)
+                        try:
+                            while True:
+                                data=self.request.recv(4096)
+                                if not data:return
+                                self.request.sendall(data)
+                        except OSError:return
+                with socketserver.ThreadingTCPServer(("127.0.0.1",0),MixedEcho) as tcp_target, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as udp_target:
+                    tcp_target.daemon_threads=True
+                    tcp_thread=threading.Thread(target=tcp_target.serve_forever,daemon=True)
+                    tcp_thread.start()
+                    udp_target.bind(("127.0.0.1",0))
+                    udp_target.settimeout(.2)
+                    done=threading.Event()
+                    def echo_udp():
+                        while not done.is_set():
+                            try:
+                                data,peer=udp_target.recvfrom(65535)
+                                udp_target.sendto(data,peer)
+                            except socket.timeout:continue
+                            except OSError:return
+                    echo_thread=threading.Thread(target=echo_udp,daemon=True)
+                    echo_thread.start()
+                    try:
+                        hm=mixed_mapping("http",fixture.server_port,hd["id"])
+                        tm=mixed_mapping("tcp",tcp_target.server_address[1])
+                        um=mixed_mapping("udp",udp_target.getsockname()[1])
+                        mixed_start(mapping3,"--runtime-tls-worker","/start",rp,"mixed_tls","tls_gateway",gp,"expected_body",probe,"cert_v2")
+                        mixed_start(hm,"--runtime-worker","/start",unique_port(),"mixed_http","mixed_gateway",hp,"expected_body")
+                        mixed_start(tm,"--runtime-tcp-worker","/tcp-start",unique_port(),"mixed_tcp",65536)
+                        mixed_start(um,"--runtime-udp-worker","/udp-start",unique_port(),unique_port(),"mixed_udp",65536,1200)
+                        assert request(hp,http_host)==(200,body)
+                        assert tls_request(gp,hostname,ca2)==(200,body)
+                        wait_connection_slots(0)
+                        def hold_web(port,host):
+                            sock=socket.create_connection(("127.0.0.1",port),timeout=5)
+                            sock.sendall(("GET / HTTP/1.1\r\nHost: "+host+"\r\n").encode())
+                            return sock
+                        with hold_web(bp,hostname) as a, hold_web(hm["bind_port"],http_host) as b, socket.create_connection(("127.0.0.1",tm["bind_port"]),timeout=5) as c, socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as d:
+                            payload=secrets.token_bytes(32)
+                            c.sendall(payload)
+                            assert c.makefile("rb").read(len(payload))==payload
+                            wait_connection_slots(3)
+                            d.settimeout(3)
+                            dst=("127.0.0.1",um["bind_port"])
+                            data=secrets.token_bytes(64)
+                            d.sendto(data,dst)
+                            assert d.recvfrom(65535)==(data,dst)
+                            wait_connection_slots(4)
+                            assert monthly_inventory()["bandwidth_reservations"]==4
+                            result=request(hp,http_host)
+                            assert result is None or result[0]!=200
+                            try:result=tls_request(gp,hostname,ca2)
+                            except (OSError,http.client.HTTPException):result=None
+                            assert result is None or result[0]!=200
+                            for sock in (a,b):
+                                sock.sendall(b"Connection: close\r\n\r\n")
+                                with http.client.HTTPResponse(sock) as response:
+                                    response.begin()
+                                    assert response.status==200 and response.read()==body
+                            for sock in (a,b,c):
+                                sock.shutdown(socket.SHUT_RDWR)
+                                sock.close()
+                            wait_connection_slots(1)
+                            assert request(hp,http_host)==(200,body)
+                            assert tls_request(gp,hostname,ca2)==(200,body)
+                            wait_connection_slots(1)
+                            assert all(proc.poll() is None for proc,_,_ in mixed_runs)
+                    finally:
+                        for proc,mp,rid in reversed(mixed_runs):
+                            if proc.poll() is None:
+                                expect(call(base,mp+"/stop","POST",admin,{"request_id":rid}),202)
+                                assert proc.wait(timeout=40)==0
+                        done.set()
+                        echo_thread.join(timeout=2)
+                        tcp_target.shutdown()
+                        tcp_thread.join(timeout=2)
+                wait_connection_slots(0)
+                assert monthly_inventory()["bandwidth_reservations"]==0
+                stop(nginx)
+                # The mixed fixture is finished; keep only live baseline
+                # processes in the subsequent HTTPS recovery health checks.
+                processes.remove(nginx)
+                for proc,_,_ in mixed_runs:
+                    assert proc.poll()==0
+                    processes.remove(proc)
+                policy(plan_id="legacy-v1")
+                report["real_four_protocol_shared_connection_slots_and_cleanup"]=True
                 # Exercise the shared recovery mechanism with actual HTTPS,
                 # a verified certificate and two owned encrypted tunnel children.
                 import signal

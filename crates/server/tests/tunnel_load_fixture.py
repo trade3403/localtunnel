@@ -32,7 +32,7 @@ class EchoFixture:
         self.end_headers()
         self.wfile.write(payload)
 
-def transfer(port, hostname, processes, ca=None):
+def transfer(port, hostname, processes, ca=None, *, workers=WORKERS, rounds=ROUNDS):
     # Each transaction uses a different non-compressible random payload and
     # an independent socket. No retries, fake success, or external endpoints.
     ctx = ssl.create_default_context(cafile=str(ca)) if ca is not None else None
@@ -64,17 +64,17 @@ def transfer(port, hostname, processes, ca=None):
 
     latencies = []
     started = time.monotonic()
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for _ in range(ROUNDS):
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for _ in range(rounds):
             assert all(p.poll() is None for p in processes), "gateway or tunnel exited"
-            latencies.extend(pool.map(one, range(WORKERS)))
+            latencies.extend(pool.map(one, range(workers)))
     elapsed = time.monotonic() - started
     assert all(p.poll() is None for p in processes)
-    assert len(latencies) == WORKERS * ROUNDS and 0 < elapsed <= 60
+    assert len(latencies) == workers * rounds and 0 < elapsed <= 60
     verified_bytes = len(latencies) * PAYLOAD_BYTES
     ordered = sorted(latencies)
     return {
-        "transactions": len(latencies), "workers": WORKERS,
+        "transactions": len(latencies), "workers": workers,
         "bytes_uploaded": verified_bytes, "bytes_downloaded": verified_bytes,
         "elapsed_seconds": round(elapsed, 6),
         "combined_application_goodput_mbps": round(verified_bytes * 2 * 8 / elapsed / 1_000_000, 3),
@@ -84,3 +84,31 @@ def transfer(port, hostname, processes, ca=None):
             "max": round(max(ordered), 3),
         },
     }
+
+
+def quota_rejects_transfer(port, hostname, ca=None):
+    """A real oversized echo must not complete. Caller verifies the ledger
+    and owned process cleanup separately; a generic request failure alone
+    is not evidence of quota enforcement."""
+    payload = secrets.token_bytes(PAYLOAD_BYTES)
+    headers = (
+        f"POST {PATH} HTTP/1.1\r\nHost: {hostname}\r\n"
+        f"Content-Length: {len(payload)}\r\n"
+        "Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+    ctx = ssl.create_default_context(cafile=str(ca)) if ca is not None else None
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=15) as raw:
+            conn = ctx.wrap_socket(raw, server_hostname=hostname) if ctx else raw
+            with closing(conn):
+                conn.sendall(headers + payload)
+                with http.client.HTTPResponse(conn) as response:
+                    response.begin()
+                    if response.status != 200:
+                        return response.status
+                    echoed = response.read(PAYLOAD_BYTES + 1)
+                    assert len(echoed) < len(payload), "full echo exceeded monthly quota"
+                    assert echoed == payload[:len(echoed)], "corrupt partial response"
+                    return 200
+    except (OSError, http.client.HTTPException):
+        return None

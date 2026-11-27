@@ -72,6 +72,7 @@ impl Admission {
 struct Session {
     socket: UdpSocket,
     last_forwarded: Instant,
+    slot: Option<String>,
     inbound: Bucket,
     outbound: Bucket,
 }
@@ -143,14 +144,61 @@ impl UdpForwarder {
             buf: Box::new([0u8;65536]), stats: UdpStats::default() })
     }
 
+    fn expire_sources(&mut self, now:Instant, mut release:impl FnMut(&str)->Result<(), &'static str>)->Result<(), &'static str>{
+        let expired:Vec<_>=self.sessions.iter().filter(|(_,s)|now.saturating_duration_since(s.last_forwarded)>=IDLE).map(|(peer,_)|*peer).collect();
+        for peer in expired {
+            if let Some(session)=self.sessions.remove(&peer){
+                let slot=session.slot.clone();
+                drop(session);
+                if let Some(id)=slot{release(&id)?;}
+            }
+        }
+        Ok(())
+    }
+
+    /// A supervisor-owned socket stays bound for the entire probe lifetime.
+    /// Only its exact address is exempt from commercial source admission;
+    /// packet limits, byte limits and charging still apply to every datagram.
+    /// The caller must retain exclusive ownership of the socket while polling.
+    pub fn poll_with_probe(&mut self, probe:&UdpSocket, charge:impl FnMut(usize)->Result<(), &'static str>,
+        acquire:impl FnMut()->Result<Option<Option<String>>, &'static str>,
+        release:impl FnMut(&str)->Result<(), &'static str>) -> Result<(), &'static str> {
+        let peer=probe.local_addr().map_err(|_|"UDP probe address unavailable")?;
+        if !valid_endpoints(peer,self.local_addr().map_err(|_|"UDP ingress address unavailable")?) || peer==self.target {
+            return Err("invalid UDP probe socket")
+        }
+        self.poll_inner(Some(peer),charge,acquire,release)
+    }
+
     pub fn local_addr(&self) -> io::Result<SocketAddr> { self.ingress.local_addr() }
     pub fn stats(&self) -> UdpStats { self.stats }
     pub fn active_sources(&self) -> usize { self.sessions.len() }
 
     /// Bounded nonblocking work; no payload logging or pending application queue.
     pub fn poll(&mut self) -> Result<(), &'static str> {
+        self.poll_with_charge(|_|Ok(()))
+    }
+    /// Charge only admitted datagrams, immediately before each socket send.
+    /// A rejected charge aborts this poll without forwarding that datagram.
+    /// The metered owner must close this forwarder on error.
+    pub fn poll_with_charge(&mut self, charge:impl FnMut(usize)->Result<(), &'static str>) -> Result<(), &'static str> {
+        self.poll_with_policy(charge, || Ok(Some(None)), |_| Ok(()))
+    }
+
+    /// Admission returns None to reject a new source, Some(None) for an
+    /// unmetered source, or Some(Some(id)) for an externally reserved slot.
+    /// Expired sockets are closed before releasing their exact slot. On an
+    /// error the owner must stop the forwarder and recover its reservation.
+    pub fn poll_with_policy(&mut self, charge:impl FnMut(usize)->Result<(), &'static str>,
+        acquire:impl FnMut()->Result<Option<Option<String>>, &'static str>,
+        release:impl FnMut(&str)->Result<(), &'static str>) -> Result<(), &'static str> {
+        self.poll_inner(None,charge,acquire,release)
+    }
+    fn poll_inner(&mut self, probe:Option<SocketAddr>, mut charge:impl FnMut(usize)->Result<(), &'static str>,
+        mut acquire:impl FnMut()->Result<Option<Option<String>>, &'static str>,
+        mut release:impl FnMut(&str)->Result<(), &'static str>) -> Result<(), &'static str> {
         let now = Instant::now();
-        self.sessions.retain(|_,s| now.saturating_duration_since(s.last_forwarded)<IDLE);
+        self.expire_sources(now, &mut release)?;
         self.admission.prune(now);
         for _ in 0..32 {
             let (n,peer)=match self.ingress.recv_from(&mut self.buf[..]) {
@@ -175,7 +223,10 @@ impl UdpForwarder {
                 if socket.connect(self.target).is_err() || socket.set_nonblocking(true).is_err() {
                     reject(&mut self.stats.rejected_from_source); continue;
                 }
-                self.sessions.insert(peer,Session {socket,last_forwarded:now,
+                let Some(slot)=(if probe==Some(peer){Some(None)}else{acquire()?}) else {
+                    reject(&mut self.stats.rejected_from_source); continue;
+                };
+                self.sessions.insert(peer,Session {socket,last_forwarded:now,slot,
                     inbound:Bucket::new(PEER_RATE,PEER_BURST,now),
                     outbound:Bucket::new(PEER_RATE,PEER_BURST,now)});
             }
@@ -187,7 +238,9 @@ impl UdpForwarder {
                     reject(&mut self.stats.byte_limited_from_source);
                     reject(&mut self.stats.rejected_from_source); continue;
                 }
-                // A failed send consumes budget conservatively but is never metered.
+                // Precharge even if the subsequent socket send fails.
+                // Successful-send counters still exclude failed sends.
+                charge(n)?;
                 if s.socket.send(&self.buf[..n]).ok()==Some(n) {
                     s.last_forwarded=now;
                     count(&mut self.stats.to_target_bytes,&mut self.stats.to_target_packets,n);
@@ -208,6 +261,7 @@ impl UdpForwarder {
                     reject(&mut self.stats.byte_limited_from_target);
                     reject(&mut self.stats.rejected_from_target); continue;
                 }
+                charge(n)?;
                 if self.ingress.send_to(&self.buf[..n],peer).ok()==Some(n) {
                     count(&mut self.stats.to_source_bytes,&mut self.stats.to_source_packets,n);
                 } else { reject(&mut self.stats.rejected_from_target); }
@@ -234,6 +288,110 @@ pub fn run_with_limits(listen: SocketAddr, relay: SocketAddr, limits: Option<Byt
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn real_datagram_precharge_denial_prevents_each_send(){
+        let target=UdpSocket::bind("127.0.0.1:0").unwrap();
+        target.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let source=UdpSocket::bind("127.0.0.1:0").unwrap();
+        source.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let mut f=UdpForwarder::bind("127.0.0.1:0".parse().unwrap(),target.local_addr().unwrap()).unwrap();
+        let addr=f.local_addr().unwrap();
+        let mut buf=[0;2048];
+        source.send_to(&[7;31],addr).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        loop{
+            match f.poll_with_charge(|n|{assert_eq!(n,31);Err("denied")}){
+                Err("denied")=>break,
+                Ok(())=>{assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(2));},
+                Err(e)=>panic!("unexpected guard error: {e}"),
+            }
+        }
+        assert!(target.recv_from(&mut buf).is_err());
+        assert_eq!(f.stats().to_target_bytes,0);
+        source.send_to(&[9;47],addr).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        let peer=loop{
+            f.poll_with_charge(|n|{assert_eq!(n,47);Ok(())}).unwrap();
+            if let Ok((n,peer))=target.recv_from(&mut buf){
+                assert_eq!(&buf[..n],&[9;47]);break peer
+            }
+            assert!(Instant::now()<until);
+        };
+        target.send_to(&[3;53],peer).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        loop{
+            match f.poll_with_charge(|n|{assert_eq!(n,53);Err("denied")}){
+                Err("denied")=>break,
+                Ok(())=>{assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(2));},
+                Err(e)=>panic!("unexpected guard error: {e}"),
+            }
+        }
+        assert!(source.recv_from(&mut buf).is_err());
+        assert_eq!(f.stats().to_target_bytes,47);
+        assert_eq!(f.stats().to_source_bytes,0);
+    }
+    #[test]
+    fn real_source_slot_admission_and_idle_release(){
+        use std::cell::RefCell;
+        let slots=RefCell::new(Vec::<String>::new());
+        let target=UdpSocket::bind("127.0.0.1:0").unwrap();
+        target.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let a=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let b=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut f=UdpForwarder::bind("127.0.0.1:0".parse().unwrap(),target.local_addr().unwrap()).unwrap();
+        let addr=f.local_addr().unwrap();
+        let acquire=||{let mut s=slots.borrow_mut();if !s.is_empty(){return Ok(None)}s.push("slot".into());Ok(Some(Some("slot".into())))};
+        let release=|id:&str|{let mut s=slots.borrow_mut();assert_eq!(s.pop().as_deref(),Some(id));Ok(())};
+        let mut buf=[0;32];
+        a.send_to(b"a",addr).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        loop{f.poll_with_policy(|_|Ok(()),acquire,release).unwrap();if target.recv_from(&mut buf).is_ok(){break}assert!(Instant::now()<until);}
+        assert_eq!(buf[0],b'a');
+        a.send_to(b"x",addr).unwrap();
+        loop{f.poll_with_policy(|_|Ok(()),acquire,release).unwrap();if target.recv_from(&mut buf).is_ok(){break}assert!(Instant::now()<until);}
+        assert_eq!(buf[0],b'x');
+        b.send_to(b"b",addr).unwrap();
+        while f.stats().rejected_from_source==0{f.poll_with_policy(|_|Ok(()),acquire,release).unwrap();assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(2));}
+        assert!(target.recv_from(&mut buf).is_err());
+        assert_eq!(f.active_sources(),1);
+        f.expire_sources(Instant::now()+IDLE,release).unwrap();
+        assert!(slots.borrow().is_empty());
+        assert_eq!(f.active_sources(),0);
+        b.send_to(b"b",addr).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        loop{f.poll_with_policy(|_|Ok(()),acquire,release).unwrap();if target.recv_from(&mut buf).is_ok(){break}assert!(Instant::now()<until);}
+        assert_eq!(buf[0],b'b');
+        assert_eq!(slots.borrow().len(),1);
+    }
+    #[test]
+    fn probe_exemption_preserves_charge_and_rejects_other_sources(){
+        use std::cell::Cell;
+        let target=UdpSocket::bind("127.0.0.1:0").unwrap();
+        target.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let probe=UdpSocket::bind("127.0.0.1:0").unwrap();
+        probe.set_read_timeout(Some(Duration::from_millis(30))).unwrap();
+        let other=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut f=UdpForwarder::bind("127.0.0.1:0".parse().unwrap(),target.local_addr().unwrap()).unwrap();
+        let addr=f.local_addr().unwrap();
+        let charged=Cell::new(0usize);
+        let attempts=Cell::new(0usize);
+        let charge=|n|{charged.set(charged.get()+n);Ok(())};
+        let acquire=||{attempts.set(attempts.get()+1);Ok(None)};
+        let release=|_:&str| -> Result<(), &'static str>{panic!("unexpected slot")};
+        probe.send_to(b"probe",addr).unwrap();
+        let until=Instant::now()+Duration::from_secs(3);
+        let mut buf=[0;32];
+        let peer=loop{f.poll_with_probe(&probe,charge,acquire,release).unwrap();if let Ok((n,p))=target.recv_from(&mut buf){assert_eq!(&buf[..n],b"probe");break p}assert!(Instant::now()<until);};
+        assert_eq!(attempts.get(),0);
+        target.send_to(b"reply",peer).unwrap();
+        loop{f.poll_with_probe(&probe,charge,acquire,release).unwrap();if let Ok((n,_))=probe.recv_from(&mut buf){assert_eq!(&buf[..n],b"reply");break}assert!(Instant::now()<until);}
+        assert_eq!(charged.get(),10);
+        other.send_to(b"probe",addr).unwrap();
+        while attempts.get()==0{f.poll_with_probe(&probe,charge,acquire,release).unwrap();assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(2));}
+        assert!(target.recv_from(&mut buf).is_err());
+        assert_eq!(charged.get(),10);
+        assert_eq!(f.active_sources(),1);
+    }
     #[test]
     fn deterministic_rate_and_admission_bounds() {
         let now=Instant::now();
