@@ -1,9 +1,9 @@
-//! Independent relay control-plane client, Linux loopback preview only.
+//! Independent relay control-plane client: loopback preview or verified HTTPS.
 //! No database access, tunnel listener, or runtime assignment authority.
 #[cfg(target_os="linux")]
 mod linux {
     use serde::Deserialize;
-    use std::{fs::{self,OpenOptions},io::{Read,Write},net::{Ipv4Addr,SocketAddrV4,TcpStream},os::unix::fs::{MetadataExt,OpenOptionsExt,PermissionsExt},path::Path,time::{Duration,Instant}};
+    use std::{fs::{self,OpenOptions},io::{Read,Write},net::{Ipv4Addr,SocketAddrV4,TcpStream},os::unix::fs::{MetadataExt,OpenOptionsExt,PermissionsExt},path::{Path,PathBuf},process::{Command,Stdio},time::{Duration,Instant}};
     const DEADLINE:Duration=Duration::from_secs(4);
     const PERIOD:Duration=Duration::from_secs(3);
     const MAX_RESPONSE:usize=8192;
@@ -14,14 +14,18 @@ mod linux {
     #[serde(deny_unknown_fields)]
     struct Identity{node_id:String,generation:i64}
 
-    fn private_token(dir:&Path)->Result<String>{
+    fn private_file(dir:&Path,name:&str)->Result<fs::File>{
         let m=fs::symlink_metadata(dir).map_err(|_|Failure::Protocol)?;
         let uid=unsafe{libc::geteuid()};
         if !m.is_dir()||m.uid()!=uid||m.permissions().mode()&0o777!=0o700{return Err(Failure::Protocol)}
         let file=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC)
-            .open(dir.join("relay.token")).map_err(|_|Failure::Protocol)?;
+            .open(dir.join(name)).map_err(|_|Failure::Protocol)?;
         let m=file.metadata().map_err(|_|Failure::Protocol)?;
         if !m.is_file()||m.uid()!=uid||m.nlink()!=1||m.permissions().mode()&0o777!=0o600{return Err(Failure::Protocol)}
+        Ok(file)
+    }
+    fn private_token(dir:&Path)->Result<String>{
+        let file=private_file(dir,"relay.token")?;
         let mut raw=String::new();
         file.take(74).read_to_string(&mut raw).map_err(|_|Failure::Protocol)?;
         let token=raw.strip_suffix('\n').unwrap_or(&raw);
@@ -32,7 +36,64 @@ mod linux {
     fn remaining(end:Instant)->Result<Duration>{
         end.checked_duration_since(Instant::now()).filter(|d|!d.is_zero()).ok_or(Failure::Transient)
     }
-    fn request(port:u16,token:&str,path:&str,body:Option<&str>)->Result<(u16,Vec<u8>)>{
+    enum Endpoint{
+        Loopback(u16),
+        Tls{host:String,port:u16,dir:PathBuf},
+    }
+    fn hostname(s:&str)->bool{
+        !s.is_empty()&&s.len()<=253&&s.split('.').all(|label|!label.is_empty()&&label.len()<=63&&
+            !label.starts_with('-')&&!label.ends_with('-')&&label.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'))
+    }
+    fn tls_request(host:&str,port:u16,dir:&Path,token:&str,path:&str,body:Option<&str>)->Result<(u16,Vec<u8>)>{
+        let ca=private_file(dir,"center-ca.pem")?;
+        if !(1..=65536).contains(&ca.metadata().map_err(|_|Failure::Protocol)?.len()){return Err(Failure::Protocol)}
+        let url=format!("https://{host}:{port}{path}");
+        let mut cmd=Command::new("/usr/bin/curl");
+        // Explicit private trust store, no default config, proxy or downgrade.
+        cmd.env_clear().args(["--disable","--silent","--proto","=https","--http1.1","--tlsv1.2",
+            "--noproxy","*","--connect-timeout","3","--max-time","4","--max-filesize","8192",
+            "--write-out","\n%{http_code}","--config","-","--cacert"])
+            .arg(dir.join("center-ca.pem")).arg("--capath").arg(dir)
+            .arg("--request").arg(if body.is_some(){"POST"}else{"GET"})
+            .args(["--header","Content-Type: application/json","--header","Connection: close"]);
+        if let Some(payload)=body{cmd.arg("--data-binary").arg(payload);}
+        let mut child=cmd.arg("--url").arg(url).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().map_err(|_|Failure::Protocol)?;
+        // Credential only in stdin, never argv, env or diagnostics.
+        let sent=child.stdin.take().ok_or(Failure::Protocol).and_then(|mut input|
+            writeln!(input,"header = \"Authorization: Bearer {token}\"").map_err(|_|Failure::Transient));
+        if let Err(e)=sent{let _=child.kill();let _=child.wait();return Err(e)}
+        let mut raw=Vec::new();
+        let read=child.stdout.take().ok_or(Failure::Protocol).and_then(|out|
+            out.take((MAX_RESPONSE+5) as u64).read_to_end(&mut raw).map_err(|_|Failure::Transient));
+        if read.is_err()||raw.len()>MAX_RESPONSE+4{
+            let _=child.kill();let _=child.wait();return Err(Failure::Protocol)
+        }
+        let status=child.wait().map_err(|_|Failure::Transient)?;
+        if !status.success(){
+            return Err(match status.code(){
+                Some(5|6|7|18|28|52|55|56)=>Failure::Transient,
+                _=>Failure::Protocol,
+            })
+        }
+        if raw.len()<4{return Err(Failure::Protocol)}
+        let split=raw.len()-4;
+        if raw[split]!=b'\n'{return Err(Failure::Protocol)}
+        let code=std::str::from_utf8(&raw[split+1..]).map_err(|_|Failure::Protocol)?.parse::<u16>().map_err(|_|Failure::Protocol)?;
+        if code==401||code==403{return Err(Failure::Denied)}
+        if matches!(code,429|500|502|503|504){return Err(Failure::Transient)}
+        if !matches!(code,200|204){return Err(Failure::Protocol)}
+        raw.truncate(split);
+        if code==204&&!raw.is_empty(){return Err(Failure::Protocol)}
+        Ok((code,raw))
+    }
+    fn request(endpoint:&Endpoint,token:&str,path:&str,body:Option<&str>)->Result<(u16,Vec<u8>)>{
+        match endpoint{
+            Endpoint::Loopback(port)=>loopback_request(*port,token,path,body),
+            Endpoint::Tls{host,port,dir}=>tls_request(host,*port,dir,token,path,body),
+        }
+    }
+    fn loopback_request(port:u16,token:&str,path:&str,body:Option<&str>)->Result<(u16,Vec<u8>)>{
         let end=Instant::now()+DEADLINE;
         let addr=SocketAddrV4::new(Ipv4Addr::LOCALHOST,port);
         let mut stream=TcpStream::connect_timeout(&addr.into(),remaining(end)?).map_err(|_|Failure::Transient)?;
@@ -76,29 +137,38 @@ mod linux {
         if length.unwrap_or(0)!=data.len()||code==204&&!data.is_empty(){return Err(Failure::Protocol)}
         Ok((code,data.to_vec()))
     }
-    fn heartbeat(port:u16,token:&str,node:&str,generation:i64,capacity:i64)->Result<()>{
-        let (code,data)=request(port,token,"/api/v1/relay/identity",None)?;
+    fn heartbeat(endpoint:&Endpoint,token:&str,node:&str,generation:i64,capacity:i64)->Result<()>{
+        let (code,data)=request(endpoint,token,"/api/v1/relay/identity",None)?;
         if code!=200{return Err(Failure::Protocol)}
         let id:Identity=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
         if id.node_id!=node||id.generation!=generation{return Err(Failure::Denied)}
         let payload=serde_json::json!({"protocol_version":1,"generation":generation,"capacity":capacity}).to_string();
-        let (code,data)=request(port,token,"/api/v1/relay/heartbeat",Some(&payload))?;
+        let (code,data)=request(endpoint,token,"/api/v1/relay/heartbeat",Some(&payload))?;
         if code!=204||!data.is_empty(){return Err(Failure::Protocol)}
         Ok(())
     }
     pub(super) fn run()->Result<()>{
         let args:Vec<_>=std::env::args_os().skip(1).collect();
-        if args.len()!=5{return Err(Failure::Protocol)}
-        let arg=|i:usize|args[i].to_str().ok_or(Failure::Protocol);
-        let port:u16=arg(1)?.parse().map_err(|_|Failure::Protocol)?;
-        let node=arg(2)?;
-        let generation:i64=arg(3)?.parse().map_err(|_|Failure::Protocol)?;
-        let capacity:i64=arg(4)?.parse().map_err(|_|Failure::Protocol)?;
+        let arg=|i:usize|args.get(i).and_then(|a|a.to_str()).ok_or(Failure::Protocol);
+        let (endpoint,dir,index,port)=if args.len()==7&&arg(0)?=="--tls"{
+            let host=arg(2)?;
+            if !hostname(host){return Err(Failure::Protocol)}
+            let port:u16=arg(3)?.parse().map_err(|_|Failure::Protocol)?;
+            private_file(Path::new(&args[1]),"relay.token")?;
+            let dir=fs::canonicalize(Path::new(&args[1])).map_err(|_|Failure::Protocol)?;
+            (Endpoint::Tls{host:host.into(),port,dir:dir.clone()},dir,4,port)
+        }else if args.len()==5{
+            let port:u16=arg(1)?.parse().map_err(|_|Failure::Protocol)?;
+            (Endpoint::Loopback(port),PathBuf::from(&args[0]),2,port)
+        }else{return Err(Failure::Protocol)};
+        let node=arg(index)?;
+        let generation:i64=arg(index+1)?.parse().map_err(|_|Failure::Protocol)?;
+        let capacity:i64=arg(index+2)?.parse().map_err(|_|Failure::Protocol)?;
         if port==0||node.len()!=32||!node.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||generation<1||!(0..=65536).contains(&capacity){return Err(Failure::Protocol)}
-        let token=private_token(Path::new(&args[0]))?;
+        let token=private_token(&dir)?;
         let mut online=false;
         loop{
-            match heartbeat(port,&token,node,generation,capacity){
+            match heartbeat(&endpoint,&token,node,generation,capacity){
                 Ok(())=>{if !online{println!("relay control connected");online=true;}},
                 Err(Failure::Transient)=>{if online{eprintln!("relay control unavailable");online=false;}},
                 Err(e)=>return Err(e),
@@ -111,6 +181,6 @@ fn main(){
     #[cfg(target_os="linux")]
     if linux::run().is_ok(){return}
     // Fixed diagnostics only, never paths, credentials or response bodies.
-    eprintln!("relay control stopped; Linux loopback preview usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity>");
+    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity>");
     std::process::exit(1);
 }

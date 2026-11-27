@@ -349,6 +349,12 @@ REQUIRED["management-v09"] = {
         "real_node_health_capacity_and_generation",
         "real_node_policy_restore_revokes_snapshot_credentials",
     ],
+    "relay-tls.json": [
+        "real_tls_three_relay_processes_and_restricted_ingress",
+        "real_tls_untrusted_ca_hostname_and_private_ca_rejected",
+        "real_tls_redirect_no_plaintext_or_proxy_fallback",
+        "real_tls_relay_revocation_and_no_credential_diagnostics",
+    ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",
         "real_relay_control_center_restart_recovery",

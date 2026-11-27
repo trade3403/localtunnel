@@ -8,6 +8,7 @@ on:
       - 'apps/admin/**'
       - 'tests/verify_v04_evidence.py'
       - 'docs/v0.9.md'
+      - 'deploy/relay-control-nginx.conf.example'
       - '.github/workflows/v04-management.yml'
   workflow_dispatch:
 permissions:
@@ -61,6 +62,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y dnsutils nginx curl openssl
+      - name: Real verified TLS relay control and restricted ingress
+        run: python3 crates/server/tests/relay_tls_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-tls.json
       - name: Real node inventory and DNS TXT proof lifecycle
         run: python3 crates/server/tests/domains_e2e.py crates/server/target/release/localtunnel-server management-evidence/domains.json
       - name: Build existing core CLI for preview integration
