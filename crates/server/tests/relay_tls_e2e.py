@@ -46,7 +46,8 @@ try:
             p=subprocess.run([str(exe),args[0],str(center),*map(str,args[1:])],input=None if data is None else json.dumps(data),text=True,capture_output=True,timeout=25)
             assert p.returncode==0,"operator command failed"
             return p.stdout.strip()
-        cmd("--init-admin",data={"username":"owner","password":secrets.token_hex(24)})
+        password=secrets.token_hex(24)
+        cmd("--init-admin",data={"username":"owner","password":password})
         nodes=[cmd("--add-node","TLS relay "+str(i)) for i in range(3)]
         tokens.extend(cmd("--relay-issue",n) for n in nodes)
         p=subprocess.Popen([str(exe),str(center),"0"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
@@ -185,6 +186,51 @@ try:
         assert not any(t in line for t in tokens for line in observed)
         assert live[0].poll() is None
         report["real_relay_process_live_policy_revision_sync"]=True
+        # Authorize an actual TLS node to verify only a fixed grant preview.
+        # The owner API stays on loopback; the node gets exact opaque IDs.
+        def admin(path,data,token=None,status=200):
+            headers={"Content-Type":"application/json"}
+            if token:headers["Authorization"]="Bearer "+token
+            req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/"+path,headers=headers,
+                method="POST",data=None if data is None else json.dumps(data).encode())
+            with urllib.request.urlopen(req,timeout=4) as r:
+                assert r.status==status
+                return json.load(r)
+        owner=admin("auth/login",{"username":"owner","password":password})["access_token"]
+        tokens.append(owner)
+        code=admin("devices/pairing-code",None,owner)["pairing_code"]
+        device=admin("devices/enroll",{"pairing_code":code,"name":"TLS grant fixture"},status=201)["id"]
+        cmd("--set-node-policy",nodes[1],1,8,"east","active")
+        alloc=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":device,"node_id":nodes[1],
+            "protocol":"tcp","local_port":8080,"bind_port":20000},owner,201)
+        grant=admin("allocations/"+alloc["id"]+"/grant",{"expected_generation":1,"expected_mapping_revision":1},owner,201)
+        def verify(i=1,grant_id=grant["id"],generation=grant["generation"],mapping=grant["mapping_id"]):
+            return subprocess.Popen([str(relay),"--verify-grant",str(dirs[i]),"localhost",str(tp),nodes[i],"1",str(i+5),
+                alloc["id"],mapping,str(grant["mapping_revision"]),str(generation),grant_id],
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+        good=verify();children.append(good)
+        with selectors.DefaultSelector() as sel:
+            sel.register(good.stdout,selectors.EVENT_READ);assert sel.select(8)
+        assert good.stdout.readline().strip()=="relay grant preview verified"
+        for bad in (verify(grant_id=secrets.token_hex(16)),verify(mapping=secrets.token_hex(16)),verify(i=0),verify(generation=3)):
+            children.append(bad);fails(bad)
+            assert "relay grant preview verified" not in bad.stdout.read()
+        report["real_tls_node_exact_grant_validation"]=True
+        out,err=good.communicate(timeout=20)
+        assert good.returncode==0 and out.strip()=="relay grant preview expired"
+        assert not any(t in (out+err) for t in tokens)
+        # Wait on the actual database UTC deadline, not the earlier
+        # conservative node observation deadline.
+        def expired():
+            with sqlite3.connect(center/"control.sqlite3") as db:
+                return db.execute("SELECT unixepoch()>=expires_at FROM relay_grants WHERE id=?",(grant["id"],)).fetchone()==(1,)
+        wait(expired,5)
+        stale=verify();children.append(stale);fails(stale)
+        assert "relay grant preview verified" not in stale.stdout.read()
+        with sqlite3.connect(center/"control.sqlite3") as db:
+            assert db.execute("SELECT count(*) FROM relay_grants").fetchone()==(1,)
+            assert db.execute("SELECT generation,state FROM relay_allocations WHERE id=?",(alloc["id"],)).fetchone()==(2,"reserved")
+        report["real_tls_node_conservative_expiry_and_restart_rejection"]=True
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
         assert request("/api/v1/relay/identity",tokens[1])[0]==401
@@ -196,4 +242,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==6 and all(report.values())
+assert len(report)==8 and all(report.values())

@@ -361,6 +361,8 @@ REQUIRED["management-v09"] = {
         "real_tls_relay_revocation_and_no_credential_diagnostics",
         "real_versioned_control_atomic_policy_and_rejected_mutations",
         "real_relay_process_live_policy_revision_sync",
+        "real_tls_node_exact_grant_validation",
+        "real_tls_node_conservative_expiry_and_restart_rejection",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",

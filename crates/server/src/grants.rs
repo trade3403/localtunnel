@@ -13,6 +13,8 @@ const INTERNAL:Failure=(StatusCode::SERVICE_UNAVAILABLE,"grant service unavailab
 const FIELDS:&str="id,allocation_id,mapping_id,mapping_revision,node_id,node_generation,generation,policy_revision,device_revision,entitlement_revision,issued_at,expires_at,revoked_at";
 #[derive(Serialize,sqlx::FromRow)]
 struct Grant{id:String,allocation_id:String,mapping_id:String,mapping_revision:i64,node_id:String,node_generation:i64,generation:i64,policy_revision:i64,device_revision:i64,entitlement_revision:i64,issued_at:i64,expires_at:i64,revoked_at:Option<i64>}
+#[derive(sqlx::FromRow)]
+struct Observation{#[sqlx(flatten)] grant:Grant,server_time:i64}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Issue{expected_generation:i64,expected_mapping_revision:i64}
@@ -76,7 +78,7 @@ async fn fetch(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Fetc
     if c.protocol_version!=1||!hex_id(&c.allocation_id)||!hex_id(&c.mapping_id)||!hex_id(&c.node_id)||!hex_id(&c.nonce)||c.mapping_revision<1||c.node_generation<1||c.generation<2{return Err(BAD)}
     // Exact identity plus current state in one read. No extension, no
     // reissuance. A stale observation never frees the port.
-    let row=sqlx::query_as::<_,Grant>("SELECT g.* FROM relay_grants g JOIN relay_allocations a ON a.id=g.allocation_id AND a.live_mapping_id=g.mapping_id AND a.generation=g.generation AND a.state='reserved'
+    let row=sqlx::query_as::<_,Observation>("SELECT g.*,unixepoch() AS server_time FROM relay_grants g JOIN relay_allocations a ON a.id=g.allocation_id AND a.live_mapping_id=g.mapping_id AND a.generation=g.generation AND a.state='reserved'
         JOIN mappings m ON m.id=g.mapping_id AND m.revision=g.mapping_revision AND m.node_id=g.node_id AND m.owner_id=a.owner_id AND m.enabled=0
         JOIN devices d ON d.id=m.device_id AND d.owner_id=m.owner_id AND d.revision=g.device_revision
         JOIN users u ON u.id=m.owner_id JOIN nodes n ON n.id=g.node_id AND n.policy_revision=g.policy_revision
@@ -92,5 +94,5 @@ async fn fetch(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Fetc
         AND p.max_bandwidth_bps IS NULL AND p.max_monthly_bytes IS NULL AND p.max_concurrent_connections IS NULL")
         .bind(c.allocation_id).bind(c.mapping_id).bind(c.mapping_revision).bind(c.node_id).bind(c.node_generation).bind(c.generation).bind(credential)
         .fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
-    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":"authorization_preview_only","grant":row}))))
+    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":"authorization_preview_only","server_time":row.server_time,"grant":row.grant}))))
 }

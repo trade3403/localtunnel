@@ -100,7 +100,8 @@ try:
             def fetch(status=200,token=tokens[0],data=payload):
                 return call(base,"relay/grant",status,token,"POST",data)[1]
             response=fetch()
-            assert response=={"protocol_version":1,"nonce":payload["nonce"],"scope":"authorization_preview_only","grant":grant}
+            assert grant["issued_at"]<=response["server_time"]<grant["expires_at"]
+            assert {k:v for k,v in response.items() if k!="server_time"}=={"protocol_version":1,"nonce":payload["nonce"],"scope":"authorization_preview_only","grant":grant}
             fetch(401,tokens[1]);fetch(401,owner)
             fetch(401,data=dict(payload,mapping_revision=2))
             fetch(401,data=dict(payload,generation=3))

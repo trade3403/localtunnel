@@ -167,10 +167,97 @@ mod linux {
         }
         Ok(p)
     }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct GrantResponse{protocol_version:i64,nonce:String,scope:String,server_time:i64,grant:Grant}
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Grant{
+        id:String,allocation_id:String,mapping_id:String,mapping_revision:i64,node_id:String,node_generation:i64,
+        generation:i64,policy_revision:i64,device_revision:i64,entitlement_revision:i64,issued_at:i64,expires_at:i64,revoked_at:Option<i64>,
+    }
+    struct Expected<'a>{id:&'a str,allocation:&'a str,mapping:&'a str,revision:i64,generation:i64}
+    fn hex_id(s:&str)->bool{s.len()==32&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
+    fn validate_grant(reply:&GrantResponse,nonce:&str,policy:&Policy,expected:&Expected<'_>,started:Instant)->Result<Instant>{
+        let g=&reply.grant;
+        if reply.protocol_version!=1||reply.nonce!=nonce||reply.scope!="authorization_preview_only"||
+            g.id!=expected.id||g.allocation_id!=expected.allocation||g.mapping_id!=expected.mapping||
+            g.mapping_revision!=expected.revision||g.generation!=expected.generation||
+            g.node_id!=policy.node_id||g.node_generation!=policy.generation||g.policy_revision!=policy.policy_revision||
+            policy.policy_mode!="active"||g.device_revision<1||g.entitlement_revision<1||g.revoked_at.is_some()||
+            g.issued_at<1||g.issued_at.checked_add(15)!=Some(g.expires_at)||
+            reply.server_time<g.issued_at||reply.server_time<policy.received_at||reply.server_time>=g.expires_at{
+            return Err(Failure::Denied)
+        }
+        // Start at the request send time, not the response arrival time.
+        // Deduct one second for integer UTC quantization. This conservative
+        // local observation deadline cannot be extended by a slow response.
+        let seconds=g.expires_at.checked_sub(reply.server_time).and_then(|n|n.checked_sub(1)).filter(|n|*n>0).ok_or(Failure::Denied)?;
+        let deadline=started.checked_add(Duration::from_secs(seconds as u64)).ok_or(Failure::Protocol)?;
+        if deadline<=Instant::now(){return Err(Failure::Denied)}
+        Ok(deadline)
+    }
+    fn verify_grant(endpoint:&Endpoint,token:&str,node:&str,generation:i64,capacity:i64,expected:&Expected<'_>)->Result<()>{
+        // This mode is intentionally TLS only; never load cached grants.
+        if !matches!(endpoint,Endpoint::Tls{..}){return Err(Failure::Protocol)}
+        let policy=synchronize(endpoint,token,node,generation,capacity,None)?;
+        if policy.policy_mode!="active"||policy.approved_capacity<1||capacity<1{return Err(Failure::Denied)}
+        let mut bytes=[0u8;16];
+        OsRng.try_fill_bytes(&mut bytes).map_err(|_|Failure::Protocol)?;
+        let nonce=hex::encode(bytes);
+        let payload=serde_json::json!({"protocol_version":1,"allocation_id":expected.allocation,"mapping_id":expected.mapping,
+            "mapping_revision":expected.revision,"node_id":node,"node_generation":generation,"generation":expected.generation,"nonce":nonce}).to_string();
+        let started=Instant::now();
+        let (code,data)=request(endpoint,token,"/api/v1/relay/grant",Some(&payload))?;
+        if code!=200{return Err(Failure::Protocol)}
+        let reply:GrantResponse=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
+        let deadline=validate_grant(&reply,&nonce,&policy,expected,started)?;
+        println!("relay grant preview verified");
+        // Only a local, non-executable observation; no listening socket,
+        // renewal, cache, business authority or ability to release a port.
+        while let Some(left)=deadline.checked_duration_since(Instant::now()){
+            if left.is_zero(){break}
+            std::thread::sleep(left.min(Duration::from_millis(100)));
+        }
+        println!("relay grant preview expired");
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod grant_tests{
+        use super::*;
+        #[test]
+        fn exact_binding_and_conservative_deadline(){
+            let id="a".repeat(32);let allocation="b".repeat(32);let mapping="c".repeat(32);let node="d".repeat(32);
+            let expected=Expected{id:&id,allocation:&allocation,mapping:&mapping,revision:1,generation:2};
+            let policy=Policy{node_id:node.clone(),generation:1,policy_revision:3,approved_capacity:4,region:"east".into(),policy_mode:"active".into(),received_at:100};
+            let mut reply=GrantResponse{protocol_version:1,nonce:"nonce".into(),scope:"authorization_preview_only".into(),server_time:101,
+                grant:Grant{id:id.clone(),allocation_id:allocation.clone(),mapping_id:mapping.clone(),mapping_revision:1,node_id:node,node_generation:1,generation:2,policy_revision:3,device_revision:2,entitlement_revision:1,issued_at:100,expires_at:115,revoked_at:None}};
+            // Keep the borrowed expected id separate from the reply storage.
+            let start=Instant::now();
+            assert_eq!(validate_grant(&reply,"nonce",&policy,&expected,start).unwrap(),start+Duration::from_secs(13));
+            assert!(validate_grant(&reply,"wrong",&policy,&expected,start).is_err());
+            reply.grant.generation=1;
+            assert!(validate_grant(&reply,"nonce",&policy,&expected,start).is_err());
+            reply.grant.generation=2;
+            reply.grant.policy_revision=2;
+            assert!(validate_grant(&reply,"nonce",&policy,&expected,start).is_err());
+            reply.grant.policy_revision=3;
+            reply.grant.revoked_at=Some(102);
+            assert!(validate_grant(&reply,"nonce",&policy,&expected,start).is_err());
+            reply.grant.revoked_at=None;
+            reply.server_time=114;
+            assert!(validate_grant(&reply,"nonce",&policy,&expected,start).is_err());
+            reply.server_time=101;
+            let past=start.checked_sub(Duration::from_secs(14)).unwrap();
+            assert!(validate_grant(&reply,"nonce",&policy,&expected,past).is_err());
+        }
+    }
     pub(super) fn run()->Result<()>{
         let args:Vec<_>=std::env::args_os().skip(1).collect();
         let arg=|i:usize|args.get(i).and_then(|a|a.to_str()).ok_or(Failure::Protocol);
-        let (endpoint,dir,index,port)=if args.len()==7&&arg(0)?=="--tls"{
+        let verify=args.len()==12&&arg(0)?=="--verify-grant";
+        let (endpoint,dir,index,port)=if (args.len()==7&&arg(0)?=="--tls")||verify{
             let host=arg(2)?;
             if !hostname(host){return Err(Failure::Protocol)}
             let port:u16=arg(3)?.parse().map_err(|_|Failure::Protocol)?;
@@ -186,6 +273,12 @@ mod linux {
         let capacity:i64=arg(index+2)?.parse().map_err(|_|Failure::Protocol)?;
         if port==0||node.len()!=32||!node.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||generation<1||!(0..=65536).contains(&capacity){return Err(Failure::Protocol)}
         let token=private_token(&dir)?;
+        if verify{
+            let expected=Expected{allocation:arg(7)?,mapping:arg(8)?,revision:arg(9)?.parse().map_err(|_|Failure::Protocol)?,
+                generation:arg(10)?.parse().map_err(|_|Failure::Protocol)?,id:arg(11)?};
+            if !hex_id(expected.id)||!hex_id(expected.allocation)||!hex_id(expected.mapping)||expected.revision<1||expected.generation<2{return Err(Failure::Protocol)}
+            return verify_grant(&endpoint,&token,node,generation,capacity,&expected)
+        }
         let mut online=false;
         let mut previous:Option<Policy>=None;
         loop{
@@ -208,6 +301,6 @@ fn main(){
     #[cfg(target_os="linux")]
     if linux::run().is_ok(){return}
     // Fixed diagnostics only, never paths, credentials or response bodies.
-    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity>");
+    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id>");
     std::process::exit(1);
 }
