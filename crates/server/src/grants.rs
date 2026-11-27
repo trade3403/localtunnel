@@ -46,7 +46,7 @@ async fn issue(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Heade
         JOIN relay_heartbeat h ON h.node_id=r.node_id AND h.generation=r.generation
         JOIN tenants t ON t.owner_id=a.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id
         WHERE a.id=? AND a.owner_id=? AND a.generation=? AND a.mapping_revision=? AND a.state='reserved'
-        AND m.enabled=0 AND ((m.protocol IN ('tcp','udp') AND m.domain_id IS NULL) OR (m.protocol='http' AND EXISTS(SELECT 1 FROM domains dom WHERE dom.id=m.domain_id AND dom.owner_id=m.owner_id AND dom.verification_token IS NOT NULL AND dom.verified_at BETWEEN unixepoch()-285 AND unixepoch()))) AND m.local_host='127.0.0.1' AND m.bind_port=a.bind_port
+        AND m.enabled=0 AND ((m.protocol IN ('tcp','udp') AND m.domain_id IS NULL) OR (m.protocol IN ('http','https') AND EXISTS(SELECT 1 FROM domains dom WHERE dom.id=m.domain_id AND dom.owner_id=m.owner_id AND dom.verification_token IS NOT NULL AND dom.verified_at BETWEEN unixepoch()-285 AND unixepoch()))) AND m.local_host='127.0.0.1' AND m.bind_port=a.bind_port
         AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND s.token_digest=? AND s.expires_at>unixepoch()
         AND n.enabled=1 AND n.policy_mode='active' AND r.token_digest IS NOT NULL AND h.received_at BETWEEN unixepoch()-15 AND unixepoch()
         AND (SELECT count(*) FROM mappings x WHERE x.node_id=n.id)<=min(n.approved_capacity,h.capacity)
@@ -86,7 +86,7 @@ async fn fetch(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Fetc
         JOIN relay_heartbeat h ON h.node_id=r.node_id AND h.generation=r.generation
         JOIN tenants t ON t.owner_id=a.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id AND e.revision=g.entitlement_revision JOIN commercial_plans p ON p.id=e.plan_id
         WHERE g.allocation_id=? AND g.mapping_id=? AND g.mapping_revision=? AND g.node_id=? AND g.node_generation=? AND g.generation=?
-        AND ((m.protocol IN ('tcp','udp') AND m.domain_id IS NULL) OR (m.protocol='http' AND EXISTS(SELECT 1 FROM domains dom WHERE dom.id=m.domain_id AND dom.owner_id=m.owner_id AND dom.verification_token IS NOT NULL AND dom.verified_at BETWEEN unixepoch()-285 AND unixepoch())))
+        AND ((m.protocol IN ('tcp','udp') AND m.domain_id IS NULL) OR (m.protocol IN ('http','https') AND EXISTS(SELECT 1 FROM domains dom WHERE dom.id=m.domain_id AND dom.owner_id=m.owner_id AND dom.verification_token IS NOT NULL AND dom.verified_at BETWEEN unixepoch()-285 AND unixepoch())))
         AND r.token_digest=? AND g.revoked_at IS NULL AND g.issued_at<=unixepoch() AND g.expires_at>unixepoch()
         AND n.enabled=1 AND n.policy_mode='active' AND d.enabled=1 AND u.enabled=1 AND u.role='admin'
         AND h.received_at BETWEEN unixepoch()-15 AND unixepoch()

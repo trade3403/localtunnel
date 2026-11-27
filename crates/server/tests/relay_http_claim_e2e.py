@@ -169,9 +169,49 @@ try:
                 assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
             assert "_localtunnel."+d["hostname"]+"." in queries
             report["real_http_proof_rotation_and_shared_transport_port_denial"]=True
+            # HTTPS requires its own exact leaf fingerprint and permit.
+            d3=domain("secure.example.test")
+            a3=allocation(20003,"https",d3)
+            grant(a3,409);verify(d3)
+            g3=grant(a3)
+            fp=secrets.token_hex(32)
+            def tls_intent(rp,gp,status=201,fingerprint=fp,token=owner):
+                return call(base,"allocations/"+a3["id"]+"/https-intent",status,token,"POST",
+                    {"grant_id":g3["id"],"expected_generation":2,"relay_port":rp,"gateway_port":gp,"certificate_sha256":fingerprint})[1]
+            intent(g3,31003,61003,409)
+            tls_intent(31000,61003,409)
+            tls_intent(31003,61000,409)
+            tls_intent(31003,61003,400,"z"*64)
+            tls_intent(31003,61003,409,token=other)
+            r=tls_intent(31003,61003)
+            assert r["certificate_sha256"]==fp and r["hostname"]==d3["hostname"]
+            q3=dict(payload(g3,d3["hostname"],31003,61003),certificate_sha256=fp)
+            def tls_claim(q,status=200,token=tokens[0]):
+                return call(base,"relay/https-claim",status,token,"POST",q)
+            claim(payload(g3,d3["hostname"],31003,61003),401)
+            tls_claim(dict(q3,certificate_sha256=secrets.token_hex(32)),401)
+            tls_claim(dict(q3,hostname="wrong.example.test"),401)
+            tls_claim(q3,401,tokens[1])
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                answers=list(pool.map(lambda _:tls_claim(q3,(200,401)),range(2)))
+            assert sorted(x[0] for x in answers)==[200,401]
+            result=next(x[1] for x in answers if x[0]==200)
+            assert result["scope"]=="https_loopback_start_claim" and result["nonce"]==q3["nonce"]
+            assert result["permit"]["certificate_sha256"]==fp and result["permit"]["hostname"]==d3["hostname"]
+            tls_claim(q3,401)
+            # Reverse direction port conflicts, across all protocol ledgers.
+            d4=domain("next.example.test");verify(d4)
+            a4=allocation(20004,"http",d4);g4=grant(a4)
+            intent(g4,31003,61004,409)
+            intent(g4,31004,61003,409)
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT count(*) FROM relay_https_intents WHERE claimed_at IS NOT NULL").fetchone()==(1,)
+                assert db.execute("SELECT count(*) FROM management_audit WHERE event='https.claimed'").fetchone()==(1,)
+                assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
+            report["real_https_certificate_fingerprint_exact_claim_and_port_isolation"]=True
         finally:
             stop(p);dns.shutdown();worker.join(timeout=3)
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==2 and all(report.values())
+assert len(report)==3 and all(report.values())

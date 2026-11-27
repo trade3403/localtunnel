@@ -340,6 +340,7 @@ REQUIRED["management-v09"] = {
     "relay-http-claim.json": [
         "real_http_dns_proof_exact_claim_and_protocol_isolation",
         "real_http_proof_rotation_and_shared_transport_port_denial",
+        "real_https_certificate_fingerprint_exact_claim_and_port_isolation",
     ],
     "relay-tcp-claim.json": [
         "real_tcp_explicit_intent_exact_claim_and_one_shot_race",

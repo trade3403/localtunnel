@@ -68,8 +68,9 @@ async fn intent_for(pool:SqlitePool,id:String,headers:HeaderMap,c:Intent,protoco
         AND EXISTS(SELECT 1 FROM admin_sessions s WHERE s.user_id=a.owner_id AND s.token_digest=? AND s.expires_at>unixepoch())
         AND NOT EXISTS(SELECT 1 FROM {other} x WHERE x.node_id=g.node_id AND x.relay_port=?)
         AND NOT EXISTS(SELECT 1 FROM relay_http_intents x WHERE x.node_id=g.node_id AND x.relay_port=?)
+        AND NOT EXISTS(SELECT 1 FROM relay_https_intents x WHERE x.node_id=g.node_id AND x.relay_port=?)
         ON CONFLICT DO NOTHING RETURNING grant_id,node_id,relay_port,bind_port,created_at,claimed_at");
-    let row=sqlx::query_as::<_,Record>(&query).bind(c.relay_port).bind(&id).bind(&c.grant_id).bind(c.expected_generation).bind(&owner).bind(token).bind(c.relay_port).bind(c.relay_port)
+    let row=sqlx::query_as::<_,Record>(&query).bind(c.relay_port).bind(&id).bind(&c.grant_id).bind(c.expected_generation).bind(&owner).bind(token).bind(c.relay_port).bind(c.relay_port).bind(c.relay_port)
         .fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or(CONFLICT)?;
     sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
         SELECT a.owner_id,?,g.mapping_id,g.mapping_revision,g.id,'pending' FROM relay_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")

@@ -54,8 +54,9 @@ async fn intent(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Head
       AND EXISTS(SELECT 1 FROM admin_sessions s WHERE s.user_id=a.owner_id AND s.token_digest=? AND s.expires_at>unixepoch())
       AND NOT EXISTS(SELECT 1 FROM relay_tcp_intents x WHERE x.node_id=g.node_id AND x.relay_port=?)
       AND NOT EXISTS(SELECT 1 FROM relay_udp_intents x WHERE x.node_id=g.node_id AND x.relay_port=?)
+      AND NOT EXISTS(SELECT 1 FROM relay_https_intents x WHERE x.node_id=g.node_id AND (x.relay_port=? OR x.gateway_port=?))
       ON CONFLICT DO NOTHING RETURNING grant_id,node_id,relay_port,bind_port,gateway_port,hostname,created_at,claimed_at");
-    let row=sqlx::query_as::<_,Record>(&query).bind(c.relay_port).bind(c.gateway_port).bind(id).bind(c.grant_id).bind(c.expected_generation).bind(owner).bind(token).bind(c.relay_port).bind(c.relay_port)
+    let row=sqlx::query_as::<_,Record>(&query).bind(c.relay_port).bind(c.gateway_port).bind(id).bind(c.grant_id).bind(c.expected_generation).bind(owner).bind(token).bind(c.relay_port).bind(c.relay_port).bind(c.relay_port).bind(c.gateway_port)
         .fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)?;
     if !valid_host(&row.hostname){return Err(CONFLICT)}
     sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
