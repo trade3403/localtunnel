@@ -46,7 +46,7 @@ async fn issue(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Heade
         JOIN relay_heartbeat h ON h.node_id=r.node_id AND h.generation=r.generation
         JOIN tenants t ON t.owner_id=a.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id JOIN commercial_plans p ON p.id=e.plan_id
         WHERE a.id=? AND a.owner_id=? AND a.generation=? AND a.mapping_revision=? AND a.state='reserved'
-        AND m.enabled=0 AND m.protocol='tcp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.bind_port=a.bind_port
+        AND m.enabled=0 AND m.protocol IN ('tcp','udp') AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.bind_port=a.bind_port
         AND d.enabled=1 AND u.enabled=1 AND u.role='admin' AND s.token_digest=? AND s.expires_at>unixepoch()
         AND n.enabled=1 AND n.policy_mode='active' AND r.token_digest IS NOT NULL AND h.received_at BETWEEN unixepoch()-15 AND unixepoch()
         AND (SELECT count(*) FROM mappings x WHERE x.node_id=n.id)<=min(n.approved_capacity,h.capacity)

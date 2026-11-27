@@ -1,4 +1,4 @@
-//! Explicit loopback TCP start intent and one-shot claim; no worker yet.
+//! Protocol-specific loopback start intents and one-shot claims.
 use crate::{auth,relay};
 use axum::{extract::{DefaultBodyLimit,Path,State},http::{HeaderMap,StatusCode},response::Response,routing::post,Json,Router};
 use serde::{Deserialize,Serialize};
@@ -33,7 +33,7 @@ const CURRENT:&str="FROM relay_grants g JOIN relay_allocations a ON a.id=g.alloc
  JOIN relay_heartbeat h ON h.node_id=r.node_id AND h.generation=r.generation
  JOIN tenants t ON t.owner_id=a.owner_id JOIN tenant_entitlements e ON e.tenant_id=t.id AND e.revision=g.entitlement_revision JOIN commercial_plans p ON p.id=e.plan_id
  WHERE g.revoked_at IS NULL AND g.issued_at<=unixepoch() AND g.expires_at>unixepoch()+2
- AND m.enabled=0 AND m.protocol='tcp' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.bind_port=a.bind_port
+ AND m.enabled=0 AND m.protocol='{protocol}' AND m.domain_id IS NULL AND m.local_host='127.0.0.1' AND m.bind_port=a.bind_port
  AND n.enabled=1 AND n.policy_mode='active' AND r.token_digest IS NOT NULL AND d.enabled=1 AND u.enabled=1 AND u.role='admin'
  AND h.received_at BETWEEN unixepoch()-15 AND unixepoch()
  AND (SELECT count(*) FROM mappings x WHERE x.node_id=n.id)<=min(n.approved_capacity,h.capacity)
@@ -44,47 +44,68 @@ const CURRENT:&str="FROM relay_grants g JOIN relay_allocations a ON a.id=g.alloc
 pub fn routes(pool:SqlitePool)->Router{
     Router::new().route("/api/v1/allocations/{id}/tcp-intent",post(intent))
         .route("/api/v1/relay/tcp-claim",post(claim))
+        .route("/api/v1/allocations/{id}/udp-intent",post(udp_intent))
+        .route("/api/v1/relay/udp-claim",post(udp_claim))
         .layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 async fn intent(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Intent>)->Result<Response,Failure>{
+    intent_for(pool,id,headers,c,"tcp").await
+}
+async fn udp_intent(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Intent>)->Result<Response,Failure>{
+    intent_for(pool,id,headers,c,"udp").await
+}
+async fn intent_for(pool:SqlitePool,id:String,headers:HeaderMap,c:Intent,protocol:&'static str)->Result<Response,Failure>{
+    let table=if protocol=="tcp"{"relay_tcp_intents"}else{"relay_udp_intents"};
+    let other=if protocol=="tcp"{"relay_udp_intents"}else{"relay_tcp_intents"};
+    let current=CURRENT.replace("{protocol}",protocol);
     let token=auth::bearer(&headers)?;
     let owner=auth::identify(&pool,&token).await?.id;
     if !hex_id(&id)||!hex_id(&c.grant_id)||c.expected_generation<2||!(30000..=59999).contains(&c.relay_port){return Err(BAD)}
     let mut tx=pool.begin().await.map_err(db_error)?;
-    let query=format!("INSERT INTO relay_tcp_intents(grant_id,node_id,relay_port,bind_port,created_at)
-        SELECT g.id,g.node_id,?,m.bind_port,unixepoch() {CURRENT}
+    let query=format!("INSERT INTO {table}(grant_id,node_id,relay_port,bind_port,created_at)
+        SELECT g.id,g.node_id,?,m.bind_port,unixepoch() {current}
         AND g.allocation_id=? AND g.id=? AND g.generation=? AND a.owner_id=?
         AND EXISTS(SELECT 1 FROM admin_sessions s WHERE s.user_id=a.owner_id AND s.token_digest=? AND s.expires_at>unixepoch())
+        AND NOT EXISTS(SELECT 1 FROM {other} x WHERE x.node_id=g.node_id AND x.relay_port=?)
         ON CONFLICT DO NOTHING RETURNING grant_id,node_id,relay_port,bind_port,created_at,claimed_at");
-    let row=sqlx::query_as::<_,Record>(&query).bind(c.relay_port).bind(&id).bind(&c.grant_id).bind(c.expected_generation).bind(&owner).bind(token)
+    let row=sqlx::query_as::<_,Record>(&query).bind(c.relay_port).bind(&id).bind(&c.grant_id).bind(c.expected_generation).bind(&owner).bind(token).bind(c.relay_port)
         .fetch_optional(&mut *tx).await.map_err(db_error)?.ok_or(CONFLICT)?;
     sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
-        SELECT a.owner_id,'tcp.intent',g.mapping_id,g.mapping_revision,g.id,'pending' FROM relay_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")
-        .bind(&row.grant_id).execute(&mut *tx).await.map_err(db_error)?;
+        SELECT a.owner_id,?,g.mapping_id,g.mapping_revision,g.id,'pending' FROM relay_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")
+        .bind(format!("{protocol}.intent")).bind(&row.grant_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     Ok(auth::uncached((StatusCode::CREATED,Json(row))))
 }
 async fn claim(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Claim>)->Result<Response,Failure>{
+    claim_for(pool,headers,c,"tcp").await
+}
+async fn udp_claim(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Claim>)->Result<Response,Failure>{
+    claim_for(pool,headers,c,"udp").await
+}
+async fn claim_for(pool:SqlitePool,headers:HeaderMap,c:Claim,protocol:&'static str)->Result<Response,Failure>{
+    let table=if protocol=="tcp"{"relay_tcp_intents"}else{"relay_udp_intents"};
+    let current=CURRENT.replace("{protocol}",protocol);
     let credential=relay::digest(&headers)?;
     if c.protocol_version!=1||!hex_id(&c.grant_id)||!hex_id(&c.allocation_id)||!hex_id(&c.mapping_id)||!hex_id(&c.node_id)||!hex_id(&c.nonce)
         ||c.mapping_revision<1||c.node_generation<1||c.generation<2||!(30000..=59999).contains(&c.relay_port){return Err(BAD)}
     let mut tx=pool.begin().await.map_err(db_error)?;
-    let query=format!("UPDATE relay_tcp_intents SET claimed_at=unixepoch() WHERE grant_id=? AND node_id=? AND relay_port=? AND claimed_at IS NULL
-        AND EXISTS(SELECT 1 {CURRENT}
-          AND g.id=relay_tcp_intents.grant_id AND g.node_id=relay_tcp_intents.node_id AND m.bind_port=relay_tcp_intents.bind_port
+    let query=format!("UPDATE {table} SET claimed_at=unixepoch() WHERE grant_id=? AND node_id=? AND relay_port=? AND claimed_at IS NULL
+        AND EXISTS(SELECT 1 {current}
+          AND g.id={table}.grant_id AND g.node_id={table}.node_id AND m.bind_port={table}.bind_port
           AND g.allocation_id=? AND g.mapping_id=? AND g.mapping_revision=? AND g.node_generation=? AND g.generation=? AND r.token_digest=?)");
     let changed=sqlx::query(&query).bind(&c.grant_id).bind(&c.node_id).bind(c.relay_port).bind(&c.allocation_id).bind(&c.mapping_id)
         .bind(c.mapping_revision).bind(c.node_generation).bind(c.generation).bind(credential)
         .execute(&mut *tx).await.map_err(db_error)?;
     if changed.rows_affected()!=1{return Err(DENIED)}
-    let permit=sqlx::query_as::<_,Permit>("SELECT g.id AS grant_id,g.allocation_id,g.mapping_id,g.mapping_revision,g.node_id,g.node_generation,g.generation,g.policy_revision,
+    let permit_query=format!("SELECT g.id AS grant_id,g.allocation_id,g.mapping_id,g.mapping_revision,g.node_id,g.node_generation,g.generation,g.policy_revision,
         i.relay_port,i.bind_port,g.issued_at,g.expires_at,unixepoch() AS server_time,i.claimed_at
-        FROM relay_tcp_intents i JOIN relay_grants g ON g.id=i.grant_id WHERE i.grant_id=?")
+        FROM {table} i JOIN relay_grants g ON g.id=i.grant_id WHERE i.grant_id=?");
+    let permit=sqlx::query_as::<_,Permit>(&permit_query)
         .bind(&c.grant_id).fetch_one(&mut *tx).await.map_err(db_error)?;
     sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
-        SELECT a.owner_id,'tcp.claimed',g.mapping_id,g.mapping_revision,g.id,'claimed' FROM relay_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")
-        .bind(&c.grant_id).execute(&mut *tx).await.map_err(db_error)?;
+        SELECT a.owner_id,?,g.mapping_id,g.mapping_revision,g.id,'claimed' FROM relay_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")
+        .bind(format!("{protocol}.claimed")).bind(&c.grant_id).execute(&mut *tx).await.map_err(db_error)?;
     tx.commit().await.map_err(db_error)?;
     // Never replay a successful claim, even if the response was lost.
-    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":"tcp_loopback_start_claim","permit":permit}))))
+    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":format!("{protocol}_loopback_start_claim"),"permit":permit}))))
 }

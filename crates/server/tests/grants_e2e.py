@@ -79,7 +79,7 @@ try:
             issue(409,other)
             issue(401,tokens[0])
             issue(409,data=dict(issue_spec,expected_mapping_revision=2))
-            issue(409,allocation=b)
+            issue(409,allocation=b,data=dict(issue_spec,expected_mapping_revision=2))
             cmd(root,"--set-node-policy",nodes[0],2,8,"east","draining")
             beat(0)
             issue(409)

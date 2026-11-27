@@ -309,6 +309,87 @@ try:
             report["real_independent_tcp_engine_expiry_closes_ports"]=True
         finally:
             target.shutdown();target.server_close();worker.join(timeout=3)
+        # UDP uses a separate grant/intent/claim and independent service token.
+        udp_token=secrets.token_hex(32)
+        tokens.append(udp_token)
+        path=dirs[1]/"udp.token";path.write_text(udp_token+"\n");path.chmod(0o600)
+        udp_relay=free_range(30000,59999)
+        while udp_relay==relay_port:udp_relay=free_range(30000,59999)
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as target_udp:
+            target_udp.bind(("127.0.0.1",0));target_udp.settimeout(.2)
+            done=threading.Event()
+            def echo_udp():
+                while not done.is_set():
+                    try:
+                        body,peer=target_udp.recvfrom(4096)
+                        target_udp.sendto(body,peer)
+                    except socket.timeout:pass
+            worker=threading.Thread(target=echo_udp,daemon=True);worker.start()
+            try:
+                while True:
+                    udp_bind=free_range(20001,29999)
+                    if udp_bind==bind_port:continue
+                    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
+                        try:probe.bind(("127.0.0.1",udp_bind))
+                        except OSError:continue
+                    break
+                a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":device,"node_id":nodes[1],
+                    "protocol":"udp","local_port":target_udp.getsockname()[1],"bind_port":udp_bind},owner,201)
+                config=root/"udp-agent.toml"
+                subprocess.run([str(core_test.CLI),"client-udp-config",str(config),f"127.0.0.1:{udp_relay}",
+                    "m_"+a["mapping_id"],f"127.0.0.1:{target_udp.getsockname()[1]}"],
+                    env=dict(os.environ,LOCALTUNNEL_TOKEN=udp_token,LOCALTUNNEL_SERVER_PUBLIC_KEY=public),
+                    check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                g=admin("allocations/"+a["id"]+"/grant",{"expected_generation":1,"expected_mapping_revision":1},owner,201)
+                def intent_for(kind,port,status):
+                    data={"grant_id":g["id"],"expected_generation":g["generation"],"relay_port":port}
+                    try:admin("allocations/"+a["id"]+"/"+kind+"-intent",data,owner,status)
+                    except urllib.error.HTTPError as ex:assert ex.code==status
+                intent_for("tcp",udp_relay,409)
+                intent_for("udp",relay_port,409)
+                intent_for("udp",udp_relay,201)
+                def start_udp(kind="udp"):
+                    p=subprocess.Popen([str(relay),"--"+kind+"-preview",str(dirs[1]),"localhost",str(tp),nodes[1],"1","6",
+                        a["id"],a["mapping_id"],"1",str(g["generation"]),g["id"],str(udp_relay),str(udp_bind),str(engine)],
+                        stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                    children.append(p);return p
+                wrong=start_udp("tcp");fails(wrong)
+                assert "relay TCP engine started" not in wrong.stdout.read()
+                running=start_udp()
+                with selectors.DefaultSelector() as sel:
+                    sel.register(running.stdout,selectors.EVENT_READ);assert sel.select(5)
+                assert running.stdout.readline().strip()=="relay UDP engine started"
+                agent=subprocess.Popen([str(engine),str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,
+                    env=dict(os.environ,RUST_LOG="warn"))
+                children.append(agent)
+                def udp_transfer():
+                    with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as client:
+                        client.settimeout(.4)
+                        body=secrets.token_bytes(48)
+                        try:
+                            client.sendto(body,("127.0.0.1",udp_bind))
+                            return client.recvfrom(4096)[0]==body
+                        except OSError:return False
+                wait(udp_transfer,9)
+                assert running.poll() is None and agent.poll() is None
+                replay=start_udp();fails(replay)
+                assert "relay UDP engine started" not in replay.stdout.read()
+                report["real_independent_udp_datagrams_protocol_and_port_isolation"]=True
+                out,err=running.communicate(timeout=20)
+                assert running.returncode==0 and out.strip()=="relay UDP engine expired and stopped"
+                assert not any(t in out+err for t in tokens)
+                assert not udp_transfer()
+                with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as probe:
+                    probe.bind(("127.0.0.1",udp_bind))
+                with socket.socket() as probe:
+                    probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",udp_relay))!=0
+                assert not (dirs[1]/("udp-"+g["id"]+".toml")).exists()
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT claimed_at IS NOT NULL FROM relay_udp_intents WHERE grant_id=?",(g["id"],)).fetchone()==(1,)
+                    assert db.execute("SELECT count(*) FROM relay_tcp_intents WHERE grant_id=?",(g["id"],)).fetchone()==(0,)
+                report["real_independent_udp_expiry_closes_transport_and_datagram_port"]=True
+            finally:
+                done.set();worker.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
         assert request("/api/v1/relay/identity",tokens[1])[0]==401
@@ -320,4 +401,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==10 and all(report.values())
+assert len(report)==12 and all(report.values())

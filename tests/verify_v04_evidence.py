@@ -369,6 +369,8 @@ REQUIRED["management-v09"] = {
         "real_tls_node_conservative_expiry_and_restart_rejection",
         "real_independent_noise_tcp_transfer_and_one_shot_start",
         "real_independent_tcp_engine_expiry_closes_ports",
+        "real_independent_udp_datagrams_protocol_and_port_isolation",
+        "real_independent_udp_expiry_closes_transport_and_datagram_port",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",

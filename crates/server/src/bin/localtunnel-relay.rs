@@ -284,7 +284,7 @@ mod linux {
         }
     }
     impl Drop for Engine{fn drop(&mut self){let _=self.stop();}}
-    fn supervise_tcp(endpoint:&Endpoint,dir:&Path,token:&str,node:&str,generation:i64,capacity:i64,expected:&Expected<'_>,relay_port:u16,bind_port:u16,engine:&Path)->Result<()>{
+    fn supervise_tcp(protocol:&str,endpoint:&Endpoint,dir:&Path,token:&str,node:&str,generation:i64,capacity:i64,expected:&Expected<'_>,relay_port:u16,bind_port:u16,engine:&Path)->Result<()>{
         use std::os::unix::process::CommandExt;
         if !matches!(endpoint,Endpoint::Tls{..})||!(30000..=59999).contains(&relay_port)||!(20000..=29999).contains(&bind_port)||!engine.is_absolute(){return Err(Failure::Protocol)}
         let engine=fs::canonicalize(engine).map_err(|_|Failure::Protocol)?;
@@ -292,19 +292,23 @@ mod linux {
         // Trusted local operator provisions independent data-plane credentials.
         // Neither tenant nor relay-control credential is used as tunnel token.
         let private=secret_file(dir,"noise.private",noise_key)?;
-        let service_token=secret_file(dir,"tcp.token",|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)))?;
-        for port in [relay_port,bind_port]{
-            let _probe=std::net::TcpListener::bind((Ipv4Addr::LOCALHOST,port)).map_err(|_|Failure::Protocol)?;
+        let service_token=secret_file(dir,if protocol=="udp"{"udp.token"}else{"tcp.token"},|s|s.len()==64&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b)))?;
+        let _probe=std::net::TcpListener::bind((Ipv4Addr::LOCALHOST,relay_port)).map_err(|_|Failure::Protocol)?;
+        drop(_probe);
+        if protocol=="udp"{
+            let _probe=std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST,bind_port)).map_err(|_|Failure::Protocol)?;
+        }else{
+            let _probe=std::net::TcpListener::bind((Ipv4Addr::LOCALHOST,bind_port)).map_err(|_|Failure::Protocol)?;
         }
         // Exclusive private configuration file: a second invocation cannot
         // replace a running child's configuration. Retain on crash for review.
-        let path=dir.join(format!("tcp-{}.toml",expected.id));
+        let path=dir.join(format!("{protocol}-{}.toml",expected.id));
         let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC)
             .open(&path).map_err(|_|Failure::Protocol)?;
         struct Config(PathBuf);
         impl Drop for Config{fn drop(&mut self){let _=fs::remove_file(&self.0);}}
         let _config=Config(path.clone());
-        write!(file,"[server]\nbind_addr = \"127.0.0.1:{relay_port}\"\nheartbeat_interval = 5\n\n[server.transport]\ntype = \"noise\"\n\n[server.transport.noise]\npattern = \"Noise_NK_25519_ChaChaPoly_BLAKE2s\"\nlocal_private_key = \"{private}\"\n\n[server.services.m_{}]\ntype = \"tcp\"\ntoken = \"{service_token}\"\nbind_addr = \"127.0.0.1:{bind_port}\"\n",expected.mapping).map_err(|_|Failure::Protocol)?;
+        write!(file,"[server]\nbind_addr = \"127.0.0.1:{relay_port}\"\nheartbeat_interval = 5\n\n[server.transport]\ntype = \"noise\"\n\n[server.transport.noise]\npattern = \"Noise_NK_25519_ChaChaPoly_BLAKE2s\"\nlocal_private_key = \"{private}\"\n\n[server.services.m_{}]\ntype = \"{protocol}\"\ntoken = \"{service_token}\"\nbind_addr = \"127.0.0.1:{bind_port}\"\n",expected.mapping).map_err(|_|Failure::Protocol)?;
         file.sync_all().map_err(|_|Failure::Protocol)?;
         drop(file);
         let policy=synchronize(endpoint,token,node,generation,capacity,None)?;
@@ -316,11 +320,11 @@ mod linux {
             "mapping_revision":expected.revision,"node_id":node,"node_generation":generation,"generation":expected.generation,
             "relay_port":relay_port,"nonce":nonce}).to_string();
         let started=Instant::now();
-        let (code,data)=request(endpoint,token,"/api/v1/relay/tcp-claim",Some(&payload))?;
+        let (code,data)=request(endpoint,token,if protocol=="udp"{"/api/v1/relay/udp-claim"}else{"/api/v1/relay/tcp-claim"},Some(&payload))?;
         if code!=200{return Err(Failure::Protocol)}
         let reply:TcpClaim=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
         let p=reply.permit;
-        if reply.protocol_version!=1||reply.nonce!=nonce||reply.scope!="tcp_loopback_start_claim"||
+        if reply.protocol_version!=1||reply.nonce!=nonce||reply.scope!=format!("{protocol}_loopback_start_claim")||
             p.grant_id!=expected.id||p.allocation_id!=expected.allocation||p.mapping_id!=expected.mapping||
             p.mapping_revision!=expected.revision||p.generation!=expected.generation||p.node_id!=node||
             p.node_generation!=generation||p.policy_revision!=policy.policy_revision||p.relay_port!=relay_port||p.bind_port!=bind_port||
@@ -340,7 +344,7 @@ mod linux {
         });}
         let mut child=Engine(command.spawn().map_err(|_|Failure::Protocol)?);
         if deadline<=Instant::now(){child.stop()?;return Err(Failure::Denied)}
-        println!("relay TCP engine started");
+        println!("relay {} engine started",protocol.to_ascii_uppercase());
         // No renewal or retry of a consumed claim. A local deadline closes
         // the entire engine, including existing connections, before exit.
         loop{
@@ -350,14 +354,14 @@ mod linux {
             std::thread::sleep(left.min(Duration::from_millis(50)));
         }
         child.stop()?;
-        println!("relay TCP engine expired and stopped");
+        println!("relay {} engine expired and stopped",protocol.to_ascii_uppercase());
         Ok(())
     }
     pub(super) fn run()->Result<()>{
         let args:Vec<_>=std::env::args_os().skip(1).collect();
         let arg=|i:usize|args.get(i).and_then(|a|a.to_str()).ok_or(Failure::Protocol);
         let verify=args.len()==12&&arg(0)?=="--verify-grant";
-        let tcp=args.len()==15&&arg(0)?=="--tcp-preview";
+        let tcp=args.len()==15&&matches!(arg(0)?,"--tcp-preview"|"--udp-preview");
         let (endpoint,dir,index,port)=if (args.len()==7&&arg(0)?=="--tls")||verify||tcp{
             let host=arg(2)?;
             if !hostname(host){return Err(Failure::Protocol)}
@@ -379,7 +383,7 @@ mod linux {
                 generation:arg(10)?.parse().map_err(|_|Failure::Protocol)?,id:arg(11)?};
             if !hex_id(expected.id)||!hex_id(expected.allocation)||!hex_id(expected.mapping)||expected.revision<1||expected.generation<2{return Err(Failure::Protocol)}
             if tcp{
-                return supervise_tcp(&endpoint,&dir,&token,node,generation,capacity,&expected,
+                return supervise_tcp(if arg(0)?=="--udp-preview"{"udp"}else{"tcp"},&endpoint,&dir,&token,node,generation,capacity,&expected,
                     arg(12)?.parse().map_err(|_|Failure::Protocol)?,arg(13)?.parse().map_err(|_|Failure::Protocol)?,Path::new(&args[14]))
             }
             return verify_grant(&endpoint,&token,node,generation,capacity,&expected)
@@ -406,6 +410,6 @@ fn main(){
     #[cfg(target_os="linux")]
     if linux::run().is_ok(){return}
     // Fixed diagnostics only, never paths, credentials or response bodies.
-    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --tcp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine>");
+    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine>");
     std::process::exit(1);
 }
