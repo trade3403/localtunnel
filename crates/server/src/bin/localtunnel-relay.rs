@@ -8,7 +8,7 @@ mod linux {
     const PERIOD:Duration=Duration::from_secs(3);
     const MAX_RESPONSE:usize=8192;
     #[derive(Debug)]
-    enum Failure{Transient,Denied,Protocol}
+    pub(super) enum Failure{Transient,Denied,Protocol}
     type Result<T>=std::result::Result<T,Failure>;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -86,7 +86,7 @@ mod linux {
         if code!=204||!data.is_empty(){return Err(Failure::Protocol)}
         Ok(())
     }
-    pub fn run()->Result<()>{
+    pub(super) fn run()->Result<()>{
         let args:Vec<_>=std::env::args_os().skip(1).collect();
         if args.len()!=5{return Err(Failure::Protocol)}
         let arg=|i:usize|args[i].to_str().ok_or(Failure::Protocol);
