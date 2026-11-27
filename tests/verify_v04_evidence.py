@@ -332,6 +332,12 @@ REQUIRED["management-v09"] = {
         "real_relay_disable_no_resurrection_and_audit",
         "real_relay_heartbeat_freshness_generation_and_isolation",
     ],
+    "relay-process.json": [
+        "real_three_independent_relay_control_processes",
+        "real_relay_control_center_restart_recovery",
+        "real_relay_process_loss_and_health_recovery",
+        "real_relay_process_credential_rotation_private_file_and_revocation",
+    ],
 }
 
 def unique_object(pairs):
