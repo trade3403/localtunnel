@@ -32,10 +32,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat','node_policy_audit')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(23) => (StatusCode::OK, "ready"),
+        Ok(24) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -127,6 +127,8 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let relay_action=args.first().and_then(|a|a.to_str()).filter(|a|matches!(*a,"--relay-issue"|"--relay-rotate"|"--relay-revoke"));
     let init = args.first().is_some_and(|a| a=="--init-admin");
     let add_node = args.first().is_some_and(|a| a=="--add-node");
+    let node_health = args.first().is_some_and(|a| a=="--node-health");
+    let set_policy = args.first().is_some_and(|a| a=="--set-node-policy");
     let set_node = args.first().is_some_and(|a| a=="--set-node-enabled");
     let export = args.first().is_some_and(|a| a=="--export-preview");
     let gateway = args.first().is_some_and(|a| a=="--preview-gateway");
@@ -145,11 +147,11 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let recover = args.first().is_some_and(|a| a=="--recover-runtime");
     let prune_history = args.first().is_some_and(|a| a=="--prune-history");
     let prune_logs = args.first().is_some_and(|a| a=="--prune-gateway-logs");
-    let expected = if relay_action==Some("--relay-issue") {3} else if relay_action.is_some() {4} else if prune_logs {3} else if prune_history {2} else if recover {4} else if tcp_worker {7} else if udp_device_worker {8} else if udp_worker || udp_resident {9} else if udp_supervise {7} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
+    let expected = if node_health {3} else if set_policy {7} else if relay_action==Some("--relay-issue") {3} else if relay_action.is_some() {4} else if prune_logs {3} else if prune_history {2} else if recover {4} else if tcp_worker {7} else if udp_device_worker {8} else if udp_worker || udp_resident {9} else if udp_supervise {7} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --commercial-create-account <data-dir> | --commercial-create-plan <data-dir> | --commercial-assign <data-dir> (each reads bounded JSON stdin) | --commercial-list-bandwidth <data-dir> | --commercial-recover-bandwidth <data-dir> (reads exact reservation JSON and offline confirmation) | --relay-issue <data-dir> <node-id> | --relay-rotate / --relay-revoke <data-dir> <node-id> <expected-generation> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-tcp-worker <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <bytes-per-second> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-device-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --commercial-create-account <data-dir> | --commercial-create-plan <data-dir> | --commercial-assign <data-dir> (each reads bounded JSON stdin) | --commercial-list-bandwidth <data-dir> | --commercial-recover-bandwidth <data-dir> (reads exact reservation JSON and offline confirmation) | --relay-issue <data-dir> <node-id> | --relay-rotate / --relay-revoke <data-dir> <node-id> <expected-generation> | --node-health <data-dir> <node-id> | --set-node-policy <data-dir> <node-id> <expected-revision> <approved-capacity> <region> <active|draining|maintenance> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-tcp-worker <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <bytes-per-second> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-device-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
     }
-    let operator = relay_action.is_some() || bandwidth_list || bandwidth_recover || commercial_action.is_some() || init || add_node || set_node || export || gateway || supervise || udp_supervise || tcp_worker || udp_worker || udp_device_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
+    let operator = node_health || set_policy || relay_action.is_some() || bandwidth_list || bandwidth_recover || commercial_action.is_some() || init || add_node || set_node || export || gateway || supervise || udp_supervise || tcp_worker || udp_worker || udp_device_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
     let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
@@ -198,6 +200,17 @@ async fn run() -> Result<(), Box<dyn Error>> {
         if action!="--relay-issue" && expected<=0{return Err("invalid generation".into())}
         let result=relay::change(&pool,node,expected,action=="--relay-revoke").await.map_err(|_|"relay credential change refused")?;
         if let Some(token)=result{println!("{token}");}
+        return Ok(())
+    }
+    if node_health {
+        let result=nodes::operator_health(&pool,args[2].to_str().ok_or("invalid node id")?).await.map_err(|_|"node health unavailable")?;
+        println!("{result}");
+        return Ok(())
+    }
+    if set_policy {
+        let expected:i64=args[3].to_str().ok_or("invalid policy revision")?.parse().map_err(|_|"invalid policy revision")?;
+        let capacity:i64=args[4].to_str().ok_or("invalid approved capacity")?.parse().map_err(|_|"invalid approved capacity")?;
+        nodes::set_policy(&pool,args[2].to_str().ok_or("invalid node id")?,expected,capacity,args[5].to_str().ok_or("invalid region")?,args[6].to_str().ok_or("invalid policy mode")?).await.map_err(|_|"node policy change refused")?;
         return Ok(())
     }
     if add_node {

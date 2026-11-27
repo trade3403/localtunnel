@@ -27,6 +27,32 @@ pub async fn set_enabled(pool:&SqlitePool,id:&str,enabled:bool)->Result<(),Failu
     if r.rows_affected()!=1{return Err(CONFLICT)}
     Ok(())
 }
+// Read-only snapshot, not free slots, a reservation or an authorization.
+// Match only the current credential generation and use the database clock.
+pub(crate) const HEALTH_SELECT:&str="SELECT n.id AS node_id,n.enabled,n.approved_capacity,n.region,n.policy_mode,n.policy_revision,r.generation,h.received_at,h.capacity AS reported_capacity,CASE WHEN n.enabled=0 THEN 'disabled' WHEN r.node_id IS NULL THEN 'unregistered' WHEN r.token_digest IS NULL THEN 'revoked' WHEN h.node_id IS NULL THEN 'awaiting_heartbeat' WHEN h.received_at BETWEEN unixepoch()-15 AND unixepoch() THEN 'online' ELSE 'offline' END AS health,CASE WHEN n.enabled=1 AND r.token_digest IS NOT NULL AND n.policy_mode='active' AND h.received_at BETWEEN unixepoch()-15 AND unixepoch() THEN min(n.approved_capacity,h.capacity) ELSE 0 END AS candidate_capacity FROM nodes n LEFT JOIN relay_identities r ON r.node_id=n.id LEFT JOIN relay_heartbeat h ON h.node_id=r.node_id AND h.generation=r.generation";
+#[derive(Serialize,sqlx::FromRow)]
+pub(crate) struct OperationalHealth {
+    node_id:String,enabled:bool,approved_capacity:i64,region:String,policy_mode:String,policy_revision:i64,
+    generation:Option<i64>,received_at:Option<i64>,reported_capacity:Option<i64>,health:String,candidate_capacity:i64,
+}
+pub async fn operator_health(pool:&SqlitePool,id:&str)->Result<String,Failure>{
+    let query=format!("{HEALTH_SELECT} WHERE n.id=?");
+    let row=sqlx::query_as::<_,OperationalHealth>(&query).bind(id).fetch_optional(pool).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)?;
+    serde_json::to_string(&row).map_err(|_|INTERNAL)
+}
+pub async fn set_policy(pool:&SqlitePool,id:&str,expected:i64,capacity:i64,region:&str,mode:&str)->Result<(),Failure>{
+    if !(1..i64::MAX).contains(&expected)||!(0..=65536).contains(&capacity)||region.is_empty()||region.len()>32||
+        !region.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-'||b==b'_')||
+        !matches!(mode,"active"|"draining"|"maintenance"){return Err(BAD)}
+    let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
+    let changed=sqlx::query("UPDATE nodes SET approved_capacity=?,region=?,policy_mode=?,policy_revision=policy_revision+1 WHERE id=? AND policy_revision=?")
+        .bind(capacity).bind(region).bind(mode).bind(id).bind(expected).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    if changed.rows_affected()!=1{return Err(CONFLICT)}
+    sqlx::query("INSERT INTO node_policy_audit(node_id,revision,approved_capacity,region,mode) VALUES (?,?,?,?,?)")
+        .bind(id).bind(expected+1).bind(capacity).bind(region).bind(mode).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    Ok(())
+}
 pub fn routes(pool:SqlitePool)->Router{
     Router::new().route("/api/v1/nodes",get(list)).with_state(pool)
 }

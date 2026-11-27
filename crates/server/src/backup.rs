@@ -125,6 +125,10 @@ pub async fn run(source:&Path,dest:&Path,restore:bool)->Result<()>{
         // coming back after rollback. Keep owner/mapping/history records.
         let mut tx=copy.begin().await?;
         for statement in [
+            // Restored node identities must not resurrect snapshot credentials.
+            "INSERT INTO relay_identity_audit(node_id,generation,event) SELECT node_id,generation+1,'revoked' FROM relay_identities WHERE token_digest IS NOT NULL",
+            "UPDATE relay_identities SET token_digest=NULL,generation=generation+1,changed_at=unixepoch() WHERE token_digest IS NOT NULL",
+            "DELETE FROM relay_heartbeat",
             "DELETE FROM admin_sessions",
             "DELETE FROM device_pairings",
             "DELETE FROM device_status",

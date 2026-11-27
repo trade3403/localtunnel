@@ -332,6 +332,12 @@ REQUIRED["management-v09"] = {
         "real_relay_disable_no_resurrection_and_audit",
         "real_relay_heartbeat_freshness_generation_and_isolation",
     ],
+    "node-policy.json": [
+        "real_node_policy_upgrade_and_constraints",
+        "real_operator_policy_revision_audit_and_isolation",
+        "real_node_health_capacity_and_generation",
+        "real_node_policy_restore_revokes_snapshot_credentials",
+    ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",
         "real_relay_control_center_restart_recovery",

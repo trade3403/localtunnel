@@ -25,12 +25,20 @@ struct Identity{node_id:String,generation:i64}
 pub fn routes(pool:SqlitePool)->Router{
     Router::new().route("/api/v1/relay/identity",get(identity))
         .route("/api/v1/relay/heartbeat",post(heartbeat).get(health))
+        .route("/api/v1/relay/policy",get(policy))
         .layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 async fn identity(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Response,Failure>{
     let id=sqlx::query_as::<_,Identity>("SELECT r.node_id,r.generation FROM relay_identities r JOIN nodes n ON n.id=r.node_id WHERE r.token_digest=? AND n.enabled=1")
         .bind(digest(&headers)?).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
     Ok(auth::uncached(Json(id)))
+}
+
+async fn policy(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Response,Failure>{
+    let query=format!("{} WHERE r.token_digest=? AND n.enabled=1",crate::nodes::HEALTH_SELECT);
+    let row=sqlx::query_as::<_,crate::nodes::OperationalHealth>(&query).bind(digest(&headers)?)
+        .fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
+    Ok(auth::uncached(Json(row)))
 }
 
 const BAD:Failure=(StatusCode::BAD_REQUEST,"invalid relay heartbeat");
