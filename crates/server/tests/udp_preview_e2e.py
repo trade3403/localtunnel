@@ -303,7 +303,10 @@ try:
                 call(base,endpoint,409,"POST",d2["device_token"],{**spec,"device_revision":cfg["revision"]+1})
                 call(base,endpoint,409,"POST",d2["device_token"],{**spec,"mapping_revision":lm["revision"]+1})
                 call(base,endpoint,401,"POST",admin,spec)
-                assert not lease_echo()
+                # A pre-agent user datagram reserves a real source slot even
+                # without a reply. For finite tests preserve the pristine
+                # quota to distinguish the internal probe from user traffic.
+                if not finite:assert not lease_echo()
                 # Independent process configured exclusively from the authenticated response.
                 config_file=root/("lease-agent-"+rid+".toml")
                 generated=subprocess.run([str(core_test.CLI.resolve()),"client-udp-config",str(config_file),"127.0.0.1:"+str(lease["relay_port"]),"m_"+lease["mapping_id"],"127.0.0.1:"+str(lease["local_port"])],
