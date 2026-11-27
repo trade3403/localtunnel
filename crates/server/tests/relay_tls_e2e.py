@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import secrets
 import selectors
+import sqlite3
 import socket
 import ssl
 import subprocess
@@ -106,6 +107,38 @@ try:
         for path in ("/api/v1/nodes","/api/v1/auth/login","/api/v1/allocations","/readyz","/"):
             assert request(path,tokens[0])[0]==404
         report["real_tls_three_relay_processes_and_restricted_ingress"]=True
+        # Real versioned control response; rejected mutations cannot alter
+        # another node's heartbeat, including a valid token of equal generation.
+        def control(token,payload,status):
+            req=urllib.request.Request(f"https://localhost:{tp}/api/v1/relay/control",method="POST",
+                headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"},data=json.dumps(payload).encode())
+            try:
+                with opener.open(req,timeout=4) as r:
+                    assert r.status==status and r.headers.get("Cache-Control")=="no-store"
+                    return json.load(r)
+            except urllib.error.HTTPError as e:assert e.code==status
+        stop(live[2])
+        nonce=secrets.token_hex(16)
+        payload={"protocol_version":1,"node_id":nodes[2],"generation":1,"capacity":7,"nonce":nonce}
+        def stored():
+            with sqlite3.connect(center/"control.sqlite3") as db:
+                return db.execute("SELECT generation,capacity,received_at FROM relay_heartbeat WHERE node_id=?",(nodes[2],)).fetchone()
+        before=stored()
+        control(tokens[2],dict(payload,protocol_version=2),400)
+        control(tokens[2],dict(payload,generation=2),401)
+        control(tokens[2],dict(payload,nonce="bad"),400)
+        control(tokens[2],dict(payload,extra=True),422)
+        control(tokens[0],payload,401)
+        assert stored()==before
+        cmd("--set-node-policy",nodes[2],1,9,"east","draining")
+        snapshot=control(tokens[2],payload,200)
+        assert snapshot["protocol_version"]==1 and snapshot["nonce"]==nonce and snapshot["scope"]=="control_only"
+        assert snapshot["policy"]=={"node_id":nodes[2],"generation":1,"policy_revision":2,"approved_capacity":9,"region":"east","policy_mode":"draining","received_at":stored()[2]}
+        assert stored()[:2]==(1,7)
+        assert request("/api/v1/relay/control",tokens[2])[0]==405
+        live[2]=start(dirs[2],2)
+        wait(fresh)
+        report["real_versioned_control_atomic_policy_and_rejected_mutations"]=True
         def fails(p):
             wait(lambda:p.poll() is not None,12)
             assert p.returncode!=0
@@ -138,6 +171,20 @@ try:
         finally:
             redirect.shutdown();redirect.server_close();redthread.join(timeout=3)
             capture.shutdown();capture.server_close();thread.join(timeout=3)
+        # Observe live revision update without restarting the node. The
+        # fixed diagnostic contains only revision and enumerated policy mode.
+        cmd("--set-node-policy",nodes[0],1,8,"west","maintenance")
+        observed=[]
+        def read_policy():
+            for line in live[0].stdout:
+                observed.append(line.strip())
+                if "relay policy synchronized revision=2 mode=maintenance"==line.strip():return
+        reader=threading.Thread(target=read_policy,daemon=True);reader.start()
+        reader.join(timeout=15)
+        assert "relay policy synchronized revision=2 mode=maintenance" in observed
+        assert not any(t in line for t in tokens for line in observed)
+        assert live[0].poll() is None
+        report["real_relay_process_live_policy_revision_sync"]=True
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
         assert request("/api/v1/relay/identity",tokens[1])[0]==401
@@ -149,4 +196,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==4 and all(report.values())
+assert len(report)==6 and all(report.values())

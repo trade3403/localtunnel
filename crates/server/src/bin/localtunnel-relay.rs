@@ -3,6 +3,7 @@
 #[cfg(target_os="linux")]
 mod linux {
     use serde::Deserialize;
+    use rand_core::{OsRng,RngCore};
     use std::{fs::{self,OpenOptions},io::{Read,Write},net::{Ipv4Addr,SocketAddrV4,TcpStream},os::unix::fs::{MetadataExt,OpenOptionsExt,PermissionsExt},path::{Path,PathBuf},process::{Command,Stdio},time::{Duration,Instant}};
     const DEADLINE:Duration=Duration::from_secs(4);
     const PERIOD:Duration=Duration::from_secs(3);
@@ -12,7 +13,15 @@ mod linux {
     type Result<T>=std::result::Result<T,Failure>;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct Identity{node_id:String,generation:i64}
+    struct Control{protocol_version:i64,nonce:String,scope:String,policy:Policy}
+    #[derive(Deserialize,PartialEq,Eq)]
+    #[serde(deny_unknown_fields)]
+    struct Policy{node_id:String,generation:i64,policy_revision:i64,approved_capacity:i64,region:String,policy_mode:String,received_at:i64}
+    impl Policy{
+        fn same_revision(&self,other:&Self)->bool{
+            self.policy_revision==other.policy_revision&&self.approved_capacity==other.approved_capacity&&self.region==other.region&&self.policy_mode==other.policy_mode
+        }
+    }
 
     fn private_file(dir:&Path,name:&str)->Result<fs::File>{
         let m=fs::symlink_metadata(dir).map_err(|_|Failure::Protocol)?;
@@ -137,15 +146,26 @@ mod linux {
         if length.unwrap_or(0)!=data.len()||code==204&&!data.is_empty(){return Err(Failure::Protocol)}
         Ok((code,data.to_vec()))
     }
-    fn heartbeat(endpoint:&Endpoint,token:&str,node:&str,generation:i64,capacity:i64)->Result<()>{
-        let (code,data)=request(endpoint,token,"/api/v1/relay/identity",None)?;
+    fn synchronize(endpoint:&Endpoint,token:&str,node:&str,generation:i64,capacity:i64,previous:Option<&Policy>)->Result<Policy>{
+        let mut bytes=[0u8;16];
+        OsRng.try_fill_bytes(&mut bytes).map_err(|_|Failure::Protocol)?;
+        let nonce=hex::encode(bytes);
+        let payload=serde_json::json!({"protocol_version":1,"node_id":node,"generation":generation,"capacity":capacity,"nonce":nonce}).to_string();
+        let (code,data)=request(endpoint,token,"/api/v1/relay/control",Some(&payload))?;
         if code!=200{return Err(Failure::Protocol)}
-        let id:Identity=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
-        if id.node_id!=node||id.generation!=generation{return Err(Failure::Denied)}
-        let payload=serde_json::json!({"protocol_version":1,"generation":generation,"capacity":capacity}).to_string();
-        let (code,data)=request(endpoint,token,"/api/v1/relay/heartbeat",Some(&payload))?;
-        if code!=204||!data.is_empty(){return Err(Failure::Protocol)}
-        Ok(())
+        let result:Control=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
+        if result.protocol_version!=1||result.nonce!=nonce||result.scope!="control_only"{return Err(Failure::Protocol)}
+        let p=result.policy;
+        if p.node_id!=node||p.generation!=generation{return Err(Failure::Denied)}
+        if p.policy_revision<1||!(0..=65536).contains(&p.approved_capacity)||p.received_at<1||
+            p.region.is_empty()||p.region.len()>32||!p.region.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-'||b==b'_')||
+            !matches!(p.policy_mode.as_str(),"active"|"draining"|"maintenance"){return Err(Failure::Protocol)}
+        if let Some(old)=previous{
+            // In-process monotonic policy observation, not an offline lease
+            // or a persistent anti-rollback guarantee across node restarts.
+            if p.policy_revision<old.policy_revision||(p.policy_revision==old.policy_revision&&!p.same_revision(old)){return Err(Failure::Protocol)}
+        }
+        Ok(p)
     }
     pub(super) fn run()->Result<()>{
         let args:Vec<_>=std::env::args_os().skip(1).collect();
@@ -167,9 +187,16 @@ mod linux {
         if port==0||node.len()!=32||!node.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||generation<1||!(0..=65536).contains(&capacity){return Err(Failure::Protocol)}
         let token=private_token(&dir)?;
         let mut online=false;
+        let mut previous:Option<Policy>=None;
         loop{
-            match heartbeat(&endpoint,&token,node,generation,capacity){
-                Ok(())=>{if !online{println!("relay control connected");online=true;}},
+            match synchronize(&endpoint,&token,node,generation,capacity,previous.as_ref()){
+                Ok(policy)=>{
+                    if previous.as_ref().is_none_or(|p|p.policy_revision!=policy.policy_revision){
+                        println!("relay policy synchronized revision={} mode={}",policy.policy_revision,policy.policy_mode);
+                    }
+                    previous=Some(policy);
+                    if !online{println!("relay control connected");online=true;}
+                },
                 Err(Failure::Transient)=>{if online{eprintln!("relay control unavailable");online=false;}},
                 Err(e)=>return Err(e),
             }

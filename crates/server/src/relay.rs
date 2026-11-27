@@ -26,6 +26,7 @@ pub fn routes(pool:SqlitePool)->Router{
     Router::new().route("/api/v1/relay/identity",get(identity))
         .route("/api/v1/relay/heartbeat",post(heartbeat).get(health))
         .route("/api/v1/relay/policy",get(policy))
+        .route("/api/v1/relay/control",post(control))
         .layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 async fn identity(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Response,Failure>{
@@ -61,6 +62,28 @@ async fn health(State(pool):State<SqlitePool>,headers:HeaderMap)->Result<Respons
     let value=sqlx::query_as::<_,Health>("SELECT r.node_id,r.generation,h.received_at,h.capacity,COALESCE(h.received_at BETWEEN unixepoch()-15 AND unixepoch(),0) AS fresh FROM relay_identities r JOIN nodes n ON n.id=r.node_id LEFT JOIN relay_heartbeat h ON h.node_id=r.node_id AND h.generation=r.generation WHERE r.token_digest=? AND n.enabled=1")
         .bind(digest(&headers)?).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
     Ok(auth::uncached(Json(value)))
+}
+
+// Versioned heartbeat plus a consistent policy snapshot. No execution grants.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlRequest{protocol_version:i64,node_id:String,generation:i64,capacity:i64,nonce:String}
+#[derive(Serialize,sqlx::FromRow)]
+struct ControlPolicy{node_id:String,generation:i64,policy_revision:i64,approved_capacity:i64,region:String,policy_mode:String,received_at:i64}
+fn hex_id(s:&str)->bool{s.len()==32&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
+async fn control(State(pool):State<SqlitePool>,headers:HeaderMap,Json(body):Json<ControlRequest>)->Result<Response,Failure>{
+    let credential=digest(&headers)?;
+    if body.protocol_version!=1||body.generation<1||!(0..=65536).contains(&body.capacity)||!hex_id(&body.node_id)||!hex_id(&body.nonce){return Err(BAD)}
+    let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
+    // The first statement acquires the SQLite writer lock; identity, policy
+    // and heartbeat are checked before the transaction releases that lock.
+    let changed=sqlx::query("INSERT INTO relay_heartbeat(node_id,generation,received_at,protocol_version,capacity) SELECT r.node_id,r.generation,unixepoch(),1,? FROM relay_identities r JOIN nodes n ON n.id=r.node_id WHERE r.token_digest=? AND n.enabled=1 AND r.generation=? AND r.node_id=? ON CONFLICT(node_id) DO UPDATE SET generation=excluded.generation,received_at=excluded.received_at,protocol_version=excluded.protocol_version,capacity=excluded.capacity")
+        .bind(body.capacity).bind(&credential).bind(body.generation).bind(&body.node_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    if changed.rows_affected()!=1{return Err(DENIED)}
+    let policy=sqlx::query_as::<_,ControlPolicy>("SELECT n.id AS node_id,r.generation,n.policy_revision,n.approved_capacity,n.region,n.policy_mode,h.received_at FROM nodes n JOIN relay_identities r ON r.node_id=n.id JOIN relay_heartbeat h ON h.node_id=n.id AND h.generation=r.generation WHERE n.id=? AND r.token_digest=? AND r.generation=? AND n.enabled=1")
+        .bind(&body.node_id).bind(&credential).bind(body.generation).fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(DENIED)?;
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":body.nonce,"scope":"control_only","policy":policy}))))
 }
 
 // First issuance is distinct from rotation. The latter requires an exact
