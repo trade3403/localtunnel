@@ -60,6 +60,8 @@ jobs:
         run: python3 crates/server/tests/grants_e2e.py crates/server/target/release/localtunnel-server management-evidence/grants.json
       - name: Real one-shot TCP start claim and port isolation
         run: python3 crates/server/tests/relay_tcp_claim_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-tcp-claim.json
+      - name: Real HTTP hostname proof and one-shot claim isolation
+        run: python3 crates/server/tests/relay_http_claim_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-http-claim.json
       - name: Real legacy SQLite migration and UDP desired metadata lifecycle
         run: python3 crates/server/tests/udp_metadata_e2e.py crates/server/target/release/localtunnel-server management-evidence/udp-metadata.json
       - name: Install DNS query utility

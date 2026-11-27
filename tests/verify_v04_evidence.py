@@ -337,6 +337,10 @@ REQUIRED["management-v09"] = {
         "real_relay_disable_no_resurrection_and_audit",
         "real_relay_heartbeat_freshness_generation_and_isolation",
     ],
+    "relay-http-claim.json": [
+        "real_http_dns_proof_exact_claim_and_protocol_isolation",
+        "real_http_proof_rotation_and_shared_transport_port_denial",
+    ],
     "relay-tcp-claim.json": [
         "real_tcp_explicit_intent_exact_claim_and_one_shot_race",
         "real_tcp_claim_port_policy_and_restore_isolation",
