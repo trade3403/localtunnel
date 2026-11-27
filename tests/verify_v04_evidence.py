@@ -314,6 +314,7 @@ REQUIRED["management-v08"] = {
         "real_operator_versioned_immutable_plan_creation",
         "real_operator_atomic_account_and_plan_assignment",
         "real_created_account_login_and_no_http_policy_mutation",
+        "real_commercial_foreign_selectors_and_operator_http_boundary",
         "real_assignment_optimistic_concurrency_expiry_and_renewal",
         "real_committed_operator_audit_and_owner_isolation",
         "real_dynamic_active_device_quota_and_pairing_retry",
