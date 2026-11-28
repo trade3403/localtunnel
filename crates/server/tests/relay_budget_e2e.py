@@ -143,22 +143,27 @@ try:
             payload={k:g[k] for k in ("allocation_id","mapping_id","mapping_revision","node_id","node_generation","generation")}
             payload.update(protocol_version=1,grant_id=g["id"],relay_port=31000,nonce=secrets.token_hex(16))
             call(base,"relay/tcp-claim",401,tokens[1],"POST",payload)
-            def intent(g,status=201,token=other,port=31000):
-                return call(base,"allocations/"+g["allocation_id"]+"/budget-intent",status,token,"POST",
+            def intent(g,status=201,token=other,port=31000,guarded=False):
+                return call(base,"allocations/"+g["allocation_id"]+("/budget-run-intent" if guarded else "/budget-intent"),status,token,"POST",
                             dict(grant_id=g["id"],expected_generation=2,relay_port=port))[1]
-            def claim(g,status=200,token=None,port=31000):
+            def claim(g,status=200,token=None,port=31000,guarded=False):
                 payload={k:g[k] for k in ("allocation_id","mapping_id","mapping_revision","node_id","node_generation","generation")}
                 payload.update(protocol_version=1,grant_id=g["id"],relay_port=port,nonce=secrets.token_hex(16))
-                code,row=call(base,"relay/budget-claim",status,token or tokens[nodes.index(g["node_id"])],"POST",payload)
+                code,row=call(base,"relay/budget-run-claim" if guarded else "relay/budget-claim",status,token or tokens[nodes.index(g["node_id"])],"POST",payload)
                 if row:
-                    assert row["nonce"]==payload["nonce"] and row["scope"]=="budget_claim_preview_only" and row["executable"] is False
+                    assert row["nonce"]==payload["nonce"] and row["scope"]==("budget_guarded_claim_preview_only" if guarded else "budget_claim_preview_only") and row["executable"] is False
                     assert row["grant"]["id"]==g["id"] and row["intent"]["relay_port"]==port and row["intent"]["claimed_at"] is not None
                 return code
             claim(g,401)
             intent(g,409,owner)
             assert intent(g)["executable"] is False
             intent(g,409)
-            intent(h)
+            intent(g,409,guarded=True)
+            intent(h,409,owner,guarded=True)
+            r=intent(h,guarded=True)
+            assert r["scope"]=="budget_guarded_intent_preview_only" and r["executable"] is False
+            intent(h,409)
+            claim(g,401,guarded=True);claim(h,401)
             claim(g,401,tokens[0]);claim(g,401,port=31001)
             with ThreadPoolExecutor(max_workers=2) as workers:
                 assert sorted(workers.map(lambda _:claim(g,(200,401)),range(2)))==[200,401]
@@ -171,14 +176,22 @@ try:
             report["real_finite_budget_one_shot_claim_and_replay_rejection"]=True
             cmd(root,"--set-node-policy",nodes[1],2,8,"east","maintenance")
             observe(g,401);observe(h)
-            claim(g,401);claim(h)
+            claim(g,401);claim(h,401)
+            claim(h,401,tokens[1],guarded=True)
+            claim(h,guarded=True);claim(h,401,guarded=True)
             with sqlite3.connect(root/"control.sqlite3") as db:
                 assert db.execute("SELECT count(*) FROM relay_budget_grants").fetchone()==(2,)
+                assert sorted(db.execute("SELECT intent_mode,claimed_at IS NOT NULL FROM relay_budget_intents").fetchall())==[("guarded_tcp",1),("observe",1)]
+                # Direct SQL cannot promote a recorded observation either.
+                try:db.execute("UPDATE relay_budget_intents SET intent_mode='guarded_tcp' WHERE intent_mode='observe'");raise AssertionError("mutable mode")
+                except sqlite3.IntegrityError:db.rollback()
+                assert db.execute("SELECT count(*) FROM management_audit WHERE event='budget.run_claim_preview'").fetchone()==(1,)
                 assert db.execute("SELECT count(*) FROM relay_grants").fetchone()==(0,)
                 assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
             report["real_finite_budget_grant_exact_node_slice_and_legacy_isolation"]=True
+            report["real_guarded_intent_explicit_opt_in_and_claim_mode_isolation"]=True
         finally:stop(p)
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==4 and all(report.values())
+assert len(report)==5 and all(report.values())
