@@ -1,6 +1,6 @@
 //! Atomic control-plane reservations only; no relay credentials or execution authority.
 use crate::auth;
-use axum::{extract::{DefaultBodyLimit,Path,State},http::{HeaderMap,StatusCode},response::Response,routing::{get,post},Json,Router};
+use axum::{extract::{DefaultBodyLimit,Path,Query,State},http::{HeaderMap,StatusCode},response::Response,routing::{get,post},Json,Router};
 use serde::{Deserialize,Serialize};
 use sha2::{Digest,Sha256};
 use sqlx::SqlitePool;
@@ -33,7 +33,7 @@ fn db_error(e:sqlx::Error)->Failure{
     INTERNAL
 }
 pub fn routes(pool:SqlitePool)->Router{
-    Router::new().route("/api/v1/allocations",post(create))
+    Router::new().route("/api/v1/allocations",post(create).get(overview))
         .route("/api/v1/allocations/{id}",get(detail))
         .route("/api/v1/allocations/{id}/cancel",post(cancel))
         .layer(DefaultBodyLimit::max(4096)).with_state(pool)
@@ -132,4 +132,71 @@ async fn cancel(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Head
     if row.state!="cancelled"||row.generation!=c.expected_generation{return Err(CONFLICT)}
     tx.commit().await.map_err(db_error)?;
     Ok(auth::uncached(Json(row)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Cursor{after:Option<String>}
+#[derive(Serialize,sqlx::FromRow)]
+struct Overview{
+    id:String,mapping_id:String,node_id:String,node_name:String,mapping_revision:i64,generation:i64,node_generation:i64,
+    bind_port:i64,state:String,created_at:i64,protocol:Option<String>,local_port:Option<i64>,
+    grant_id:Option<String>,grant_kind:Option<String>,expires_at:Option<i64>,revoked_at:Option<i64>,
+    claimed_at:Option<i64>,relay_port:Option<i64>,authorization_state:String,
+    failure_reason:Option<String>,failure_at:Option<i64>,fenced_at:Option<i64>,cleanup_at:Option<i64>,
+    reclaimed_at:Option<i64>,retired_at:Option<i64>,auto_state:Option<String>,auto_entitlement_revision:Option<i64>,
+    source_id:Option<String>,successor_id:Option<String>,lineage_epoch:i64,
+    budget_entitlement_revision:Option<i64>,monthly_bytes:Option<i64>,connection_slots:Option<i64>,rate_bytes_per_second:Option<i64>,month_utc:Option<String>,
+    cancellable:bool,
+}
+/// Owner-only snapshot, including historical records. A claimed lease is
+/// authorization evidence, not process liveness or a successful data probe.
+async fn overview(State(pool):State<SqlitePool>,headers:HeaderMap,Query(c):Query<Cursor>)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    let after=c.after.unwrap_or_default();
+    if !after.is_empty()&&!hex_id(&after){return Err(BAD)}
+    let rows=sqlx::query_as::<_,Overview>("SELECT a.id,a.mapping_id,a.node_id,n.name AS node_name,a.mapping_revision,a.generation,a.node_generation,
+      a.bind_port,a.state,a.created_at,coalesce(m.protocol,CASE WHEN retirement.allocation_id IS NOT NULL THEN 'tcp' END) AS protocol,
+      coalesce(m.local_port,retirement.local_port) AS local_port,
+      coalesce(bg.id,g.id) AS grant_id,CASE WHEN bg.id IS NOT NULL THEN 'finite' WHEN g.id IS NOT NULL THEN 'ordinary' END AS grant_kind,
+      coalesce(bg.expires_at,g.expires_at) AS expires_at,coalesce(bg.revoked_at,g.revoked_at) AS revoked_at,
+      i.claimed_at,i.relay_port,
+      CASE WHEN retirement.allocation_id IS NOT NULL THEN 'retired'
+      WHEN f.allocation_id IS NOT NULL THEN 'fenced'
+      WHEN a.state='cancelled' THEN 'cancelled'
+      WHEN coalesce(bg.id,g.id) IS NULL THEN 'not_issued'
+      WHEN coalesce(bg.revoked_at,g.revoked_at) IS NOT NULL THEN 'revoked'
+      WHEN coalesce(bg.expires_at,g.expires_at)<=unixepoch() THEN 'expired'
+      WHEN i.claimed_at IS NOT NULL THEN 'claimed'
+      WHEN i.grant_id IS NOT NULL THEN 'pending_claim'
+      ELSE 'issued' END AS authorization_state,
+      obs.reason AS failure_reason,obs.observed_at AS failure_at,f.fenced_at,cleanup.reported_at AS cleanup_at,
+      reclaim.reclaimed_at,retirement.retired_at,
+      CASE WHEN opt.cancelled_at IS NOT NULL THEN 'cancelled' WHEN opt.source_id IS NOT NULL THEN 'enabled' END AS auto_state,
+      opt.entitlement_revision AS auto_entitlement_revision,
+      parent.source_id,child.successor_id,coalesce(parent.lineage_epoch,1) AS lineage_epoch,
+      b.entitlement_revision AS budget_entitlement_revision,b.monthly_bytes,b.connection_slots,b.rate_bytes_per_second,b.month_utc,
+      CASE WHEN a.state='reserved' AND a.generation=1 AND b.allocation_id IS NULL AND g.id IS NULL AND bg.id IS NULL
+      AND NOT EXISTS(SELECT 1 FROM runtime_requests rr WHERE rr.mapping_id=a.mapping_id) THEN 1 ELSE 0 END AS cancellable
+      FROM relay_allocations a JOIN nodes n ON n.id=a.node_id
+      LEFT JOIN mappings m ON m.id=a.live_mapping_id AND m.owner_id=a.owner_id
+      LEFT JOIN relay_grants g ON g.allocation_id=a.id
+      LEFT JOIN relay_budget_previews b ON b.allocation_id=a.id
+      LEFT JOIN relay_budget_grants bg ON bg.allocation_id=a.id
+      LEFT JOIN relay_budget_intents i ON i.grant_id=bg.id
+      LEFT JOIN relay_allocation_fences f ON f.allocation_id=a.id
+      LEFT JOIN relay_failure_observations obs ON obs.allocation_id=a.id
+      LEFT JOIN relay_cleanup_reports cleanup ON cleanup.allocation_id=a.id
+      LEFT JOIN relay_budget_reclaims reclaim ON reclaim.allocation_id=a.id
+      LEFT JOIN relay_budget_retirements retirement ON retirement.allocation_id=a.id
+      LEFT JOIN relay_auto_failover opt ON opt.source_id=a.id
+      LEFT JOIN relay_failover_links parent ON parent.successor_id=a.id
+      LEFT JOIN relay_failover_links child ON child.source_id=a.id
+      WHERE a.owner_id=? AND a.id>? ORDER BY a.id LIMIT 101")
+      .bind(owner).bind(after).fetch_all(&pool).await.map_err(db_error)?;
+    let mut rows=rows;
+    let more=rows.len()>100;rows.truncate(100);
+    let next=if more{rows.last().map(|r|r.id.clone())}else{None};
+    Ok(auth::uncached(Json(serde_json::json!({"scope":"owner_allocation_observations_only","executable":false,"allocations":rows,"next_after":next}))))
 }

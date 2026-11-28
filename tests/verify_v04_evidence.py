@@ -274,6 +274,7 @@ REQUIRED["management-v08"] = {
         "real_browser_commercial_entitlement_and_refresh",
         "real_browser_commercial_owner_isolation",
         "real_browser_node_overview_and_refresh",
+        "real_browser_allocation_overview_history",
     ],
     "tcp-preview.json": [
         "real_tcp_scoped_queue_and_cancel",
@@ -366,6 +367,7 @@ REQUIRED["management-v09"] = {
         "real_region_port_and_drain_isolation",
         "real_allocation_owner_boundary_and_cancel",
         "real_allocation_restore_retains_reservation",
+        "real_owner_allocation_overview_and_history",
     ],
     "node-policy.json": [
         "real_node_policy_upgrade_and_constraints",
@@ -410,6 +412,7 @@ REQUIRED["management-v09"] = {
          "real_automatic_stale_node_detection_expiry_fence_without_release",
          "real_opted_in_automatic_failover_after_verified_retirement",
          "real_automatic_successor_discovery_and_replacement_noise_traffic",
+         "real_failover_overview_retired_and_expired_lineage",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",

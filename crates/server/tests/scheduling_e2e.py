@@ -131,6 +131,20 @@ try:
                 assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.reserved'").fetchone()==(4,)
                 assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.cancelled'").fetchone()==(2,)
             report["real_allocation_owner_boundary_and_cancel"]=True
+            call(base,"allocations",401)
+            call(base,"allocations",401,tokens[0])
+            call(base,"allocations?after=invalid",400,owner)
+            listing=call(base,"allocations",200,owner)[1]
+            assert listing["scope"]=="owner_allocation_observations_only" and listing["executable"] is False and listing["next_after"] is None
+            rows=listing["allocations"]
+            assert [r["id"] for r in rows]==sorted([one["id"],two["id"],three["id"],replacement["id"]])
+            byid={r["id"]:r for r in rows}
+            assert byid[replacement["id"]]["authorization_state"]=="not_issued" and byid[replacement["id"]]["cancellable"] is True
+            assert byid[two["id"]]["authorization_state"]=="cancelled" and byid[two["id"]]["cancellable"] is False
+            assert all("request_digest" not in r and "request_key" not in r and "owner_id" not in r for r in rows)
+            assert call(base,"allocations",200,other)[1]["allocations"]==[]
+            assert call(base,"allocations?after="+rows[0]["id"],200,owner)[1]["allocations"]==rows[1:]
+            report["real_owner_allocation_overview_and_history"]=True
             backup=Path(tmp)/"backup";restored=Path(tmp)/"restored"
             assert subprocess.run([exe,"--backup-db",str(root),str(backup)],capture_output=True,timeout=40).returncode==0
         finally:stop(p)
@@ -149,4 +163,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==4 and all(report.values())
+assert len(report)==5 and all(report.values())

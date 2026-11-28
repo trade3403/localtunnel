@@ -383,6 +383,31 @@ with sqlite3.connect(sys.argv[1]) as db:
     assert.equal(await otherPage.evaluate(()=>localStorage.length+sessionStorage.length),0)
   }finally{await otherPage.close()}
   report.real_browser_commercial_owner_isolation=true
+  stage='allocation overview'
+  const nodeCredential=spawnSync(exe,['--relay-issue',root,localNode],{timeout:20000,encoding:'utf8'})
+  assert.equal(nodeCredential.status,0)
+  const heartbeat=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/relay/heartbeat',{method:'POST',
+    headers:{Authorization:'Bearer '+nodeCredential.stdout.trim(),'Content-Type':'application/json'},
+    body:JSON.stringify({protocol_version:1,generation:1,capacity:9})})
+  assert.equal(heartbeat.status,204)
+  const devs=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/devices',{headers:{Authorization:adminBearer}})
+  const dev=(await devs.json()).find(d=>d.name==='Browser fixture')
+  assert.ok(dev)
+  const allocationResponse=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/allocations',{method:'POST',
+    headers:{Authorization:adminBearer,'Content-Type':'application/json'},
+    body:JSON.stringify({request_key:randomBytes(16).toString('hex'),device_id:dev.id,node_id:localNode,protocol:'tcp',local_port:8080,bind_port:29999})})
+  assert.equal(allocationResponse.status,201)
+  const allocation=await allocationResponse.json()
+  await menu('分配与切换').click()
+  const allocationRow=page.getByTestId('allocation-overview').getByRole('row').filter({hasText:allocation.id})
+  await allocationRow.getByText('未签发许可',{exact:true}).waitFor()
+  await page.getByTestId('allocations-count').getByText('已加载 1 条',{exact:true}).waitFor()
+  const cancel=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/allocations/'+allocation.id+'/cancel',{method:'POST',
+    headers:{Authorization:adminBearer,'Content-Type':'application/json'},body:JSON.stringify({expected_generation:1})})
+  assert.equal(cancel.status,200)
+  await page.getByRole('button',{name:'刷新数据'}).click()
+  await allocationRow.getByText('已取消',{exact:true}).waitFor()
+  report.real_browser_allocation_overview_history=true
   stage='logout'
   await page.getByRole('button',{name:'退出登录'}).click()
   await page.getByRole('heading',{name:'管理后台登录'}).waitFor()

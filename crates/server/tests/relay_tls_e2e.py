@@ -1627,6 +1627,18 @@ try:
                             with socket.socket() as probe:
                                 probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",port))!=0
                         report["real_automatic_successor_discovery_and_replacement_noise_traffic"]=True
+                        req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/allocations",headers={"Authorization":"Bearer "+dual_owner})
+                        with urllib.request.urlopen(req,timeout=4) as response:
+                            listing=json.load(response)
+                        byid={row["id"]:row for row in listing["allocations"]}
+                        archived=byid[sid];newrow=byid[successor]
+                        assert archived["authorization_state"]=="retired" and archived["failure_reason"]=="heartbeat_stale"
+                        assert all(archived[k] is not None for k in ("failure_at","fenced_at","cleanup_at","reclaimed_at","retired_at"))
+                        assert archived["successor_id"]==successor and archived["auto_state"]=="enabled"
+                        assert newrow["source_id"]==sid and newrow["lineage_epoch"]==2 and newrow["authorization_state"]=="expired"
+                        assert newrow["monthly_bytes"]==95904 and newrow["claimed_at"] is not None and newrow["cancellable"] is False
+                        assert a2["id"] not in byid
+                        report["real_failover_overview_retired_and_expired_lineage"]=True
                     finally:
                         if agent2 is not None:stop(agent2)
                         stop(replacement)
@@ -1649,4 +1661,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==35 and all(report.values())
+assert len(report)==36 and all(report.values())

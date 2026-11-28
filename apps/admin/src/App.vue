@@ -58,12 +58,24 @@ async function readTraffic(id:string){
 }
 const deviceStatus = ref<Record<string,unknown>|null>(null)
 const create = reactive({device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
-const nav = [{key:'dashboard',label:'仪表盘'},{key:'devices',label:'设备管理'},{key:'mappings',label:'映射管理'},{key:'domains',label:'域名管理'},{key:'nodes',label:'节点管理'},{key:'audit',label:'操作审计'},{key:'commercial',label:'套餐与额度'}]
+type AllocationOverview={id:string;mapping_id:string;node_id:string;node_name:string;generation:number;node_generation:number;bind_port:number;state:string;protocol:string|null;local_port:number|null;grant_kind:string|null;expires_at:number|null;authorization_state:string;failure_reason:string|null;failure_at:number|null;fenced_at:number|null;cleanup_at:number|null;reclaimed_at:number|null;retired_at:number|null;auto_state:string|null;source_id:string|null;successor_id:string|null;lineage_epoch:number;monthly_bytes:number|null;connection_slots:number|null;rate_bytes_per_second:number|null;month_utc:string|null}
+const allocations=ref<AllocationOverview[]>([])
+const allocationAfter=ref<string|null>(null)
+const allocationLabels:Record<string,string>={retired:'已退役',fenced:'已隔离',cancelled:'已取消',not_issued:'未签发许可',revoked:'许可已撤销',expired:'许可已到期',claimed:'已领取许可',pending_claim:'等待领取',issued:'已签发许可'}
+const failureLabels:Record<string,string>={node_disabled:'节点停用',identity_unavailable:'节点身份不可用',heartbeat_stale:'心跳失效'}
+async function loadAllocations(append=false){
+  if(append&&!allocationAfter.value)return
+  const result=await get<{scope:string;executable:boolean;allocations:AllocationOverview[];next_after:string|null}>('/allocations'+(append?'?after='+encodeURIComponent(allocationAfter.value!):''))
+  if(result.scope!=='owner_allocation_observations_only'||result.executable!==false)throw Error('unexpected allocation scope')
+  allocations.value=append?[...allocations.value,...result.allocations]:result.allocations
+  allocationAfter.value=result.next_after
+}
+const nav = [{key:'dashboard',label:'仪表盘'},{key:'devices',label:'设备管理'},{key:'mappings',label:'映射管理'},{key:'domains',label:'域名管理'},{key:'nodes',label:'节点管理'},{key:'allocations',label:'分配与切换'},{key:'audit',label:'操作审计'},{key:'commercial',label:'套餐与额度'}]
 const title = computed(() => nav.find(n=>n.key===page.value)?.label)
 const labels:Record<string,string> = {queued:'等待执行器',starting:'启动中',running:'已应用（执行器报告）',stopping:'停止中',stopped:'已停止',failed_or_unknown:'失败或未知'}
 function clearPair(){pairing.value='';if(pairTimer) clearTimeout(pairTimer)}
 function reset(){
-  auditEvents.value=[];auditBefore.value=null;commercial.value=null
+  auditEvents.value=[];auditBefore.value=null;commercial.value=null;allocations.value=[];allocationAfter.value=null
   token.value='';user.value='';password.value='';devices.value=[];nodes.value=[];domains.value=[];mappings.value=[];
   selectedMapping.value=null;runtime.value=null;traffic.value=[];deviceStatus.value=null;clearPair();notice.value='';page.value='dashboard'
   Object.assign(create,{device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
@@ -81,6 +93,7 @@ async function run(fn:()=>Promise<void>){
 async function get<T>(path:string){return api<T>(path,token.value)}
 async function send<T>(path:string,method:string,body?:unknown){return api<T>(path,token.value,method,body)}
 async function refresh(){
+  if(page.value==='allocations'){await loadAllocations();return}
   if(page.value==='audit'){await loadAudit();return}
   if(page.value==='commercial'){await loadCommercial();return}
   const [d,n,h,m]=await Promise.all([get<Device[]>('/devices'),get<Node[]>('/nodes/overview'),get<Domain[]>('/domains'),get<Mapping[]>('/mappings')])
@@ -110,7 +123,7 @@ async function login(){await run(async()=>{
   try{user.value=(await get<{username:string}>('/auth/me')).username;await refresh()}catch(e){reset();throw e}
 })}
 async function logout(){await run(async()=>{try{await send('/auth/logout','POST')}finally{reset()}})}
-function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value='';auditEvents.value=[];auditBefore.value=null;commercial.value=null;if(key==='audit')void run(()=>loadAudit());if(key==='commercial')void run(loadCommercial)}
+function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value='';auditEvents.value=[];auditBefore.value=null;commercial.value=null;if(key==='audit')void run(()=>loadAudit());if(key==='commercial')void run(loadCommercial);allocations.value=[];allocationAfter.value=null;if(key==='allocations')void run(()=>loadAllocations())}
 async function issue(){await run(async()=>{clearPair();const p=await send<{pairing_code:string;expires_in:number}>('/devices/pairing-code','POST');pairing.value=p.pairing_code;pairTimer=setTimeout(clearPair,p.expires_in*1000)})}
 async function revoke(d:Device){await run(async()=>{await send('/devices/'+d.id+'/revoke','POST');await refresh();deviceStatus.value=null;notice.value='设备凭据已吊销'})}
 async function inspectDevice(d:Device){await run(async()=>{deviceStatus.value=await get('/devices/'+d.id+'/status')})}
@@ -223,6 +236,27 @@ onBeforeUnmount(clearPair)
             </a-table>
             <div class="cursor-footer"><span data-testid="devices-count">已加载 {{devices.length}} 条</span><a-button v-if="more.devices" :disabled="busy" @click="loadMore('devices')" data-testid="devices-more">加载更多</a-button></div>
             <a-card v-if="deviceStatus" size="small" title="设备心跳（自报）"><p>管理在线：{{deviceStatus.management_online?'是':'否'}}</p><p>期望版本：{{deviceStatus.desired_revision}} · 自报版本：{{deviceStatus.reported_revision??'—'}}</p><p>自报状态：{{deviceStatus.reported_state??'—'}}</p></a-card>
+          </a-card>
+        </template>
+        <template v-if="page==='allocations'">
+          <div class="metrics">
+            <a-card><a-statistic title="已加载分配" :value="allocations.length"/></a-card>
+            <a-card><a-statistic title="保留分配（已加载）" :value="allocations.filter(a=>a.state==='reserved').length"/></a-card>
+            <a-card><a-statistic title="历史故障观察（已加载）" :value="allocations.filter(a=>a.failure_at!==null).length"/></a-card>
+            <a-card><a-statistic title="已有替代分配（已加载）" :value="allocations.filter(a=>a.successor_id!==null).length"/></a-card>
+          </div>
+          <a-card title="分配与切换记录" data-testid="allocation-overview">
+            <p class="muted">仅显示当前租户。许可签发、领取、隔离及回收是控制面记录，不证明隧道正在运行。历史记录保留，已退役不代表月流量退还。</p>
+            <a-table :data-source="allocations" row-key="id" :pagination="{pageSize:10}" :scroll="{x:1400}">
+              <a-table-column title="分配 ID"><template #default="{record}"><div class="wrap-code">{{record.id}}</div><div class="small muted">代际 {{record.generation}} · 节点代际 {{record.node_generation}}</div></template></a-table-column>
+              <a-table-column title="节点 / 端口"><template #default="{record}">{{record.node_name}}<div class="small">{{record.protocol?.toUpperCase()||'—'}} {{record.local_port??'—'}} → {{record.bind_port}}</div></template></a-table-column>
+              <a-table-column title="许可状态"><template #default="{record}"><a-tag>{{allocationLabels[record.authorization_state]||'未知'}}</a-tag><div class="small muted">到期 {{nodeTime(record.expires_at)}}</div></template></a-table-column>
+              <a-table-column title="故障观察"><template #default="{record}">{{record.failure_reason?(failureLabels[record.failure_reason]||'未知'):'—'}}<div class="small muted">{{nodeTime(record.failure_at)}}</div></template></a-table-column>
+              <a-table-column title="隔离与回收"><template #default="{record}"><div>隔离 {{nodeTime(record.fenced_at)}}</div><div>清理 {{nodeTime(record.cleanup_at)}}</div><div>回收 {{nodeTime(record.reclaimed_at)}}</div><div>退役 {{nodeTime(record.retired_at)}}</div></template></a-table-column>
+              <a-table-column title="切换链路"><template #default="{record}"><div>链路代际 {{record.lineage_epoch}}</div><div class="small">自动预留 {{record.auto_state==='enabled'?'已授权':record.auto_state==='cancelled'?'已撤销':'未授权'}}</div><div v-if="record.source_id" class="wrap-code">来源 {{record.source_id}}</div><div v-if="record.successor_id" class="wrap-code">替代 {{record.successor_id}}</div></template></a-table-column>
+              <a-table-column title="有限预算"><template #default="{record}"><template v-if="record.monthly_bytes!==null"><div>{{record.monthly_bytes}} B / {{record.month_utc}}</div><div>{{record.rate_bytes_per_second}} B/s · {{record.connection_slots}} 槽</div></template><span v-else>—</span></template></a-table-column>
+            </a-table>
+            <div class="cursor-footer"><span data-testid="allocations-count">已加载 {{allocations.length}} 条</span><a-button v-if="allocationAfter!==null" :disabled="busy" @click="run(()=>loadAllocations(true))">加载更多</a-button></div>
           </a-card>
         </template>
         <template v-if="page==='nodes'">
