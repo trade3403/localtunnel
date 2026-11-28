@@ -126,6 +126,12 @@ pub(crate) struct Outcome {
 /// A successful write is payload accounting, not a wire/delivery guarantee.
 pub(crate) fn run(listener: TcpListener, target_port: u16, rate: u32, bytes: u64,
                   slots: u32, deadline: Deadline) -> io::Result<Outcome> {
+    run_checked(listener,target_port,rate,bytes,slots,deadline,|_|Ok(true))
+}
+/// The supervisor checks the owned engine on every pass, and checks actual
+/// ownership of the target listener before admitting a backend connection.
+pub(crate) fn run_checked(listener: TcpListener, target_port: u16, rate: u32, bytes: u64,
+                  slots: u32, deadline: Deadline, mut healthy: impl FnMut(bool)->io::Result<bool>) -> io::Result<Outcome> {
     let local = listener.local_addr()?;
     if local.ip() != std::net::IpAddr::V4(Ipv4Addr::LOCALHOST) || local.port() == target_port
         || target_port == 0 || !(65536..=125_000_000).contains(&rate)
@@ -142,9 +148,10 @@ pub(crate) fn run(listener: TcpListener, target_port: u16, rate: u32, bytes: u64
     loop {
         if left == 0 { return Ok(Outcome { end: End::Exhausted, written: bytes }); }
         if !deadline.alive()? { return Ok(Outcome { end: End::Expired, written: bytes - left }); }
+        if !healthy(false)? { return Err(io::Error::other("engine unavailable")); }
         match listener.accept() {
             Ok((source, peer)) => {
-                if peer.ip().is_loopback() && connections.len() < cap && deadline.alive()? {
+                if peer.ip().is_loopback() && connections.len() < cap && deadline.alive()? && healthy(true)? {
                     if let Ok(c) = Connection::new(source, target) {
                         if deadline.alive()? { connections.push(c); }
                     }

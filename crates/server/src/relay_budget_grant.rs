@@ -1,4 +1,4 @@
-//! Finite TCP budget authorization observation; never executable.
+//! Finite TCP budget authorization and separately opted-in guarded loopback execution.
 use crate::{auth,relay};
 use axum::{extract::{DefaultBodyLimit,Path,State},http::{HeaderMap,StatusCode},response::Response,routing::post,Json,Router};
 use serde::{Deserialize,Serialize};
@@ -45,7 +45,9 @@ pub fn routes(pool:SqlitePool)->Router{
         .route("/api/v1/allocations/{id}/budget-intent",post(intent))
         .route("/api/v1/relay/budget-claim",post(claim))
         .route("/api/v1/allocations/{id}/budget-run-intent",post(run_intent))
-        .route("/api/v1/relay/budget-run-claim",post(run_claim)).layer(DefaultBodyLimit::max(1024)).with_state(pool)
+        .route("/api/v1/relay/budget-run-claim",post(run_claim))
+        .route("/api/v1/allocations/{id}/budget-start-intent",post(start_intent))
+        .route("/api/v1/relay/budget-start-claim",post(start_claim)).layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 async fn issue(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Issue>)->Result<Response,Failure>{
     let token=auth::bearer(&headers)?;
@@ -96,19 +98,22 @@ const CLAIM_ELIGIBLE:&str="a.generation=2 AND d.revision=g.device_revision AND g
  AND g.issued_at<=unixepoch() AND g.expires_at>unixepoch()+2
  AND (e.expires_at IS NULL OR e.expires_at>=g.expires_at)";
 async fn intent(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Intent>)->Result<Response,Failure>{
-    intent_for(pool,id,headers,c,false).await
+    intent_for(pool,id,headers,c,false,false).await
 }
 async fn run_intent(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Intent>)->Result<Response,Failure>{
-    intent_for(pool,id,headers,c,true).await
+    intent_for(pool,id,headers,c,true,false).await
 }
-async fn intent_for(pool:SqlitePool,id:String,headers:HeaderMap,c:Intent,guarded:bool)->Result<Response,Failure>{
+async fn start_intent(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Intent>)->Result<Response,Failure>{
+    intent_for(pool,id,headers,c,true,true).await
+}
+async fn intent_for(pool:SqlitePool,id:String,headers:HeaderMap,c:Intent,guarded:bool,execution:bool)->Result<Response,Failure>{
     let mode=if guarded{"guarded_tcp"}else{"observe"};
     let token=auth::bearer(&headers)?;
     let owner=auth::identify(&pool,&token).await?.id;
     if !hex_id(&id)||!hex_id(&c.grant_id)||c.expected_generation!=2||!(30000..=59999).contains(&c.relay_port){return Err(BAD)}
     let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
-    let query=format!("INSERT INTO relay_budget_intents(grant_id,node_id,relay_port,bind_port,created_at,intent_mode)
-        SELECT g.id,b.node_id,?,a.bind_port,unixepoch(),? {CURRENT} JOIN relay_budget_grants g ON g.allocation_id=a.id
+    let query=format!("INSERT INTO relay_budget_intents(grant_id,node_id,relay_port,bind_port,created_at,intent_mode,execution_opt_in)
+        SELECT g.id,b.node_id,?,a.bind_port,unixepoch(),?,? {CURRENT} JOIN relay_budget_grants g ON g.allocation_id=a.id
         WHERE {ELIGIBLE} AND {CLAIM_ELIGIBLE} AND a.id=? AND g.id=? AND a.owner_id=?
         AND EXISTS(SELECT 1 FROM admin_sessions s WHERE s.user_id=a.owner_id AND s.token_digest=? AND s.expires_at>unixepoch())
         AND NOT EXISTS(SELECT 1 FROM relay_tcp_intents x WHERE x.node_id=b.node_id AND x.relay_port=?)
@@ -116,34 +121,37 @@ async fn intent_for(pool:SqlitePool,id:String,headers:HeaderMap,c:Intent,guarded
         AND NOT EXISTS(SELECT 1 FROM relay_http_intents x WHERE x.node_id=b.node_id AND x.relay_port=?)
         AND NOT EXISTS(SELECT 1 FROM relay_https_intents x WHERE x.node_id=b.node_id AND x.relay_port=?)
         ON CONFLICT DO NOTHING RETURNING grant_id,node_id,relay_port,bind_port,created_at,claimed_at");
-    let row=sqlx::query_as::<_,IntentRecord>(&query).bind(c.relay_port).bind(mode).bind(&id).bind(&c.grant_id).bind(&owner).bind(token)
+    let row=sqlx::query_as::<_,IntentRecord>(&query).bind(c.relay_port).bind(mode).bind(i64::from(execution)).bind(&id).bind(&c.grant_id).bind(&owner).bind(token)
         .bind(c.relay_port).bind(c.relay_port).bind(c.relay_port).bind(c.relay_port)
         .fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)?;
     sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
         SELECT a.owner_id,?,a.live_mapping_id,a.mapping_revision,g.id,'pending' FROM relay_budget_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")
-        .bind(if guarded{"budget.run_intent"}else{"budget.intent"}).bind(&row.grant_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+        .bind(if execution{"budget.start_intent"}else if guarded{"budget.run_intent"}else{"budget.intent"}).bind(&row.grant_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
     tx.commit().await.map_err(|_|INTERNAL)?;
-    Ok(auth::uncached((StatusCode::CREATED,Json(serde_json::json!({"scope":if guarded{"budget_guarded_intent_preview_only"}else{"budget_intent_preview_only"},"executable":false,"intent":row})))))
+    Ok(auth::uncached((StatusCode::CREATED,Json(serde_json::json!({"scope":if execution{"budget_guarded_start_intent"}else if guarded{"budget_guarded_intent_preview_only"}else{"budget_intent_preview_only"},"executable":false,"intent":row})))))
 }
 async fn claim(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Claim>)->Result<Response,Failure>{
-    claim_for(pool,headers,c,false).await
+    claim_for(pool,headers,c,false,false).await
 }
 async fn run_claim(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Claim>)->Result<Response,Failure>{
-    claim_for(pool,headers,c,true).await
+    claim_for(pool,headers,c,true,false).await
 }
-async fn claim_for(pool:SqlitePool,headers:HeaderMap,c:Claim,guarded:bool)->Result<Response,Failure>{
+async fn start_claim(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<Claim>)->Result<Response,Failure>{
+    claim_for(pool,headers,c,true,true).await
+}
+async fn claim_for(pool:SqlitePool,headers:HeaderMap,c:Claim,guarded:bool,execution:bool)->Result<Response,Failure>{
     let mode=if guarded{"guarded_tcp"}else{"observe"};
     let credential=relay::digest(&headers)?;
     if c.protocol_version!=1||!hex_id(&c.grant_id)||!hex_id(&c.allocation_id)||!hex_id(&c.mapping_id)||!hex_id(&c.node_id)||!hex_id(&c.nonce)
         ||c.mapping_revision<1||c.node_generation<1||c.generation!=2||!(30000..=59999).contains(&c.relay_port){return Err(BAD)}
     let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
     let query=format!("UPDATE relay_budget_intents SET claimed_at=unixepoch()
-      WHERE grant_id=? AND node_id=? AND relay_port=? AND intent_mode=? AND claimed_at IS NULL
+      WHERE grant_id=? AND node_id=? AND relay_port=? AND intent_mode=? AND execution_opt_in=? AND claimed_at IS NULL
       AND EXISTS(SELECT 1 {CURRENT} JOIN relay_budget_grants g ON g.allocation_id=a.id
         WHERE {ELIGIBLE} AND {CLAIM_ELIGIBLE} AND g.id=relay_budget_intents.grant_id
         AND b.node_id=relay_budget_intents.node_id AND a.bind_port=relay_budget_intents.bind_port
         AND a.id=? AND m.id=? AND b.mapping_revision=? AND b.node_generation=? AND r.token_digest=?)");
-    let changed=sqlx::query(&query).bind(&c.grant_id).bind(&c.node_id).bind(c.relay_port).bind(mode).bind(&c.allocation_id).bind(&c.mapping_id)
+    let changed=sqlx::query(&query).bind(&c.grant_id).bind(&c.node_id).bind(c.relay_port).bind(mode).bind(i64::from(execution)).bind(&c.allocation_id).bind(&c.mapping_id)
         .bind(c.mapping_revision).bind(c.node_generation).bind(credential).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
     if changed.rows_affected()!=1{return Err(DENIED)}
     let query=format!("SELECT {FIELDS} {CURRENT} JOIN relay_budget_grants g ON g.allocation_id=a.id WHERE g.id=?");
@@ -152,7 +160,7 @@ async fn claim_for(pool:SqlitePool,headers:HeaderMap,c:Claim,guarded:bool)->Resu
         .bind(&c.grant_id).fetch_one(&mut *tx).await.map_err(|_|INTERNAL)?;
     sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
         SELECT a.owner_id,?,a.live_mapping_id,a.mapping_revision,g.id,'claimed' FROM relay_budget_grants g JOIN relay_allocations a ON a.id=g.allocation_id WHERE g.id=?")
-        .bind(if guarded{"budget.run_claim_preview"}else{"budget.claimed"}).bind(&c.grant_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+        .bind(if execution{"budget.start_claim"}else if guarded{"budget.run_claim_preview"}else{"budget.claimed"}).bind(&c.grant_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
     tx.commit().await.map_err(|_|INTERNAL)?;
-    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":if guarded{"budget_guarded_claim_preview_only"}else{"budget_claim_preview_only"},"executable":false,"grant":grant,"intent":row}))))
+    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":if execution{"budget_guarded_tcp_start"}else if guarded{"budget_guarded_claim_preview_only"}else{"budget_claim_preview_only"},"executable":execution,"grant":grant,"intent":row}))))
 }

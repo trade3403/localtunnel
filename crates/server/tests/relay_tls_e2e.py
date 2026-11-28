@@ -998,6 +998,63 @@ try:
         fails(claim_budget())
         assert marker.is_file()
         report["real_tls_finite_budget_node_verification_and_expiry_without_listener"]=True
+        # Fresh explicit opt-in: existing observation or guarded previews
+        # cannot be promoted. Use the remaining reserved plan slice.
+        with socketserver.ThreadingTCPServer(("127.0.0.1",0),Stream) as target:
+            target.daemon_threads=True
+            worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
+            try:
+                br,bf=offline_port(30000,59999),offline_port(20001,29999)
+                control(tokens[0],{"protocol_version":1,"node_id":nodes[0],"generation":1,"capacity":5,"nonce":secrets.token_hex(16)},200)
+                a2=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":finite_device,"node_id":nodes[0],
+                    "protocol":"tcp","local_port":target.server_address[1],"bind_port":bf},finite_owner,201)
+                admin("allocations/"+a2["id"]+"/budget-preview",dict(spec,rate_bytes_per_second=65536,monthly_bytes=4096,connection_slots=1),finite_owner,201)
+                service_token=secrets.token_hex(32);tokens.append(service_token)
+                secret=dirs[0]/"budget-tcp.token";secret.write_text(service_token+"\n");secret.chmod(0o600)
+                config=root/"finite-client.toml"
+                subprocess.run([str(core_test.CLI),"client-config",str(config),f"127.0.0.1:{br}","m_"+a2["mapping_id"],f"127.0.0.1:{target.server_address[1]}"],
+                    env=dict(os.environ,LOCALTUNNEL_TOKEN=service_token,LOCALTUNNEL_SERVER_PUBLIC_KEY=public0),
+                    check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                g2=admin("allocations/"+a2["id"]+"/budget-grant",spec,finite_owner,201)["grant"]
+                admin("allocations/"+a2["id"]+"/budget-start-intent",dict(grant_id=g2["id"],expected_generation=2,relay_port=br),finite_owner,201)
+                args=[str(relay),"--budget-tcp-preview",str(dirs[0]),"localhost",str(tp),nodes[0],"1","5",a2["id"],a2["mapping_id"],"1","2",g2["id"],str(bf),"65536","4096","1",str(br),str(engine)]
+                def start_finite():
+                    p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);children.append(p);return p
+                finite_relay=start_finite()
+                with selectors.DefaultSelector() as sel:
+                    sel.register(finite_relay.stdout,selectors.EVENT_READ);assert sel.select(5)
+                assert finite_relay.stdout.readline().strip()=="relay finite TCP engine started"
+                agent=subprocess.Popen([str(engine),str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,RUST_LOG="warn"));children.append(agent)
+                connected=[]
+                def connect_finite():
+                    try:
+                        c=socket.create_connection(("127.0.0.1",bf),timeout=.5)
+                        try:
+                            c.sendall(b"budget-echo");data=c.recv(11)
+                            if data!=b"budget-echo":c.close();return False
+                            connected.append(c);return True
+                        except OSError:c.close();return False
+                    except OSError:return False
+                wait(connect_finite,6)
+                with connected[0] as c:
+                    c.settimeout(3)
+                    c.sendall(b"x"*8192)
+                    try:
+                        while c.recv(4096):pass
+                    except (ConnectionResetError,BrokenPipeError):pass
+                out,err=finite_relay.communicate(timeout=5)
+                assert finite_relay.returncode==0 and out.strip()=="relay finite TCP stopped reason=exhausted bytes=4096"
+                stop(agent)
+                fails(start_finite())
+                for port in (br,bf):
+                    with socket.socket() as check:
+                        check.settimeout(.5);assert check.connect_ex(("127.0.0.1",port))!=0
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT execution_opt_in,claimed_at IS NOT NULL FROM relay_budget_intents WHERE grant_id=?",(g2["id"],)).fetchone()==(1,1)
+                assert (dirs[0]/("budget-consumed-"+g2["id"])).is_file()
+                report["real_tls_guarded_noise_tcp_budget_exhaustion_and_replay_rejection"]=True
+            finally:
+                target.shutdown();target.server_close();worker.join(timeout=3)
         dns.shutdown();dns_thread.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
@@ -1010,4 +1067,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==25 and all(report.values())
+assert len(report)==26 and all(report.values())
