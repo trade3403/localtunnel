@@ -41,10 +41,10 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat','node_policy_audit','relay_allocations','relay_grants','relay_tcp_intents','relay_udp_intents','relay_http_intents','relay_https_intents','relay_budget_previews','relay_budget_grants','relay_budget_intents','relay_allocation_fences','relay_cleanup_reports','relay_budget_reclaims','relay_budget_retirements','relay_failover_links','relay_failure_observations')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat','node_policy_audit','relay_allocations','relay_grants','relay_tcp_intents','relay_udp_intents','relay_http_intents','relay_https_intents','relay_budget_previews','relay_budget_grants','relay_budget_intents','relay_allocation_fences','relay_cleanup_reports','relay_budget_reclaims','relay_budget_retirements','relay_failover_links','relay_failure_observations','relay_auto_failover')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(39) => (StatusCode::OK, "ready"),
+        Ok(40) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
@@ -198,12 +198,14 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }else{None};
     if scan_relay_failures{
         let result=reconciliation::scan_failures(&pool).await?;
-        println!("{}",serde_json::to_string(&result)?);
+        let (reserved,_)=failover::scan_auto(&pool,"").await?;
+        println!("{}",serde_json::json!({"observed":result.observed,"fenced":result.fenced,"reserved":reserved}));
         return Ok(())
     }
     if watch_relay_failures{
         // An opt-in independent controller. No HTTP listener, tenant token,
         // grant issuance or remote command execution.
+        let mut cursor=String::new();
         loop{
             match reconciliation::scan_failures(&pool).await{
                 Ok(result)=>{
@@ -213,6 +215,13 @@ async fn run() -> Result<(), Box<dyn Error>> {
                     }
                 },
                 Err(_)=>eprintln!("relay failure scan unavailable; resources retained"),
+            }
+            match failover::scan_auto(&pool,&cursor).await{
+                Ok((reserved,next))=>{
+                    cursor=next;
+                    if reserved>0{println!("relay failover reserved={reserved}");io::stdout().flush()?;}
+                },
+                Err(_)=>{cursor.clear();eprintln!("relay failover scan unavailable; resources retained");}
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }

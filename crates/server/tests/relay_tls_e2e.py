@@ -1490,6 +1490,65 @@ try:
                     except urllib.error.HTTPError as ex:assert ex.code==404
                     report["real_automatic_stale_node_detection_expiry_fence_without_release"]=True
                     live[2]=start(dirs[2],2)
+                    # Explicit owner opt-in after observation, pinned to the
+                    # current entitlement. No stored session is needed later.
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        dual_tenant=db.execute("SELECT tenant_id FROM relay_budget_previews WHERE allocation_id=?",(sid,)).fetchone()[0]
+                    expanded=cmd("--commercial-create-plan",data={"code":"finite-relay","version":3,"name":"Finite recovery",
+                        "max_active_devices":4,"max_retained_devices":8,"max_mappings":8,"max_bandwidth_bps":1048576,
+                        "max_monthly_bytes":195904,"max_concurrent_connections":4})
+                    cmd("--commercial-assign",data={"tenant_id":dual_tenant,"plan_id":expanded,"expected_revision":1,"state":"active","expires_at":None})
+                    opt_path="allocations/"+sid+"/auto-failover"
+                    opt_data=dict(grant_id=second["grant"]["id"],expected_entitlement_revision=2,enabled=True)
+                    try:
+                        admin(opt_path,opt_data,finite_owner,200)
+                        raise AssertionError("cross-owner opt-in")
+                    except urllib.error.HTTPError as ex:assert ex.code==409
+                    opted=admin(opt_path,opt_data,dual_owner,200)
+                    assert opted["executable"] is False and opted["opt_in"]["cancelled_at"] is None
+                    assert admin(opt_path,opt_data,dual_owner,200)==opted
+                    # A separate source can opt out irreversibly before any
+                    # automatic action. It has not been retired.
+                    other_opt="allocations/"+fid+"/auto-failover"
+                    other_data=dict(grant_id=first["grant"]["id"],expected_entitlement_revision=2,enabled=True)
+                    admin(other_opt,other_data,dual_owner,200)
+                    cancelled=admin(other_opt,dict(other_data,enabled=False),dual_owner,200)
+                    assert cancelled["opt_in"]["cancelled_at"] is not None
+                    try:
+                        admin(other_opt,other_data,dual_owner,200)
+                        raise AssertionError("cancelled opt-in re-enabled")
+                    except urllib.error.HTTPError as ex:assert ex.code==409
+                    assert json.loads(cmd("--scan-relay-failures"))["reserved"]==0
+                    # Recovered node can submit the real cleanup observation,
+                    # but the trusted operator must still verify shutdown.
+                    report_args=[str(relay),"--report-budget-cleanup",str(second["d"]),"localhost",str(tp),nodes[2],"1","7",
+                        sid,second["a"]["mapping_id"],"1","3",second["grant"]["id"],str(second["rp"]),str(second["bp"])]
+                    cleanup=subprocess.run(report_args,text=True,capture_output=True,timeout=12)
+                    assert cleanup.returncode==0 and cleanup.stdout.strip()=="relay cleanup observation recorded; resources retained"
+                    assert json.loads(cmd("--scan-relay-failures"))["reserved"]==0
+                    cmd("--recover-relay-budget",sid,second["grant"]["id"],"offline_engine_and_guard_verified_stopped")
+                    assert json.loads(cmd("--scan-relay-failures"))["reserved"]==0
+                    cmd("--retire-relay-budget",sid,second["grant"]["id"],"offline_ports_and_engine_verified_stopped")
+                    control(tokens[0],dict(protocol_version=1,node_id=nodes[0],generation=1,capacity=8,nonce=secrets.token_hex(16)),200)
+                    watcher2=subprocess.Popen([str(exe),"--watch-relay-failures",str(center)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                    children.append(watcher2)
+                    def auto_reserved():
+                        assert watcher2.poll() is None
+                        with sqlite3.connect(center/"control.sqlite3") as db:
+                            return db.execute("SELECT count(*) FROM relay_failover_links WHERE source_id=?",(sid,)).fetchone()==(1,)
+                    wait(auto_reserved,15)
+                    stop(watcher2)
+                    assert json.loads(cmd("--scan-relay-failures"))["reserved"]==0
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        successor=db.execute("SELECT successor_id FROM relay_failover_links WHERE source_id=?",(sid,)).fetchone()[0]
+                        assert db.execute("SELECT generation,state,node_id FROM relay_allocations WHERE id=?",(successor,)).fetchone() in ((1,"reserved",nodes[0]),(1,"reserved",nodes[1]))
+                        assert db.execute("SELECT count(*) FROM relay_budget_grants WHERE allocation_id=?",(successor,)).fetchone()==(0,)
+                        assert db.execute("SELECT sum(monthly_bytes) FROM relay_budget_previews WHERE tenant_id=?",(dual_tenant,)).fetchone()==(195904,)
+                        assert db.execute("SELECT sum(rate_bytes_per_second),sum(connection_slots) FROM relay_budget_active WHERE tenant_id=?",(dual_tenant,)).fetchone()==(131072,4)
+                        assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.failover_reserved' AND request_id=?",(sid,)).fetchone()==(1,)
+                        assert db.execute("SELECT count(*) FROM relay_failover_links WHERE source_id=?",(fid,)).fetchone()==(0,)
+                        assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
+                    report["real_opted_in_automatic_failover_after_verified_retirement"]=True
                 finally:
                     for item in items:
                         if item.get("conn") is not None:item["conn"].close()
@@ -1509,4 +1568,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==33 and all(report.values())
+assert len(report)==34 and all(report.values())

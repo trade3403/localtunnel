@@ -406,6 +406,7 @@ REQUIRED["management-v09"] = {
          "real_retired_failover_atomic_successor_and_budget_isolation",
          "real_failover_successor_atomic_activation_and_noise_traffic",
          "real_automatic_stale_node_detection_expiry_fence_without_release",
+         "real_opted_in_automatic_failover_after_verified_retirement",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",
