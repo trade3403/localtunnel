@@ -27,6 +27,9 @@ try{
   assert.equal(spawnSync(exe,['--init-admin',root],{input:JSON.stringify({username:'operator',password}),timeout:20000}).status,0)
   const node=spawnSync(exe,['--add-node',root,'Local relay'],{timeout:20000,encoding:'utf8'})
   assert.equal(node.status,0)
+  const localNode=node.stdout.trim()
+  assert.match(localNode,/^[a-f0-9]{32}$/)
+  assert.equal(spawnSync(exe,['--set-node-policy',root,localNode,'1','12','test-east','active'],{timeout:20000}).status,0)
   // Real SQLite fixtures to exercise server cursor boundaries without
   // manufacturing fake HTTP responses. The real CLI-created node sorts first.
   const seed=spawnSync('python3',['-c',`import sqlite3,sys
@@ -79,11 +82,22 @@ with sqlite3.connect(sys.argv[1]) as db:
   const menu=name=>page.getByRole('menuitem',{name,exact:true})
   await menu('节点管理').click()
   await page.getByText('Local relay',{exact:true}).waitFor()
+  const nodeRow=page.getByTestId('node-overview').getByRole('row').filter({hasText:'Local relay'})
+  await nodeRow.getByText('未注册',{exact:true}).waitFor()
+  await nodeRow.getByText('test-east',{exact:true}).waitFor()
+  await nodeRow.getByText('接收调度',{exact:true}).waitFor()
+  await nodeRow.getByText('12 / —',{exact:true}).waitFor()
+  await nodeRow.getByText('0 / 0',{exact:true}).waitFor()
+  assert.equal(spawnSync(exe,['--set-node-policy',root,localNode,'2','9','test-west','active'],{timeout:20000}).status,0)
+  await page.getByRole('button',{name:'刷新数据'}).click()
+  await nodeRow.getByText('test-west',{exact:true}).waitFor()
+  await nodeRow.getByText('9 / —',{exact:true}).waitFor()
   await page.getByTestId('nodes-count').filter({hasText:/^已加载 100 条$/}).waitFor()
   await page.getByTestId('nodes-more').click()
   await page.getByTestId('nodes-count').filter({hasText:/^已加载 102 条$/}).waitFor()
   await page.getByTestId('nodes-more').waitFor({state:'hidden'})
   report.real_cursor_pagination=true
+  report.real_browser_node_overview_and_refresh=true
   await menu('设备管理').click()
   await page.getByRole('button',{name:'生成配对码'}).click()
   const code=await page.getByTestId('pairing').textContent()
@@ -369,6 +383,82 @@ with sqlite3.connect(sys.argv[1]) as db:
     assert.equal(await otherPage.evaluate(()=>localStorage.length+sessionStorage.length),0)
   }finally{await otherPage.close()}
   report.real_browser_commercial_owner_isolation=true
+  stage='allocation overview'
+  const nodeCredential=spawnSync(exe,['--relay-issue',root,localNode],{timeout:20000,encoding:'utf8'})
+  assert.equal(nodeCredential.status,0)
+  const heartbeat=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/relay/heartbeat',{method:'POST',
+    headers:{Authorization:'Bearer '+nodeCredential.stdout.trim(),'Content-Type':'application/json'},
+    body:JSON.stringify({protocol_version:1,generation:1,capacity:9})})
+  assert.equal(heartbeat.status,204)
+  const devs=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/devices',{headers:{Authorization:adminBearer}})
+  const dev=(await devs.json()).find(d=>d.name==='Browser fixture')
+  assert.ok(dev)
+  const allocationSpec={request_key:randomBytes(16).toString('hex'),device_id:dev.id,node_id:localNode,protocol:'tcp',local_port:8080,bind_port:29999}
+  const createAllocation=()=>fetch('http://127.0.0.1:'+apiPort+'/api/v1/allocations',{method:'POST',
+    headers:{Authorization:adminBearer,'Content-Type':'application/json'},body:JSON.stringify(allocationSpec)})
+  // Previous commercial phase intentionally left the owner expired.
+  // Exercise the real admission denial, then renew the same plan with
+  // its current revision before testing a successful reservation.
+  const expired=await entitlement()
+  assert.equal(expired.effective_state,'expired')
+  assert.equal((await createAllocation()).status,409)
+  assign('active',null,expired.revision)
+  const renewed=await entitlement()
+  assert.equal(renewed.effective_state,'active')
+  assert.equal(renewed.revision,expired.revision+1)
+  const refreshedHeartbeat=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/relay/heartbeat',{method:'POST',
+    headers:{Authorization:'Bearer '+nodeCredential.stdout.trim(),'Content-Type':'application/json'},
+    body:JSON.stringify({protocol_version:1,generation:1,capacity:9})})
+  assert.equal(refreshedHeartbeat.status,204)
+  const allocationResponse=await createAllocation()
+  assert.equal(allocationResponse.status,201)
+  const allocation=await allocationResponse.json()
+  await menu('分配与切换').click()
+  const allocationRow=page.getByTestId('allocation-overview').getByRole('row').filter({hasText:allocation.id})
+  await allocationRow.getByText('未签发许可',{exact:true}).waitFor()
+  await page.getByTestId('allocations-count').getByText('已加载 1 条',{exact:true}).waitFor()
+  await allocationRow.getByRole('button',{name:'取消分配',exact:true}).click()
+  await page.locator('.ant-popover:visible').getByRole('button',{name:'确认取消',exact:true}).click()
+  await allocationRow.getByText('已取消',{exact:true}).waitFor()
+  await allocationRow.getByText('不可直接取消',{exact:true}).waitFor()
+  report.real_browser_allocation_overview_history=true
+  stage='browser allocation create and conflict'
+  const form=page.getByTestId('allocation-create')
+  await form.getByTestId('allocation-device').click()
+  await page.locator('.ant-select-dropdown:visible').getByText('Browser fixture',{exact:true}).click()
+  await form.getByTestId('allocation-node').click()
+  await page.locator('.ant-select-dropdown:visible').getByText('Local relay',{exact:true}).click()
+  await page.locator('#allocation-bind-port').fill('29999')
+  const beatAgain=async()=>assert.equal((await fetch('http://127.0.0.1:'+apiPort+'/api/v1/relay/heartbeat',{method:'POST',
+    headers:{Authorization:'Bearer '+nodeCredential.stdout.trim(),'Content-Type':'application/json'},
+    body:JSON.stringify({protocol_version:1,generation:1,capacity:9})})).status,204)
+  await beatAgain()
+  const createdResponse=page.waitForResponse(r=>r.url().endsWith('/api/v1/allocations')&&r.request().method()==='POST')
+  await form.getByRole('button',{name:'创建分配预留',exact:true}).click()
+  const createdHttp=await createdResponse
+  assert.equal(createdHttp.status(),201)
+  const created=await createdHttp.json()
+  const submitted=createdHttp.request().postDataJSON()
+  assert.match(submitted.request_key,/^[a-f0-9]{32}$/)
+  assert.equal(submitted.device_id,dev.id)
+  assert.equal(submitted.node_id,localNode)
+  assert.equal(submitted.bind_port,29999)
+  assert.notEqual(created.id,allocation.id)
+  const createdRow=page.getByTestId('allocation-overview').getByRole('row').filter({hasText:created.id})
+  await createdRow.getByText('未签发许可',{exact:true}).waitFor()
+  await page.getByText('分配已预留（未启动）',{exact:true}).waitFor()
+  await beatAgain()
+  const rejectedResponse=page.waitForResponse(r=>r.url().endsWith('/api/v1/allocations')&&r.request().method()==='POST')
+  await form.getByRole('button',{name:'创建分配预留',exact:true}).click()
+  const rejected=await rejectedResponse
+  assert.equal(rejected.status(),409)
+  assert.notEqual(rejected.request().postDataJSON().request_key,submitted.request_key)
+  await page.getByText('状态冲突，请刷新并检查版本、域名验证或执行器状态',{exact:true}).waitFor()
+  await page.getByTestId('allocations-count').getByText('已加载 2 条',{exact:true}).waitFor()
+  await createdRow.getByRole('button',{name:'取消分配',exact:true}).click()
+  await page.locator('.ant-popover:visible').getByRole('button',{name:'确认取消',exact:true}).click()
+  await createdRow.getByText('已取消',{exact:true}).waitFor()
+  report.real_browser_allocation_create_cancel_conflict=true
   stage='logout'
   await page.getByRole('button',{name:'退出登录'}).click()
   await page.getByRole('heading',{name:'管理后台登录'}).waitFor()

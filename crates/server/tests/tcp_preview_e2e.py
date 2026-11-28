@@ -39,9 +39,10 @@ def call(base,path,status,method="GET",token=None,data=None):
     if code in (200,201,202):return json.loads(raw)
 
 def free(lo,hi,exclude,kind=socket.SOCK_STREAM):
-    for _ in range(200):
-        port=lo+secrets.randbelow(hi-lo+1)
-        if port in exclude:continue
+    low,high=map(int,Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split())
+    candidates=[p for p in range(lo,hi+1) if p not in exclude and not low<=p<=high]
+    while candidates:
+        port=candidates.pop(secrets.randbelow(len(candidates)))
         with socket.socket(socket.AF_INET,kind) as s:
             try:s.bind(("127.0.0.1",port))
             except OSError:continue
@@ -52,7 +53,9 @@ def line(p,prefix,seconds):
     with selectors.DefaultSelector() as s:
         s.register(p.stdout,selectors.EVENT_READ)
         assert s.select(seconds),"TCP readiness timed out"
-    assert p.stdout.readline().strip().startswith(prefix),"TCP readiness failed"
+    # No raw stdout/credential material in logs. Worker stderr contains
+    # fixed diagnostics only; the return code distinguishes exit from timeout.
+    assert p.stdout.readline().strip().startswith(prefix),f"TCP/UDP readiness failed (exit={p.poll()})"
 
 class Echo(socketserver.BaseRequestHandler):
     def handle(self):
@@ -119,9 +122,25 @@ try:
             call(base,route+"/tcp-start",409,"POST",admin,spec)
             assert call(base,route+"/stop",202,"POST",admin,{"request_id":q["request_id"]})["state"]=="stopped"
             report["real_tcp_scoped_queue_and_cancel"]=True
+            def node_policy(expected,mode):
+                result=subprocess.run([exe,"--set-node-policy",str(root),node,str(expected),"0","unassigned",mode],capture_output=True,timeout=20)
+                assert result.returncode==0,"node policy change failed"
+            # A pending but unclaimed request is cancelled atomically.
+            queued=call(base,route+"/tcp-start",202,"POST",admin,spec)
+            node_policy(1,"draining")
+            state=call(base,route+"/runtime",200,token=admin)["request"]
+            assert state["request_id"]==queued["request_id"] and state["state"]=="stopped"
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            new_draft={"device_id":device["id"],"node_id":node,"protocol":"tcp","local_port":local,"bind_port":free(20000,29999,[local,ingress])}
+            call(base,"mappings",409,"POST",admin,new_draft)
+            node_policy(2,"maintenance")
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            call(base,"mappings",409,"POST",admin,new_draft)
+            node_policy(3,"active")
+            report["real_node_drain_cancels_unclaimed_and_blocks_new_admission"]=True
             def start(bundle):
                 q=call(base,route+"/tcp-start",202,"POST",admin,spec)
-                p=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),mid,str(m["revision"]),str(relay),bundle,"240000"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                p=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),mid,str(m["revision"]),str(relay),bundle,"240000"],env=env,stdout=subprocess.PIPE,text=True)
                 children.append(p)
                 line(p,"TCP_PREVIEW_READY",45)
                 state=call(base,route+"/runtime",200,token=admin)
@@ -156,12 +175,27 @@ try:
             assert 3.8<=elapsed<=30
             report["tcp_bandwidth_measurements"]={"bytes_each_direction":524288,"elapsed_seconds":elapsed}
             report["real_tcp_noise_shared_bidirectional_cap"]=True
+            # Actual forwarding and durable reservations survive drain.
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                before=db.execute("SELECT * FROM bandwidth_reservations WHERE mapping_id=?",(mid,)).fetchall()
+                assert before
+            node_policy(4,"draining")
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            call(base,"mappings",409,"POST",admin,new_draft)
+            exchange(4096)
+            state=call(base,route+"/runtime",200,token=admin)["request"]
+            assert state["request_id"]==rid and state["state"]=="running"
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT * FROM bandwidth_reservations WHERE mapping_id=?",(mid,)).fetchall()==before
             call(base,route+"/stop",404,"POST",other,{"request_id":rid})
             call(base,route+"/stop",409,"POST",admin,{"request_id":secrets.token_hex(16)})
             assert call(base,route+"/stop",202,"POST",admin,{"request_id":rid})["state"]=="stopping"
             closed(p,rid,guard,"tcp_first")
             report["real_tcp_stop_closes_listeners_and_bundle"]=True
+            call(base,route+"/tcp-start",409,"POST",admin,spec)
+            node_policy(5,"active")
             p,rid,guard=start("tcp_second")
+            report["real_node_drain_preserves_live_tcp_budget_and_resumes_after_stop"]=True
             exchange(1024)
             policy(state="suspended")
             call(base,route+"/tcp-start",409,"POST",admin,spec)
@@ -191,12 +225,20 @@ try:
                 path="mappings/"+item["id"]
                 q=call(base,path+"/tcp-start",202,"POST",token,{"expected_revision":item["revision"]})
                 port=alloc(30000,60000)
-                child=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),item["id"],str(item["revision"]),str(port),bundle,"65536"],env=env,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+                child=subprocess.Popen([exe,"--runtime-tcp-worker",str(root),item["id"],str(item["revision"]),str(port),bundle,"65536"],env=env,stdout=subprocess.PIPE,text=True)
                 children.append(child)
                 return child,q["request_id"],path,port,bundle
             def ready_tcp(run):
                 child,rid,path,port,bundle=run
-                line(child,"TCP_PREVIEW_READY",45)
+                try:
+                    line(child,"TCP_PREVIEW_READY",45)
+                except AssertionError:
+                    # Inspect only enumerated request state and numeric exit
+                    # status. Do not print the request, manifest or credentials.
+                    with sqlite3.connect(root/"control.sqlite3") as db:
+                        state=db.execute("SELECT state FROM runtime_requests WHERE request_id=?",(rid,)).fetchone()
+                    print(f"TCP readiness diagnostic: bundle={bundle}, state={state}, exit={child.poll()}",file=sys.stderr,flush=True)
+                    raise
                 manifest=json.loads((root/bundle/"manifest.json").read_text())
                 assert manifest["byte_rate"]==65536
                 return manifest["tcp_limiter_port"]
@@ -593,4 +635,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len([v for v in report.values() if v is True])==20
+assert len([v for v in report.values() if v is True])==22

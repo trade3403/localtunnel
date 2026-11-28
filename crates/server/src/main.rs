@@ -3,6 +3,16 @@ mod devices;
 mod commercial;
 mod mappings;
 mod nodes;
+mod scheduling;
+mod reconciliation;
+mod failover;
+mod grants;
+mod relay_tcp;
+mod relay_http;
+mod relay_https;
+mod relay_budget;
+mod relay_budget_grant;
+mod relay;
 mod domains;
 mod preview;
 mod tcp_limit;
@@ -31,26 +41,40 @@ async fn health() -> &'static str {
 async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
     // Real database query, not a cached startup flag.
     let count = sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots')"
+        "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('users','devices','nodes','domains','mappings','admin_sessions','device_pairings','device_status','preview_attempts','runtime_requests','mapping_traffic','management_audit','commercial_plans','tenants','tenant_entitlements','commercial_operator_audit','bandwidth_reservations','bandwidth_recovery_audit','tenant_monthly_usage','connection_slots','relay_identities','relay_identity_audit','relay_heartbeat','node_policy_audit','relay_allocations','relay_grants','relay_tcp_intents','relay_udp_intents','relay_http_intents','relay_https_intents','relay_budget_previews','relay_budget_grants','relay_budget_intents','relay_allocation_fences','relay_cleanup_reports','relay_budget_reclaims','relay_budget_retirements','relay_failover_links','relay_failure_observations','relay_auto_failover')"
     ).fetch_one(&pool).await;
     match count {
-        Ok(20) => (StatusCode::OK, "ready"),
+        Ok(40) => (StatusCode::OK, "ready"),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "not ready"),
     }
 }
 
 #[cfg(target_os = "linux")]
-fn secure_sqlite_file(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+fn secure_sqlite_file(path: &Path, sidecar: bool) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     // The parent is private and trusted. Open without following links, then
     // inspect and tighten the exact descriptor rather than chmod a pathname.
-    let file = std::fs::OpenOptions::new().read(true)
+    let file = match std::fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+        .open(path) {
+        Ok(file) => file,
+        // SQLite may commit and unlink a transient journal between the
+        // pathname inspection and open. A missing main DB is not this case.
+        Err(e) if sidecar && e.kind()==io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    secure_sqlite_descriptor(&file, sidecar)
+}
+#[cfg(target_os = "linux")]
+fn secure_sqlite_descriptor(file: &std::fs::File, sidecar: bool) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let m = file.metadata()?;
-    if !m.is_file() || m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
+    if !m.is_file() || m.uid() != unsafe { libc::geteuid() } || m.nlink()>1 || (!sidecar && m.nlink()==0) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe SQLite ownership or link count"));
     }
+    // A valid owned sidecar can also be unlinked after open. Nothing at
+    // the old inode remains reachable by pathname; do not chmod it.
+    if m.nlink()==0 {return Ok(())}
     if m.permissions().mode() & 0o7777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
@@ -86,7 +110,7 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
             }
             Ok(_) => {
                 #[cfg(target_os = "linux")]
-                secure_sqlite_file(&dir.join(name))?;
+                secure_sqlite_file(&dir.join(name), name!="control.sqlite3")?;
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -120,11 +144,18 @@ async fn run() -> Result<(), Box<dyn Error>> {
         #[cfg(not(target_os = "linux"))]
         return Err("database snapshot maintenance is Linux-only".into());
     }
+    let scan_relay_failures=args.first().is_some_and(|a|a=="--scan-relay-failures");
+    let watch_relay_failures=args.first().is_some_and(|a|a=="--watch-relay-failures");
+    let relay_budget_retire=args.first().is_some_and(|a|a=="--retire-relay-budget");
+    let relay_budget_recover=args.first().is_some_and(|a|a=="--recover-relay-budget");
     let bandwidth_list=args.first().is_some_and(|a|a=="--commercial-list-bandwidth");
     let bandwidth_recover=args.first().is_some_and(|a|a=="--commercial-recover-bandwidth");
     let commercial_action=args.first().and_then(|a|a.to_str()).filter(|a|matches!(*a,"--commercial-create-account"|"--commercial-create-plan"|"--commercial-assign"));
+    let relay_action=args.first().and_then(|a|a.to_str()).filter(|a|matches!(*a,"--relay-issue"|"--relay-rotate"|"--relay-revoke"));
     let init = args.first().is_some_and(|a| a=="--init-admin");
     let add_node = args.first().is_some_and(|a| a=="--add-node");
+    let node_health = args.first().is_some_and(|a| a=="--node-health");
+    let set_policy = args.first().is_some_and(|a| a=="--set-node-policy");
     let set_node = args.first().is_some_and(|a| a=="--set-node-enabled");
     let export = args.first().is_some_and(|a| a=="--export-preview");
     let gateway = args.first().is_some_and(|a| a=="--preview-gateway");
@@ -143,12 +174,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let recover = args.first().is_some_and(|a| a=="--recover-runtime");
     let prune_history = args.first().is_some_and(|a| a=="--prune-history");
     let prune_logs = args.first().is_some_and(|a| a=="--prune-gateway-logs");
-    let expected = if prune_logs {3} else if prune_history {2} else if recover {4} else if tcp_worker {7} else if udp_device_worker {8} else if udp_worker || udp_resident {9} else if udp_supervise {7} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
+    let expected = if relay_budget_recover || relay_budget_retire {5} else if node_health {3} else if set_policy {7} else if relay_action==Some("--relay-issue") {3} else if relay_action.is_some() {4} else if prune_logs {3} else if prune_history {2} else if recover {4} else if tcp_worker {7} else if udp_device_worker {8} else if udp_worker || udp_resident {9} else if udp_supervise {7} else if supervise_tls || tls_worker || tls_resident {11} else if worker || resident {9} else if tls_gateway {if args.get(8).is_some_and(|a|a=="apply-checked"){10}else{9}} else if supervise {9} else if export {6} else if gateway {if args.get(6).is_some_and(|a|a=="apply-checked"){8}else{7}} else if add_node {3} else if set_node {4} else {2};
     if args.len()!=expected {
-        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --commercial-create-account <data-dir> | --commercial-create-plan <data-dir> | --commercial-assign <data-dir> (each reads bounded JSON stdin) | --commercial-list-bandwidth <data-dir> | --commercial-recover-bandwidth <data-dir> (reads exact reservation JSON and offline confirmation) | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-tcp-worker <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <bytes-per-second> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-device-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
+        return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --commercial-create-account <data-dir> | --commercial-create-plan <data-dir> | --commercial-assign <data-dir> (each reads bounded JSON stdin) | --scan-relay-failures <data-dir> | --watch-relay-failures <data-dir> | --retire-relay-budget <data-dir> <allocation-id> <grant-id> <offline_ports_and_engine_verified_stopped> | --recover-relay-budget <data-dir> <allocation-id> <grant-id> <offline_engine_and_guard_verified_stopped> | --commercial-list-bandwidth <data-dir> | --commercial-recover-bandwidth <data-dir> (reads exact reservation JSON and offline confirmation) | --relay-issue <data-dir> <node-id> | --relay-rotate / --relay-revoke <data-dir> <node-id> <expected-generation> | --node-health <data-dir> <node-id> | --set-node-policy <data-dir> <node-id> <expected-revision> <approved-capacity> <region> <active|draining|maintenance> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-tcp-worker <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <bytes-per-second> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-device-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
     }
-    let operator = bandwidth_list || bandwidth_recover || commercial_action.is_some() || init || add_node || set_node || export || gateway || supervise || udp_supervise || tcp_worker || udp_worker || udp_device_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
-    let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
+    let operator = scan_relay_failures || watch_relay_failures || relay_budget_retire || relay_budget_recover || node_health || set_policy || relay_action.is_some() || bandwidth_list || bandwidth_recover || commercial_action.is_some() || init || add_node || set_node || export || gateway || supervise || udp_supervise || tcp_worker || udp_worker || udp_device_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
+    let database = data_path(Path::new(if operator { &args[1] } else { &args[0] })).map_err(|e|{
+        if tcp_worker{eprintln!("TCP worker database path admission failed");}
+        e
+    })?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
     if prune_logs{
@@ -164,15 +198,68 @@ async fn run() -> Result<(), Box<dyn Error>> {
             .create_if_missing(true)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(3)))
-        .await?;
-    MIGRATOR.run(&pool).await?;
+        .await.map_err(|e|{
+            if tcp_worker{eprintln!("TCP worker database connection failed");}
+            e
+        })?;
+    MIGRATOR.run(&pool).await.map_err(|e|{
+        if tcp_worker{eprintln!("TCP worker database migration check failed");}
+        e
+    })?;
     // Hold the guard until this entire process finishes, including
     // cleanup and DB release. Exclusive recovery cannot race a new worker.
     let _bandwidth_guard=if bandwidth_recover{
         Some(preview::bandwidth_guard(&root,true)?)
     }else if supervise || supervise_tls || worker || tls_worker || resident || tls_resident || udp_supervise || udp_worker || udp_device_worker || udp_resident || tcp_worker || recover{
-        Some(preview::bandwidth_guard(&root,false)?)
+        Some(preview::bandwidth_guard(&root,false).map_err(|e|{
+            if tcp_worker{eprintln!("TCP worker shared bandwidth guard admission failed");}
+            e
+        })?)
     }else{None};
+    if scan_relay_failures{
+        let result=reconciliation::scan_failures(&pool).await?;
+        let (reserved,_)=failover::scan_auto(&pool,"").await?;
+        println!("{}",serde_json::json!({"observed":result.observed,"fenced":result.fenced,"reserved":reserved}));
+        return Ok(())
+    }
+    if watch_relay_failures{
+        // An opt-in independent controller. No HTTP listener, tenant token,
+        // grant issuance or remote command execution.
+        let mut cursor=String::new();
+        loop{
+            match reconciliation::scan_failures(&pool).await{
+                Ok(result)=>{
+                    if result.observed>0||result.fenced>0{
+                        println!("relay failure scan observed={} fenced={}",result.observed,result.fenced);
+                        io::stdout().flush()?;
+                    }
+                },
+                Err(_)=>eprintln!("relay failure scan unavailable; resources retained"),
+            }
+            match failover::scan_auto(&pool,&cursor).await{
+                Ok((reserved,next))=>{
+                    cursor=next;
+                    if reserved>0{println!("relay failover reserved={reserved}");io::stdout().flush()?;}
+                },
+                Err(_)=>{cursor.clear();eprintln!("relay failover scan unavailable; resources retained");}
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+    if relay_budget_retire{
+        let id=args[2].to_str().ok_or("invalid allocation id")?;
+        let grant=args[3].to_str().ok_or("invalid grant id")?;
+        let confirmation=args[4].to_str().ok_or("invalid retirement confirmation")?;
+        println!("{}",reconciliation::retire_budget(&pool,id,grant,confirmation).await?);
+        return Ok(())
+    }
+    if relay_budget_recover{
+        let id=args[2].to_str().ok_or("invalid allocation id")?;
+        let grant=args[3].to_str().ok_or("invalid grant id")?;
+        let confirmation=args[4].to_str().ok_or("invalid recovery confirmation")?;
+        println!("{}",reconciliation::reclaim_budget(&pool,id,grant,confirmation).await?);
+        return Ok(())
+    }
     if bandwidth_list{
         println!("{}",commercial::list_bandwidth(&pool).await?);
         return Ok(());
@@ -189,6 +276,25 @@ async fn run() -> Result<(), Box<dyn Error>> {
     if init {
         auth::init_admin(&pool).await.map_err(|_| "administrator initialization refused")?;
         return Ok(());
+    }
+    if let Some(action)=relay_action{
+        let node=args[2].to_str().ok_or("invalid node id")?;
+        let expected:i64=if action=="--relay-issue"{0}else{args[3].to_str().ok_or("invalid generation")?.parse().map_err(|_|"invalid generation")?};
+        if action!="--relay-issue" && expected<=0{return Err("invalid generation".into())}
+        let result=relay::change(&pool,node,expected,action=="--relay-revoke").await.map_err(|_|"relay credential change refused")?;
+        if let Some(token)=result{println!("{token}");}
+        return Ok(())
+    }
+    if node_health {
+        let result=nodes::operator_health(&pool,args[2].to_str().ok_or("invalid node id")?).await.map_err(|_|"node health unavailable")?;
+        println!("{result}");
+        return Ok(())
+    }
+    if set_policy {
+        let expected:i64=args[3].to_str().ok_or("invalid policy revision")?.parse().map_err(|_|"invalid policy revision")?;
+        let capacity:i64=args[4].to_str().ok_or("invalid approved capacity")?.parse().map_err(|_|"invalid approved capacity")?;
+        nodes::set_policy(&pool,args[2].to_str().ok_or("invalid node id")?,expected,capacity,args[5].to_str().ok_or("invalid region")?,args[6].to_str().ok_or("invalid policy mode")?).await.map_err(|_|"node policy change refused")?;
+        return Ok(())
     }
     if add_node {
         let id=nodes::add(&pool,args[2].to_str().ok_or("invalid node name")?).await.map_err(|_|"node creation refused")?;
@@ -210,7 +316,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
     }
     if tcp_worker {
         let arg=|i:usize|args[i].to_str().ok_or("invalid TCP worker argument");
-        preview::tcp_worker(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?,arg(6)?.parse()?).await?;
+        // tcp_worker returns only static, internally authored errors. Never
+        // print SQLx errors, engine stderr, argument values or secret material.
+        preview::tcp_worker(&pool,&root,arg(2)?,arg(3)?.parse()?,arg(4)?.parse()?,arg(5)?,arg(6)?.parse()?).await.map_err(|reason|{
+            eprintln!("TCP worker stopped: {reason}");
+            reason
+        })?;
         return Ok(());
     }
     if udp_device_worker {
@@ -253,9 +364,15 @@ async fn run() -> Result<(), Box<dyn Error>> {
             let listen=arg(7)?.parse()?;
             let expected_file=arg(8)?;
             if resident || tls_resident{
-                preview::resident(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await?;
+                preview::resident(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await.map_err(|reason|{
+                    eprintln!("Web resident stopped: {reason}");
+                    reason
+                })?;
             }else if worker || tls_worker{
-                preview::worker(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await?;
+                preview::worker(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport).await.map_err(|reason|{
+                    eprintln!("Web worker stopped: {reason}");
+                    reason
+                })?;
             }else{
                 preview::supervise(&pool,&root,id,revision,relay,bundle,prefix,listen,expected_file,transport,None,None).await?;
             }
@@ -276,6 +393,16 @@ async fn run() -> Result<(), Box<dyn Error>> {
         .merge(commercial::routes(pool.clone()))
         .merge(mappings::routes(pool.clone()))
         .merge(nodes::routes(pool.clone()))
+        .merge(scheduling::routes(pool.clone()))
+        .merge(reconciliation::routes(pool.clone()))
+        .merge(failover::routes(pool.clone()))
+        .merge(grants::routes(pool.clone()))
+        .merge(relay_tcp::routes(pool.clone()))
+        .merge(relay_http::routes(pool.clone()))
+        .merge(relay_https::routes(pool.clone()))
+        .merge(relay_budget::routes(pool.clone()))
+        .merge(relay_budget_grant::routes(pool.clone()))
+        .merge(relay::routes(pool.clone()))
         .merge(runtime::routes(pool.clone()))
         .merge(traffic::routes(pool.clone()))
         .merge(audit::routes(pool.clone()))
@@ -302,5 +429,42 @@ async fn entry() {
         // Do not print SQL, filesystem paths, or future credentials.
         eprintln!("LocalTunnel management server failed to initialize or serve");
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test,target_os="linux"))]
+mod sqlite_admission_tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt,PermissionsExt,symlink};
+    struct Temp(PathBuf);
+    impl Drop for Temp{fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+    #[test]
+    fn transient_sidecar_removal_is_not_a_worker_start_failure(){
+        let root=Temp(std::env::temp_dir().join(format!("lt-sidecar-{}",hex::encode(auth::random::<16>().unwrap()))));
+        std::fs::DirBuilder::new().mode(0o700).create(&root.0).unwrap();
+        let path=root.0.join("control.sqlite3-journal");
+        std::fs::write(&path,b"fixture").unwrap();
+        let file=std::fs::File::open(&path).unwrap();
+        // Deterministically reproduce both disappearing-name and
+        // disappearing-link races without modifying a live SQLite journal.
+        std::fs::remove_file(&path).unwrap();
+        assert!(secure_sqlite_file(&path,true).is_ok());
+        assert!(secure_sqlite_file(&path,false).is_err());
+        assert!(secure_sqlite_descriptor(&file,true).is_ok());
+        assert!(secure_sqlite_descriptor(&file,false).is_err());
+        let target=root.0.join("target");
+        std::fs::write(&target,b"fixture").unwrap();
+        symlink(&target,&path).unwrap();
+        assert!(secure_sqlite_file(&path,true).is_err());
+        assert!(data_path(&root.0).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target,&path).unwrap();
+        assert!(secure_sqlite_file(&path,true).is_err());
+        assert!(data_path(&root.0).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path,b"fixture").unwrap();
+        std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(secure_sqlite_file(&path,true).is_ok());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);
     }
 }

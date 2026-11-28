@@ -585,7 +585,27 @@ bind_addr = "127.0.0.1:{udp_mapped}"
                                             return record
                                         time.sleep(.25)
                                     raise RuntimeError("mixed service traffic sample unavailable")
+                                # Readiness probes may have completed after the most
+                                # recent published sample. Require fresh, unchanged
+                                # samples spanning a quiet interval before measuring.
+                                deadline = time.monotonic() + 15
                                 initial = sample()
+                                stable_since = initial["sampledAtMs"]
+                                last_stamp = stable_since
+                                while time.monotonic() < deadline:
+                                    time.sleep(.25)
+                                    current = sample()
+                                    stamp = current["sampledAtMs"]
+                                    if stamp <= last_stamp:
+                                        continue
+                                    last_stamp = stamp
+                                    if (current["uploadBytes"], current["downloadBytes"]) != (initial["uploadBytes"], initial["downloadBytes"]):
+                                        stable_since = stamp
+                                    initial = current
+                                    if stamp - stable_since >= 3000:
+                                        break
+                                else:
+                                    raise RuntimeError("mixed service traffic did not settle before measurement")
                                 assert udp_roundtrip()
                                 deadline = time.monotonic() + 15
                                 while time.monotonic() < deadline:
@@ -595,7 +615,12 @@ bind_addr = "127.0.0.1:{udp_mapped}"
                                         break
                                     time.sleep(.25)
                                 else:
-                                    raise RuntimeError("UDP-only service traffic delta is not exact")
+                                    raise RuntimeError(
+                                        "UDP-only service traffic delta is not exact: "
+                                        f"upload={final['uploadBytes'] - initial['uploadBytes']}, "
+                                        f"download={final['downloadBytes'] - initial['downloadBytes']}, "
+                                        f"sample_ms={final['sampledAtMs'] - initial['sampledAtMs']}"
+                                    )
                                 assert (child[1] / "traffic.json").is_file()
                                 report["mixed_service_udp_upload_delta"] = final["uploadBytes"] - initial["uploadBytes"]
                                 report["mixed_service_udp_download_delta"] = final["downloadBytes"] - initial["downloadBytes"]

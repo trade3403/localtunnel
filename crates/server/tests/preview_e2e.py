@@ -138,10 +138,25 @@ def request(port,hostname):
     except (OSError,http.client.HTTPException):
         return None
 
+def fixed_port(exclude):
+    # Repeatedly reused listener ports must not come from Linux's
+    # outgoing connection pool: a later short-lived HTTP connection can
+    # claim an otherwise idle port between two managed generations.
+    low,high=map(int,Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split())
+    candidates=[p for p in range(30000,65000) if not low<=p<=high and p not in exclude]
+    while candidates:
+        p=candidates.pop(secrets.randbelow(len(candidates)))
+        with socket.socket() as s:
+            try:s.bind(("127.0.0.1",p))
+            except OSError:continue
+            return p
+    raise AssertionError("no listener port outside the ephemeral range")
+
 def await_body(port,hostname,expected,processes):
     deadline=time.monotonic()+45
     while time.monotonic()<deadline:
-        assert all(p.poll() is None for p in processes),"preview process exited"
+        statuses=[p.poll() for p in processes]
+        assert all(code is None for code in statuses),f"preview process exited: {statuses}"
         if request(port,hostname)==expected:
             return
         time.sleep(.25)
@@ -199,10 +214,8 @@ try:
                     raise AssertionError("no free internal port")
                 mapping=expect(call(base,"mappings","POST",admin,{"device_id":device["id"],"node_id":nid,"domain_id":domain["id"],"protocol":"http","local_port":fixture.server_port,"bind_port":bp}),201)
                 mid=mapping["id"]
-                rp=core_test.port()
-                gp=core_test.port()
-                while gp in (rp,bp,fixture.server_port) or rp in (bp,fixture.server_port):
-                    rp,gp=core_test.port(),core_test.port()
+                rp=fixed_port([bp,fixture.server_port])
+                gp=fixed_port([rp,bp,fixture.server_port])
                 assert operator("--export-preview",mid,1,rp,"unverified").returncode!=0
                 assert not (root/"unverified").exists()
                 records[domain["txt_name"]+"."]=domain["txt_value"]
@@ -317,7 +330,7 @@ try:
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
                 mapping2=expect(call(base,"mappings","POST",admin,{"device_id":device2["id"],"node_id":nid,"domain_id":domain["id"],"protocol":"http","local_port":fixture.server_port,"bind_port":bp}),201)
                 mid2=mapping2["id"]
-                supervisor=subprocess.Popen([exe,"--supervise-preview",str(root),mid2,"1",str(rp),"supervised_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--supervise-preview",str(root),mid2,"1",str(rp),"supervised_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
                 assert request(bp,"preview.example.test")== (200,body)
                 assert (root/"supervisor-gateway.lock").exists()
@@ -362,7 +375,7 @@ try:
                 queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
                 assert queued["request_id"]!=cancelled["request_id"]
                 expect(call(base,runtime_path+"/stop","POST",admin,{"request_id":cancelled["request_id"]}),409)
-                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"runtime_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"runtime_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
                 deadline=time.monotonic()+10
                 while time.monotonic()<deadline:
@@ -414,7 +427,7 @@ try:
                 policy()
                 assert expect(call(base,runtime_path+"/runtime",token=admin),200)["request"]["request_id"]==queued["request_id"]
                 queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
-                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"commercial_expiry","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"commercial_expiry","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
                 end=time.monotonic()+10
                 while time.monotonic()<end:
@@ -446,7 +459,7 @@ try:
                 assert not (root/"unlimited_bypass").exists()
                 assert operator("--preview-gateway",mid3,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
                 queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
-                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"commercial_bandwidth","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"commercial_bandwidth","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
                 end=time.monotonic()+10
                 while time.monotonic()<end:
@@ -490,7 +503,7 @@ try:
                 assert operator("--supervise-preview",mid3,1,rp,"monthly_manual","gateway",gp,"expected_body").returncode!=0
                 assert not (root/"monthly_manual").exists()
                 queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
-                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"monthly_web","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"monthly_web","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
                 end=time.monotonic()+10
                 while time.monotonic()<end:
@@ -537,7 +550,7 @@ try:
                 assert not (root/"connection_bypass").exists()
                 assert operator("--preview-gateway",mid3,1,"gateway",gp,"apply-checked","expected_body").returncode!=0
                 queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
-                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"connection_web","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-worker",str(root),mid3,"1",str(rp),"connection_web","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
                 end=time.monotonic()+10
                 while time.monotonic()<end:
@@ -580,7 +593,7 @@ try:
                 # Resident owns a single fixed mapping, but accepts multiple
                 # independently authorized requests without operator relaunch.
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
-                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"resident_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"resident_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 def wait_state(phase,timeout=40):
                     end=time.monotonic()+timeout
                     while time.monotonic()<end:
@@ -624,7 +637,7 @@ try:
                 # Deliberately stop only one of the test-owned direct engine
                 # children. Verify its executable and per-request config,
                 # then confirm the supervisor stops its other owned child.
-                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"fault_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"fault_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
                 rid=queued["request_id"]
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
@@ -657,7 +670,7 @@ try:
                 assert request(gp,"preview.example.test")[0]==421
                 assert (root/("fault_bundle-"+rid)).is_dir()
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
-                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"crash_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"crash_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
                 rid=queued["request_id"]
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])
@@ -691,7 +704,7 @@ try:
                 # Real gateway lifecycle with a controlled sparse quota
                 # fixture. No external traffic or fake runtime state.
                 expect(call(base,"domains/verify","POST",admin,{"domain_id":domain["id"]}),200)
-                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"quota_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                supervisor=subprocess.Popen([exe,"--runtime-resident",str(root),mid3,"1",str(rp),"quota_bundle","gateway",str(gp),"expected_body"],env=env,stdout=subprocess.DEVNULL)
                 queued=expect(call(base,runtime_path+"/start","POST",admin,{"expected_revision":1}),202)
                 rid=queued["request_id"]
                 await_body(gp,"preview.example.test",(200,body),[*processes,supervisor])

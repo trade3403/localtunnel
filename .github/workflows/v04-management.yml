@@ -1,11 +1,14 @@
 name: V0.4 Management API CI
 on:
   push:
-    branches: ['feat/v0.4-management-api', 'feat/v0.5-security-stability', 'feat/v0.6-cross-platform', 'feat/v0.7-udp-quic', 'feat/v0.8-commercial-management']
+    branches: ['feat/v0.4-management-api', 'feat/v0.5-security-stability', 'feat/v0.6-cross-platform', 'feat/v0.7-udp-quic', 'feat/v0.8-commercial-management', 'feat/v0.9-multi-node']
   pull_request:
     paths:
       - 'crates/server/**'
       - 'apps/admin/**'
+      - 'tests/verify_v04_evidence.py'
+      - 'docs/v0.9.md'
+      - 'deploy/relay-control-nginx.conf.example'
       - '.github/workflows/v04-management.yml'
   workflow_dispatch:
 permissions:
@@ -14,7 +17,9 @@ jobs:
   management:
     # Playwright 1.56.1 supports Ubuntu 24.04, not the current 26.04 latest image.
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    # Full multi-node TLS/Noise suite includes real lease expiry waits.
+    # Keep the complete browser and evidence gates within a bounded job.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
@@ -45,16 +50,34 @@ jobs:
         run: python3 crates/server/tests/mappings_e2e.py crates/server/target/release/localtunnel-server management-evidence/mappings.json
       - name: Real commercial inventory upgrade and owner isolation
         run: python3 crates/server/tests/commercial_e2e.py crates/server/target/release/localtunnel-server management-evidence/commercial.json
+      - name: Real independent relay credential issuance, rotation and revocation
+        run: python3 crates/server/tests/relay_identity_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-identity.json
+      - name: Real three independent relay control processes and recovery
+        run: python3 crates/server/tests/relay_process_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-process.json
+      - name: Real node capacity policy, health, upgrade and restore
+        run: python3 crates/server/tests/node_policy_e2e.py crates/server/target/release/localtunnel-server management-evidence/node-policy.json
+      - name: Real atomic relay reservation and scheduling isolation
+        run: python3 crates/server/tests/scheduling_e2e.py crates/server/target/release/localtunnel-server management-evidence/scheduling.json
+      - name: Real bounded relay grant preview and reconciliation guard
+        run: python3 crates/server/tests/grants_e2e.py crates/server/target/release/localtunnel-server management-evidence/grants.json
+      - name: Real one-shot TCP start claim and port isolation
+        run: python3 crates/server/tests/relay_tcp_claim_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-tcp-claim.json
+      - name: Real HTTP hostname proof and one-shot claim isolation
+        run: python3 crates/server/tests/relay_http_claim_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-http-claim.json
+      - name: Real atomic cross-node budget reservation preview
+        run: python3 crates/server/tests/relay_budget_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-budget.json
       - name: Real legacy SQLite migration and UDP desired metadata lifecycle
         run: python3 crates/server/tests/udp_metadata_e2e.py crates/server/target/release/localtunnel-server management-evidence/udp-metadata.json
       - name: Install DNS query utility
         run: |
           sudo apt-get update
           sudo apt-get install -y dnsutils nginx curl openssl
-      - name: Real node inventory and DNS TXT proof lifecycle
-        run: python3 crates/server/tests/domains_e2e.py crates/server/target/release/localtunnel-server management-evidence/domains.json
       - name: Build existing core CLI for preview integration
         run: cargo build --release --locked
+      - name: Real verified TLS relay control and restricted ingress
+        run: python3 crates/server/tests/relay_tls_e2e.py crates/server/target/release/localtunnel-server management-evidence/relay-tls.json
+      - name: Real node inventory and DNS TXT proof lifecycle
+        run: python3 crates/server/tests/domains_e2e.py crates/server/target/release/localtunnel-server management-evidence/domains.json
       - name: Real authorized TCP management draft to guarded Noise echo preview
         run: python3 crates/server/tests/tcp_preview_e2e.py crates/server/target/release/localtunnel-server management-evidence/tcp-preview.json
       - name: Real authorized UDP management draft to guarded Noise echo preview
@@ -79,7 +102,7 @@ jobs:
         working-directory: apps/admin
         run: npm run test:e2e -- ../../crates/server/target/release/localtunnel-server ../../management-evidence/admin-browser.json
       - name: Require complete V0.4 and V0.5 management evidence
-        run: python3 tests/verify_v04_evidence.py management-v08 management-evidence
+        run: python3 tests/verify_v04_evidence.py management-v09 management-evidence
       - name: Collect admin dependency lock and build
         if: always()
         run: |

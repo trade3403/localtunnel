@@ -37,7 +37,7 @@ struct Cursor {after:Option<String>}
 struct Verify {domain_id:String}
 
 fn valid_id(s:&str)->bool{s.len()==32&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
-fn valid_host(s:&str)->bool{
+pub(crate) fn valid_host(s:&str)->bool{
     // Reserve space for the TXT prefix and follow the gateway's hostname grammar.
     s.len()<=240&&s.contains('.')&&s.parse::<IpAddr>().is_err()&&s!="localtunnel-probe.invalid"&&
         s.split('.').all(|l|!l.is_empty()&&l.len()<=63&&!l.starts_with('-')&&!l.ends_with('-')&&

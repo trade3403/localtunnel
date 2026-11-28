@@ -27,8 +27,42 @@ pub async fn set_enabled(pool:&SqlitePool,id:&str,enabled:bool)->Result<(),Failu
     if r.rows_affected()!=1{return Err(CONFLICT)}
     Ok(())
 }
+// Read-only snapshot, not free slots, a reservation or an authorization.
+// Match only the current credential generation and use the database clock.
+pub(crate) const HEALTH_SELECT:&str="SELECT n.id AS node_id,n.enabled,n.approved_capacity,n.region,n.policy_mode,n.policy_revision,r.generation,h.received_at,h.capacity AS reported_capacity,CASE WHEN n.enabled=0 THEN 'disabled' WHEN r.node_id IS NULL THEN 'unregistered' WHEN r.token_digest IS NULL THEN 'revoked' WHEN h.node_id IS NULL THEN 'awaiting_heartbeat' WHEN h.received_at BETWEEN unixepoch()-15 AND unixepoch() THEN 'online' ELSE 'offline' END AS health,CASE WHEN n.enabled=1 AND r.token_digest IS NOT NULL AND n.policy_mode='active' AND h.received_at BETWEEN unixepoch()-15 AND unixepoch() THEN min(n.approved_capacity,h.capacity) ELSE 0 END AS candidate_capacity FROM nodes n LEFT JOIN relay_identities r ON r.node_id=n.id LEFT JOIN relay_heartbeat h ON h.node_id=r.node_id AND h.generation=r.generation";
+#[derive(Serialize,sqlx::FromRow)]
+pub(crate) struct OperationalHealth {
+    node_id:String,enabled:bool,approved_capacity:i64,region:String,policy_mode:String,policy_revision:i64,
+    generation:Option<i64>,received_at:Option<i64>,reported_capacity:Option<i64>,health:String,candidate_capacity:i64,
+}
+pub async fn operator_health(pool:&SqlitePool,id:&str)->Result<String,Failure>{
+    let query=format!("{HEALTH_SELECT} WHERE n.id=?");
+    let row=sqlx::query_as::<_,OperationalHealth>(&query).bind(id).fetch_optional(pool).await.map_err(|_|INTERNAL)?.ok_or(CONFLICT)?;
+    serde_json::to_string(&row).map_err(|_|INTERNAL)
+}
+pub async fn set_policy(pool:&SqlitePool,id:&str,expected:i64,capacity:i64,region:&str,mode:&str)->Result<(),Failure>{
+    if !(1..i64::MAX).contains(&expected)||!(0..=65536).contains(&capacity)||region.is_empty()||region.len()>32||
+        !region.bytes().all(|b|b.is_ascii_lowercase()||b.is_ascii_digit()||b==b'-'||b==b'_')||
+        !matches!(mode,"active"|"draining"|"maintenance"){return Err(BAD)}
+    let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
+    let changed=sqlx::query("UPDATE nodes SET approved_capacity=?,region=?,policy_mode=?,policy_revision=policy_revision+1 WHERE id=? AND policy_revision=?")
+        .bind(capacity).bind(region).bind(mode).bind(id).bind(expected).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    if changed.rows_affected()!=1{return Err(CONFLICT)}
+    sqlx::query("INSERT INTO node_policy_audit(node_id,revision,approved_capacity,region,mode) VALUES (?,?,?,?,?)")
+        .bind(id).bind(expected+1).bind(capacity).bind(region).bind(mode).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    // A queued request has not been claimed and owns no worker authority.
+    // Serialize cancellation with the claim write. Never touch claimed,
+    // running, stopping or unknown requests, or their resource reservations.
+    if mode!="active"{
+        sqlx::query("UPDATE runtime_requests SET state='stopped',updated_at=unixepoch() WHERE state='queued' AND mapping_id IN (SELECT id FROM mappings WHERE node_id=?)")
+            .bind(id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    }
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    Ok(())
+}
 pub fn routes(pool:SqlitePool)->Router{
-    Router::new().route("/api/v1/nodes",get(list)).with_state(pool)
+    Router::new().route("/api/v1/nodes",get(list))
+        .route("/api/v1/nodes/overview",get(overview)).with_state(pool)
 }
 async fn list(State(pool):State<SqlitePool>,headers:HeaderMap,Query(q):Query<Cursor>)->Result<Response,Failure>{
     auth::identify(&pool,&auth::bearer(&headers)?).await?;
@@ -36,5 +70,27 @@ async fn list(State(pool):State<SqlitePool>,headers:HeaderMap,Query(q):Query<Cur
     if after.len()>64||after.chars().any(char::is_control){return Err(BAD)}
     let rows=sqlx::query_as::<_,Node>("SELECT id,name,enabled FROM nodes WHERE id>? ORDER BY id LIMIT 100")
         .bind(after).fetch_all(&pool).await.map_err(|_|INTERNAL)?;
+    Ok(auth::uncached(Json(rows)))
+}
+
+#[derive(Serialize,sqlx::FromRow)]
+struct Overview {
+    id:String,name:String,enabled:bool,region:String,policy_mode:String,policy_revision:i64,
+    approved_capacity:i64,reported_capacity:Option<i64>,received_at:Option<i64>,health:String,
+    candidate_capacity:i64,owner_mappings:i64,owner_reserved_allocations:i64
+}
+/// Shared operational metadata is read-only. Only the authenticated owner's
+/// mapping and allocation counts are exposed, never global occupancy or keys.
+async fn overview(State(pool):State<SqlitePool>,headers:HeaderMap,Query(q):Query<Cursor>)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    let after=q.after.unwrap_or_default();
+    if after.len()>64||after.chars().any(char::is_control){return Err(BAD)}
+    let query=format!("SELECT n.id,n.name,h.enabled,h.region,h.policy_mode,h.policy_revision,
+      h.approved_capacity,h.reported_capacity,h.received_at,h.health,h.candidate_capacity,
+      (SELECT count(*) FROM mappings m WHERE m.node_id=n.id AND m.owner_id=?) AS owner_mappings,
+      (SELECT count(*) FROM relay_allocations a WHERE a.node_id=n.id AND a.owner_id=? AND a.state='reserved') AS owner_reserved_allocations
+      FROM nodes n JOIN ({HEALTH_SELECT}) h ON h.node_id=n.id WHERE n.id>? ORDER BY n.id LIMIT 100");
+    let rows=sqlx::query_as::<_,Overview>(&query).bind(&owner).bind(&owner).bind(after).fetch_all(&pool).await.map_err(|_|INTERNAL)?;
     Ok(auth::uncached(Json(rows)))
 }

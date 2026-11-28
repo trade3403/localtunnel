@@ -1,0 +1,86 @@
+# Dedicated control hostname; include in nginx http {} after replacing placeholders.
+# Never expose the center plain HTTP socket.
+server {
+    listen @LISTEN@ ssl;
+    server_name @HOST@;
+    ssl_certificate @CERT@;
+    ssl_certificate_key @KEY@;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    access_log off;
+    error_log /dev/null crit;
+    client_max_body_size 1k;
+    client_header_timeout 5s;
+    client_body_timeout 5s;
+    send_timeout 5s;
+    keepalive_timeout 5s;
+    proxy_connect_timeout 2s;
+    proxy_send_timeout 4s;
+    proxy_read_timeout 4s;
+    proxy_http_version 1.1;
+    proxy_set_header Host 127.0.0.1:@CENTER_PORT@;
+    proxy_set_header Connection close;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header X-Forwarded-For "";
+    proxy_set_header X-Forwarded-Proto "";
+    location = /api/v1/relay/identity {
+        if ($request_method != GET) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/heartbeat {
+        if ($request_method !~ ^(GET|POST)$) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/policy {
+        if ($request_method != GET) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/control {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/grant {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/tcp-claim {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/udp-claim {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/http-claim {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/https-claim {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/budget-grant {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/budget-claim {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/budget-run-claim {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/budget-start-claim {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/failover-pending {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location = /api/v1/relay/budget-cleanup-report {
+        if ($request_method != POST) { return 405; }
+        proxy_pass http://127.0.0.1:@CENTER_PORT@;
+    }
+    location / { return 404; }
+}
