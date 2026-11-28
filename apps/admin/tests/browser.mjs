@@ -417,12 +417,48 @@ with sqlite3.connect(sys.argv[1]) as db:
   const allocationRow=page.getByTestId('allocation-overview').getByRole('row').filter({hasText:allocation.id})
   await allocationRow.getByText('未签发许可',{exact:true}).waitFor()
   await page.getByTestId('allocations-count').getByText('已加载 1 条',{exact:true}).waitFor()
-  const cancel=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/allocations/'+allocation.id+'/cancel',{method:'POST',
-    headers:{Authorization:adminBearer,'Content-Type':'application/json'},body:JSON.stringify({expected_generation:1})})
-  assert.equal(cancel.status,200)
-  await page.getByRole('button',{name:'刷新数据'}).click()
+  await allocationRow.getByRole('button',{name:'取消分配',exact:true}).click()
+  await page.locator('.ant-popover:visible').getByRole('button',{name:'确认取消',exact:true}).click()
   await allocationRow.getByText('已取消',{exact:true}).waitFor()
+  await allocationRow.getByText('不可直接取消',{exact:true}).waitFor()
   report.real_browser_allocation_overview_history=true
+  stage='browser allocation create and conflict'
+  const form=page.getByTestId('allocation-create')
+  await form.getByTestId('allocation-device').click()
+  await page.locator('.ant-select-dropdown:visible').getByText('Browser fixture',{exact:true}).click()
+  await form.getByTestId('allocation-node').click()
+  await page.locator('.ant-select-dropdown:visible').getByText('Local relay',{exact:true}).click()
+  await page.locator('#allocation-bind-port').fill('29999')
+  const beatAgain=async()=>assert.equal((await fetch('http://127.0.0.1:'+apiPort+'/api/v1/relay/heartbeat',{method:'POST',
+    headers:{Authorization:'Bearer '+nodeCredential.stdout.trim(),'Content-Type':'application/json'},
+    body:JSON.stringify({protocol_version:1,generation:1,capacity:9})})).status,204)
+  await beatAgain()
+  const createdResponse=page.waitForResponse(r=>r.url().endsWith('/api/v1/allocations')&&r.request().method()==='POST')
+  await form.getByRole('button',{name:'创建分配预留',exact:true}).click()
+  const createdHttp=await createdResponse
+  assert.equal(createdHttp.status(),201)
+  const created=await createdHttp.json()
+  const submitted=createdHttp.request().postDataJSON()
+  assert.match(submitted.request_key,/^[a-f0-9]{32}$/)
+  assert.equal(submitted.device_id,dev.id)
+  assert.equal(submitted.node_id,localNode)
+  assert.equal(submitted.bind_port,29999)
+  assert.notEqual(created.id,allocation.id)
+  const createdRow=page.getByTestId('allocation-overview').getByRole('row').filter({hasText:created.id})
+  await createdRow.getByText('未签发许可',{exact:true}).waitFor()
+  await page.getByText('分配已预留（未启动）',{exact:true}).waitFor()
+  await beatAgain()
+  const rejectedResponse=page.waitForResponse(r=>r.url().endsWith('/api/v1/allocations')&&r.request().method()==='POST')
+  await form.getByRole('button',{name:'创建分配预留',exact:true}).click()
+  const rejected=await rejectedResponse
+  assert.equal(rejected.status(),409)
+  assert.notEqual(rejected.request().postDataJSON().request_key,submitted.request_key)
+  await page.getByText('状态冲突，请刷新并检查版本、域名验证或执行器状态',{exact:true}).waitFor()
+  await page.getByTestId('allocations-count').getByText('已加载 2 条',{exact:true}).waitFor()
+  await createdRow.getByRole('button',{name:'取消分配',exact:true}).click()
+  await page.locator('.ant-popover:visible').getByRole('button',{name:'确认取消',exact:true}).click()
+  await createdRow.getByText('已取消',{exact:true}).waitFor()
+  report.real_browser_allocation_create_cancel_conflict=true
   stage='logout'
   await page.getByRole('button',{name:'退出登录'}).click()
   await page.getByRole('heading',{name:'管理后台登录'}).waitFor()

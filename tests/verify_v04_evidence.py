@@ -275,6 +275,7 @@ REQUIRED["management-v08"] = {
         "real_browser_commercial_owner_isolation",
         "real_browser_node_overview_and_refresh",
         "real_browser_allocation_overview_history",
+        "real_browser_allocation_create_cancel_conflict",
     ],
     "tcp-preview.json": [
         "real_tcp_scoped_queue_and_cancel",

@@ -58,9 +58,48 @@ async function readTraffic(id:string){
 }
 const deviceStatus = ref<Record<string,unknown>|null>(null)
 const create = reactive({device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
-type AllocationOverview={id:string;mapping_id:string;node_id:string;node_name:string;generation:number;node_generation:number;bind_port:number;state:string;protocol:string|null;local_port:number|null;grant_kind:string|null;expires_at:number|null;authorization_state:string;failure_reason:string|null;failure_at:number|null;fenced_at:number|null;cleanup_at:number|null;reclaimed_at:number|null;retired_at:number|null;auto_state:string|null;source_id:string|null;successor_id:string|null;lineage_epoch:number;monthly_bytes:number|null;connection_slots:number|null;rate_bytes_per_second:number|null;month_utc:string|null}
+type AllocationOverview={cancellable:boolean;id:string;mapping_id:string;node_id:string;node_name:string;generation:number;node_generation:number;bind_port:number;state:string;protocol:string|null;local_port:number|null;grant_kind:string|null;expires_at:number|null;authorization_state:string;failure_reason:string|null;failure_at:number|null;fenced_at:number|null;cleanup_at:number|null;reclaimed_at:number|null;retired_at:number|null;auto_state:string|null;source_id:string|null;successor_id:string|null;lineage_epoch:number;monthly_bytes:number|null;connection_slots:number|null;rate_bytes_per_second:number|null;month_utc:string|null}
 const allocations=ref<AllocationOverview[]>([])
 const allocationAfter=ref<string|null>(null)
+type AllocationInput={device_id:string;node_id:string|null;protocol:string;local_port:number;bind_port:number}
+const allocationDraft=reactive({device_id:'',node_id:'',protocol:'tcp',local_port:8080,bind_port:20000})
+const pendingAllocation=ref<(AllocationInput&{request_key:string})|null>(null)
+const validAllocation=computed(()=>devices.value.some(d=>d.id===allocationDraft.device_id&&d.enabled)&&
+  ['tcp','udp'].includes(allocationDraft.protocol)&&Number.isInteger(allocationDraft.local_port)&&allocationDraft.local_port>=1&&allocationDraft.local_port<=65535&&
+  Number.isInteger(allocationDraft.bind_port)&&allocationDraft.bind_port>=20000&&allocationDraft.bind_port<=29999)
+function resetAllocationDraft(){
+  pendingAllocation.value=null
+  Object.assign(allocationDraft,{device_id:'',node_id:'',protocol:'tcp',local_port:8080,bind_port:20000})
+}
+async function refreshAllocationPage(){
+  const [d,n]=await Promise.all([get<Device[]>('/devices'),get<Node[]>('/nodes/overview')])
+  devices.value=d;nodes.value=n;more.devices=d.length===100;more.nodes=n.length===100
+  await loadAllocations()
+}
+async function createAllocation(){await run(async()=>{
+  if(!pendingAllocation.value){
+    if(!validAllocation.value)return
+    const request_key=Array.from(crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('')
+    pendingAllocation.value={...allocationDraft,node_id:allocationDraft.node_id||null,request_key}
+  }
+  try{
+    const result=await send<{id:string;state:string}>('/allocations','POST',pendingAllocation.value)
+    pendingAllocation.value=null
+    await refreshAllocationPage()
+    notice.value=result.state==='reserved'?'分配已预留（未启动）':'该请求已有历史分配，请查看记录'
+  }catch(e){
+    // Definite validation/admission refusal; the exact retry contract
+    // returns the old record if a previous submission was committed.
+    // On transport failure, retain the entire payload and key for retry.
+    if(e instanceof ApiError&&[400,409,422].includes(e.status))pendingAllocation.value=null
+    throw e
+  }
+})}
+async function cancelAllocation(row:AllocationOverview){await run(async()=>{
+  if(!row.cancellable)return
+  await send('/allocations/'+row.id+'/cancel','POST',{expected_generation:row.generation})
+  await refreshAllocationPage();notice.value='分配已取消，历史记录保留'
+})}
 const allocationLabels:Record<string,string>={retired:'已退役',fenced:'已隔离',cancelled:'已取消',not_issued:'未签发许可',revoked:'许可已撤销',expired:'许可已到期',claimed:'已领取许可',pending_claim:'等待领取',issued:'已签发许可'}
 const failureLabels:Record<string,string>={node_disabled:'节点停用',identity_unavailable:'节点身份不可用',heartbeat_stale:'心跳失效'}
 async function loadAllocations(append=false){
@@ -75,7 +114,7 @@ const title = computed(() => nav.find(n=>n.key===page.value)?.label)
 const labels:Record<string,string> = {queued:'等待执行器',starting:'启动中',running:'已应用（执行器报告）',stopping:'停止中',stopped:'已停止',failed_or_unknown:'失败或未知'}
 function clearPair(){pairing.value='';if(pairTimer) clearTimeout(pairTimer)}
 function reset(){
-  auditEvents.value=[];auditBefore.value=null;commercial.value=null;allocations.value=[];allocationAfter.value=null
+  auditEvents.value=[];auditBefore.value=null;commercial.value=null;allocations.value=[];allocationAfter.value=null;resetAllocationDraft()
   token.value='';user.value='';password.value='';devices.value=[];nodes.value=[];domains.value=[];mappings.value=[];
   selectedMapping.value=null;runtime.value=null;traffic.value=[];deviceStatus.value=null;clearPair();notice.value='';page.value='dashboard'
   Object.assign(create,{device_id:'',node_id:'',domain_id:'',protocol:'http',local_port:8080,bind_port:20000})
@@ -93,7 +132,7 @@ async function run(fn:()=>Promise<void>){
 async function get<T>(path:string){return api<T>(path,token.value)}
 async function send<T>(path:string,method:string,body?:unknown){return api<T>(path,token.value,method,body)}
 async function refresh(){
-  if(page.value==='allocations'){await loadAllocations();return}
+  if(page.value==='allocations'){await refreshAllocationPage();return}
   if(page.value==='audit'){await loadAudit();return}
   if(page.value==='commercial'){await loadCommercial();return}
   const [d,n,h,m]=await Promise.all([get<Device[]>('/devices'),get<Node[]>('/nodes/overview'),get<Domain[]>('/domains'),get<Mapping[]>('/mappings')])
@@ -123,7 +162,7 @@ async function login(){await run(async()=>{
   try{user.value=(await get<{username:string}>('/auth/me')).username;await refresh()}catch(e){reset();throw e}
 })}
 async function logout(){await run(async()=>{try{await send('/auth/logout','POST')}finally{reset()}})}
-function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value='';auditEvents.value=[];auditBefore.value=null;commercial.value=null;if(key==='audit')void run(()=>loadAudit());if(key==='commercial')void run(loadCommercial);allocations.value=[];allocationAfter.value=null;if(key==='allocations')void run(()=>loadAllocations())}
+function go(key:string){if(busy.value)return;page.value=key;clearPair();deviceStatus.value=null;selectedMapping.value=null;runtime.value=null;traffic.value=[];editDraft.value=null;error.value='';notice.value='';auditEvents.value=[];auditBefore.value=null;commercial.value=null;if(key==='audit')void run(()=>loadAudit());if(key==='commercial')void run(loadCommercial);allocations.value=[];allocationAfter.value=null;if(key==='allocations')void run(refreshAllocationPage);if(key==='mappings'||key==='dashboard')void run(refresh)}
 async function issue(){await run(async()=>{clearPair();const p=await send<{pairing_code:string;expires_in:number}>('/devices/pairing-code','POST');pairing.value=p.pairing_code;pairTimer=setTimeout(clearPair,p.expires_in*1000)})}
 async function revoke(d:Device){await run(async()=>{await send('/devices/'+d.id+'/revoke','POST');await refresh();deviceStatus.value=null;notice.value='设备凭据已吊销'})}
 async function inspectDevice(d:Device){await run(async()=>{deviceStatus.value=await get('/devices/'+d.id+'/status')})}
@@ -245,9 +284,21 @@ onBeforeUnmount(clearPair)
             <a-card><a-statistic title="历史故障观察（已加载）" :value="allocations.filter(a=>a.failure_at!==null).length"/></a-card>
             <a-card><a-statistic title="已有替代分配（已加载）" :value="allocations.filter(a=>a.successor_id!==null).length"/></a-card>
           </div>
+          <a-card title="新建调度预留" data-testid="allocation-create">
+            <p class="muted">当前 Web 支持 TCP / UDP 预留。自动选节点由中心实时核验容量、端口和租户额度；预留不签发许可、不启动转发。下拉框显示已加载的设备及节点。</p>
+            <a-alert v-if="pendingAllocation" type="warning" show-icon message="上次提交结果可能未确认。请使用相同请求重试，避免重复分配；离开页面不会清除本次待确认请求。"/>
+            <form class="mapping-form" @submit.prevent="createAllocation">
+              <label>设备<a-select data-testid="allocation-device" v-model:value="allocationDraft.device_id" aria-label="预留设备" :disabled="busy||!!pendingAllocation" :options="devices.filter(d=>d.enabled).map(d=>({value:d.id,label:d.name}))"/></label>
+              <label>节点<a-select data-testid="allocation-node" v-model:value="allocationDraft.node_id" aria-label="预留节点" :disabled="busy||!!pendingAllocation" :options="[{value:'',label:'自动调度'},...nodes.filter(n=>n.enabled).map(n=>({value:n.id,label:n.name}))]"/></label>
+              <label>协议<a-select v-model:value="allocationDraft.protocol" aria-label="预留协议" :disabled="busy||!!pendingAllocation" :options="[{value:'tcp',label:'TCP'},{value:'udp',label:'UDP'}]"/></label>
+              <label>本地端口<a-input-number id="allocation-local-port" v-model:value="allocationDraft.local_port" :min="1" :max="65535" :precision="0" :disabled="busy||!!pendingAllocation"/></label>
+              <label>绑定端口<a-input-number id="allocation-bind-port" v-model:value="allocationDraft.bind_port" :min="20000" :max="29999" :precision="0" :disabled="busy||!!pendingAllocation"/></label>
+              <a-button type="primary" html-type="submit" :loading="busy" :disabled="!pendingAllocation&&!validAllocation">{{pendingAllocation?'重试相同请求':'创建分配预留'}}</a-button>
+            </form>
+          </a-card>
           <a-card title="分配与切换记录" data-testid="allocation-overview">
             <p class="muted">仅显示当前租户。许可签发、领取、隔离及回收是控制面记录，不证明隧道正在运行。历史记录保留，已退役不代表月流量退还。</p>
-            <a-table :data-source="allocations" row-key="id" :pagination="{pageSize:10}" :scroll="{x:1400}">
+            <a-table :data-source="allocations" row-key="id" :pagination="{pageSize:10}" :scroll="{x:1550}">
               <a-table-column title="分配 ID"><template #default="{record}"><div class="wrap-code">{{record.id}}</div><div class="small muted">代际 {{record.generation}} · 节点代际 {{record.node_generation}}</div></template></a-table-column>
               <a-table-column title="节点 / 端口"><template #default="{record}">{{record.node_name}}<div class="small">{{record.protocol?.toUpperCase()||'—'}} {{record.local_port??'—'}} → {{record.bind_port}}</div></template></a-table-column>
               <a-table-column title="许可状态"><template #default="{record}"><a-tag>{{allocationLabels[record.authorization_state]||'未知'}}</a-tag><div class="small muted">到期 {{nodeTime(record.expires_at)}}</div></template></a-table-column>
@@ -255,6 +306,11 @@ onBeforeUnmount(clearPair)
               <a-table-column title="隔离与回收"><template #default="{record}"><div>隔离 {{nodeTime(record.fenced_at)}}</div><div>清理 {{nodeTime(record.cleanup_at)}}</div><div>回收 {{nodeTime(record.reclaimed_at)}}</div><div>退役 {{nodeTime(record.retired_at)}}</div></template></a-table-column>
               <a-table-column title="切换链路"><template #default="{record}"><div>链路代际 {{record.lineage_epoch}}</div><div class="small">自动预留 {{record.auto_state==='enabled'?'已授权':record.auto_state==='cancelled'?'已撤销':'未授权'}}</div><div v-if="record.source_id" class="wrap-code">来源 {{record.source_id}}</div><div v-if="record.successor_id" class="wrap-code">替代 {{record.successor_id}}</div></template></a-table-column>
               <a-table-column title="有限预算"><template #default="{record}"><template v-if="record.monthly_bytes!==null"><div>{{record.monthly_bytes}} B / {{record.month_utc}}</div><div>{{record.rate_bytes_per_second}} B/s · {{record.connection_slots}} 槽</div></template><span v-else>—</span></template></a-table-column>
+              <a-table-column title="操作" fixed="right" :width="140"><template #default="{record}">
+                <a-popconfirm v-if="record.cancellable" title="确认取消尚未授权的分配？" ok-text="确认取消" cancel-text="返回" @confirm="cancelAllocation(record)">
+                  <a-button size="small" danger :disabled="busy">取消分配</a-button>
+                </a-popconfirm><span v-else class="muted small">不可直接取消</span>
+              </template></a-table-column>
             </a-table>
             <div class="cursor-footer"><span data-testid="allocations-count">已加载 {{allocations.length}} 条</span><a-button v-if="allocationAfter!==null" :disabled="busy" @click="run(()=>loadAllocations(true))">加载更多</a-button></div>
           </a-card>
