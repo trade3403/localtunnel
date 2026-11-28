@@ -273,6 +273,7 @@ REQUIRED["management-v08"] = {
         *REQUIRED["management-v05"]["admin-browser.json"],
         "real_browser_commercial_entitlement_and_refresh",
         "real_browser_commercial_owner_isolation",
+        "real_browser_node_overview_and_refresh",
     ],
     "tcp-preview.json": [
         "real_tcp_scoped_queue_and_cancel",
@@ -371,6 +372,7 @@ REQUIRED["management-v09"] = {
         "real_operator_policy_revision_audit_and_isolation",
         "real_node_health_capacity_and_generation",
         "real_node_policy_restore_revokes_snapshot_credentials",
+        "real_owner_node_overview_health_and_cursor",
     ],
     "relay-tls.json": [
         "real_tls_three_relay_processes_and_restricted_ingress",

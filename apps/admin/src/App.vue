@@ -3,7 +3,11 @@ import { computed, ref, reactive, onBeforeUnmount } from 'vue'
 import { api, ApiError } from './api'
 
 type Device = {id:string;name:string;enabled:boolean;revision:number}
-type Node = {id:string;name:string;enabled:boolean}
+type Node = {id:string;name:string;enabled:boolean;region:string;policy_mode:string;policy_revision:number;approved_capacity:number;reported_capacity:number|null;received_at:number|null;health:string;candidate_capacity:number;owner_mappings:number;owner_reserved_allocations:number}
+const nodeHealthLabels:Record<string,string>={online:'在线',offline:'离线',disabled:'停用',unregistered:'未注册',revoked:'凭据已撤销',awaiting_heartbeat:'等待心跳'}
+const nodePolicyLabels:Record<string,string>={active:'接收调度',draining:'排空中',maintenance:'维护中'}
+const nodeHealthColor=(health:string)=>health==='online'?'green':health==='offline'||health==='revoked'?'red':'default'
+const nodeTime=(time:number|null)=>time===null?'—':new Date(time*1000).toLocaleString('zh-CN')
 type Domain = {id:string;hostname:string;verified_at:number|null;txt_name:string;txt_value:string|null}
 type Mapping = {id:string;device_id:string;node_id:string;domain_id:string|null;protocol:string;local_host:string;local_port:number;bind_port:number;enabled:boolean;revision:number}
 type Runtime = {request:{request_id:string;state:string;updated_at:number}|null;worker_recent:boolean}
@@ -79,7 +83,7 @@ async function send<T>(path:string,method:string,body?:unknown){return api<T>(pa
 async function refresh(){
   if(page.value==='audit'){await loadAudit();return}
   if(page.value==='commercial'){await loadCommercial();return}
-  const [d,n,h,m]=await Promise.all([get<Device[]>('/devices'),get<Node[]>('/nodes'),get<Domain[]>('/domains'),get<Mapping[]>('/mappings')])
+  const [d,n,h,m]=await Promise.all([get<Device[]>('/devices'),get<Node[]>('/nodes/overview'),get<Domain[]>('/domains'),get<Mapping[]>('/mappings')])
   devices.value=d;nodes.value=n;domains.value=h;mappings.value=m
   more.devices=d.length===100;more.nodes=n.length===100;more.domains=h.length===100;more.mappings=m.length===100
   if(selectedMapping.value){
@@ -91,7 +95,7 @@ async function refresh(){
 async function loadMore(key:Resource){await run(async()=>{
   const rows=lists[key].value
   if(!more[key]||!rows.length)return
-  const next=await get<(Device|Node|Domain|Mapping)[]>('/'+key+'?after='+encodeURIComponent(rows[rows.length-1].id))
+  const next=await get<(Device|Node|Domain|Mapping)[]>('/'+(key==='nodes'?'nodes/overview':key)+'?after='+encodeURIComponent(rows[rows.length-1].id))
   // Append only server-ordered records beyond the current cursor.
   // Avoid duplicates if a refresh/retry occurs.
   if(key==='devices')devices.value.push(...next as Device[])
@@ -222,7 +226,26 @@ onBeforeUnmount(clearPair)
           </a-card>
         </template>
         <template v-if="page==='nodes'">
-          <a-card title="共享节点目录"><p class="muted">只读；由本地操作员创建及维护。启用不代表已部署。</p><a-table :data-source="nodes" row-key="id" :pagination="{pageSize:10}"><a-table-column title="节点名称" data-index="name"/><a-table-column title="节点 ID" data-index="id"/><a-table-column title="状态"><template #default="{record}"><a-tag>{{record.enabled?'启用':'停用'}}</a-tag></template></a-table-column></a-table><div class="cursor-footer"><span data-testid="nodes-count">已加载 {{nodes.length}} 条</span><a-button v-if="more.nodes" :disabled="busy" @click="loadMore('nodes')" data-testid="nodes-more">加载更多</a-button></div></a-card>
+          <div class="metrics" data-testid="node-overview-metrics">
+            <a-card><a-statistic title="已加载节点" :value="nodes.length"/></a-card>
+            <a-card><a-statistic title="在线（已加载）" :value="nodes.filter(n=>n.health==='online').length"/></a-card>
+            <a-card><a-statistic title="排空 / 维护（已加载）" :value="nodes.filter(n=>n.policy_mode!=='active').length"/></a-card>
+            <a-card><a-statistic title="我的保留分配（已加载节点）" :value="nodes.reduce((sum,n)=>sum+n.owner_reserved_allocations,0)"/></a-card>
+          </div>
+          <a-card title="共享节点监控">
+            <p class="muted">只读快照；本地操作员维护节点及调度策略。在线表示当前凭据心跳新鲜，不代表隧道可用。候选容量是批准与上报容量的较小值（仅在线且接收调度时），不是可用余量。</p>
+            <a-table :data-source="nodes" row-key="id" :pagination="{pageSize:10}" :scroll="{x:1160}" data-testid="node-overview">
+              <a-table-column title="节点"><template #default="{record}"><strong>{{record.name}}</strong><div class="muted wrap-code">{{record.id}}</div></template></a-table-column>
+              <a-table-column title="地区" data-index="region"/>
+              <a-table-column title="健康状态"><template #default="{record}"><a-tag :color="nodeHealthColor(record.health)">{{nodeHealthLabels[record.health]||'未知'}}</a-tag></template></a-table-column>
+              <a-table-column title="调度策略"><template #default="{record}"><a-tag>{{nodePolicyLabels[record.policy_mode]||'未知'}}</a-tag><div class="small muted">版本 {{record.policy_revision}}</div></template></a-table-column>
+              <a-table-column title="批准 / 上报"><template #default="{record}">{{record.approved_capacity}} / {{record.reported_capacity??'—'}}</template></a-table-column>
+              <a-table-column title="候选容量" data-index="candidate_capacity"/>
+              <a-table-column title="我的映射 / 保留分配"><template #default="{record}">{{record.owner_mappings}} / {{record.owner_reserved_allocations}}</template></a-table-column>
+              <a-table-column title="最近心跳"><template #default="{record}">{{nodeTime(record.received_at)}}</template></a-table-column>
+            </a-table>
+            <div class="cursor-footer"><span data-testid="nodes-count">已加载 {{nodes.length}} 条</span><a-button v-if="more.nodes" :disabled="busy" @click="loadMore('nodes')" data-testid="nodes-more">加载更多</a-button></div>
+          </a-card>
         </template>
         <template v-if="page==='domains'">
           <a-card title="添加域名"><form class="inline-form" @submit.prevent="addDomain"><a-input v-model:value="domainName" aria-label="域名" placeholder="web.example.com" required/><a-button type="primary" html-type="submit" :loading="busy">添加域名</a-button></form></a-card>

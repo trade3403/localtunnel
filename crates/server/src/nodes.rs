@@ -61,7 +61,8 @@ pub async fn set_policy(pool:&SqlitePool,id:&str,expected:i64,capacity:i64,regio
     Ok(())
 }
 pub fn routes(pool:SqlitePool)->Router{
-    Router::new().route("/api/v1/nodes",get(list)).with_state(pool)
+    Router::new().route("/api/v1/nodes",get(list))
+        .route("/api/v1/nodes/overview",get(overview)).with_state(pool)
 }
 async fn list(State(pool):State<SqlitePool>,headers:HeaderMap,Query(q):Query<Cursor>)->Result<Response,Failure>{
     auth::identify(&pool,&auth::bearer(&headers)?).await?;
@@ -69,5 +70,27 @@ async fn list(State(pool):State<SqlitePool>,headers:HeaderMap,Query(q):Query<Cur
     if after.len()>64||after.chars().any(char::is_control){return Err(BAD)}
     let rows=sqlx::query_as::<_,Node>("SELECT id,name,enabled FROM nodes WHERE id>? ORDER BY id LIMIT 100")
         .bind(after).fetch_all(&pool).await.map_err(|_|INTERNAL)?;
+    Ok(auth::uncached(Json(rows)))
+}
+
+#[derive(Serialize,sqlx::FromRow)]
+struct Overview {
+    id:String,name:String,enabled:bool,region:String,policy_mode:String,policy_revision:i64,
+    approved_capacity:i64,reported_capacity:Option<i64>,received_at:Option<i64>,health:String,
+    candidate_capacity:i64,owner_mappings:i64,owner_reserved_allocations:i64
+}
+/// Shared operational metadata is read-only. Only the authenticated owner's
+/// mapping and allocation counts are exposed, never global occupancy or keys.
+async fn overview(State(pool):State<SqlitePool>,headers:HeaderMap,Query(q):Query<Cursor>)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    let after=q.after.unwrap_or_default();
+    if after.len()>64||after.chars().any(char::is_control){return Err(BAD)}
+    let query=format!("SELECT n.id,n.name,h.enabled,h.region,h.policy_mode,h.policy_revision,
+      h.approved_capacity,h.reported_capacity,h.received_at,h.health,h.candidate_capacity,
+      (SELECT count(*) FROM mappings m WHERE m.node_id=n.id AND m.owner_id=?) AS owner_mappings,
+      (SELECT count(*) FROM relay_allocations a WHERE a.node_id=n.id AND a.owner_id=? AND a.state='reserved') AS owner_reserved_allocations
+      FROM nodes n JOIN ({HEALTH_SELECT}) h ON h.node_id=n.id WHERE n.id>? ORDER BY n.id LIMIT 100");
+    let rows=sqlx::query_as::<_,Overview>(&query).bind(&owner).bind(&owner).bind(after).fetch_all(&pool).await.map_err(|_|INTERNAL)?;
     Ok(auth::uncached(Json(rows)))
 }

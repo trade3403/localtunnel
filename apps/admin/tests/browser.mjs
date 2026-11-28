@@ -27,6 +27,9 @@ try{
   assert.equal(spawnSync(exe,['--init-admin',root],{input:JSON.stringify({username:'operator',password}),timeout:20000}).status,0)
   const node=spawnSync(exe,['--add-node',root,'Local relay'],{timeout:20000,encoding:'utf8'})
   assert.equal(node.status,0)
+  const localNode=node.stdout.trim()
+  assert.match(localNode,/^[a-f0-9]{32}$/)
+  assert.equal(spawnSync(exe,['--set-node-policy',root,localNode,'1','12','test-east','active'],{timeout:20000}).status,0)
   // Real SQLite fixtures to exercise server cursor boundaries without
   // manufacturing fake HTTP responses. The real CLI-created node sorts first.
   const seed=spawnSync('python3',['-c',`import sqlite3,sys
@@ -79,11 +82,22 @@ with sqlite3.connect(sys.argv[1]) as db:
   const menu=name=>page.getByRole('menuitem',{name,exact:true})
   await menu('节点管理').click()
   await page.getByText('Local relay',{exact:true}).waitFor()
+  const nodeRow=page.getByTestId('node-overview').getByRole('row').filter({hasText:'Local relay'})
+  await nodeRow.getByText('未注册',{exact:true}).waitFor()
+  await nodeRow.getByText('test-east',{exact:true}).waitFor()
+  await nodeRow.getByText('接收调度',{exact:true}).waitFor()
+  await nodeRow.getByText('12 / —',{exact:true}).waitFor()
+  await nodeRow.getByText('0 / 0',{exact:true}).waitFor()
+  assert.equal(spawnSync(exe,['--set-node-policy',root,localNode,'2','9','test-west','active'],{timeout:20000}).status,0)
+  await page.getByRole('button',{name:'刷新数据'}).click()
+  await nodeRow.getByText('test-west',{exact:true}).waitFor()
+  await nodeRow.getByText('9 / —',{exact:true}).waitFor()
   await page.getByTestId('nodes-count').filter({hasText:/^已加载 100 条$/}).waitFor()
   await page.getByTestId('nodes-more').click()
   await page.getByTestId('nodes-count').filter({hasText:/^已加载 102 条$/}).waitFor()
   await page.getByTestId('nodes-more').waitFor({state:'hidden'})
   report.real_cursor_pagination=true
+  report.real_browser_node_overview_and_refresh=true
   await menu('设备管理').click()
   await page.getByRole('button',{name:'生成配对码'}).click()
   const code=await page.getByTestId('pairing').textContent()

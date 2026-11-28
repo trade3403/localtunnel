@@ -130,12 +130,25 @@ try:
             report["real_operator_policy_revision_audit_and_isolation"]=True
             beat(token,1,99)
             assert health(root,a)["candidate_capacity"]==7
+            call(base,"nodes/overview",401)
+            call(base,"nodes/overview",401,token)
+            call(base,"nodes/overview",405,owner,"POST",{})
+            overview=call(base,"nodes/overview",200,owner)
+            assert len(overview)==2 and overview[0]["id"]==a and overview[1]["id"]==b
+            assert overview[0]["health"]=="online" and overview[0]["candidate_capacity"]==7 and overview[0]["reported_capacity"]==99
+            assert overview[1]["health"]=="unregistered" and overview[1]["reported_capacity"] is None
+            assert all(x["owner_mappings"]==0 and x["owner_reserved_allocations"]==0 for x in overview)
+            assert set(overview[0])=={"id","name","enabled","region","policy_mode","policy_revision","approved_capacity","reported_capacity","received_at","health","candidate_capacity","owner_mappings","owner_reserved_allocations"}
+            assert call(base,"nodes/overview?after="+a,200,owner)==overview[1:]
+            call(base,"nodes/overview?after="+"x"*65,400,owner)
             beat(token,1,3)
             assert call(base,policy,200,token)["candidate_capacity"]==3
             command(root,"--set-node-policy",a,3,7,"us-east","draining")
             beat(token,1,99)
             h=health(root,a)
             assert h["health"]=="online" and h["candidate_capacity"]==0 and h["policy_mode"]=="draining"
+            o=call(base,"nodes/overview",200,owner)[0]
+            assert o["health"]=="online" and o["candidate_capacity"]==0 and o["policy_mode"]=="draining"
             command(root,"--set-node-policy",a,4,7,"us-east","maintenance")
             assert health(root,a)["candidate_capacity"]==0
             command(root,"--set-node-policy",a,5,7,"us-east","active")
@@ -147,6 +160,9 @@ try:
                 time.sleep(.25)
             h=health(root,a)
             assert h["health"]=="offline" and h["candidate_capacity"]==0
+            o=call(base,"nodes/overview",200,owner)[0]
+            assert o["health"]=="offline" and o["candidate_capacity"]==0
+            report["real_owner_node_overview_health_and_cursor"]=True
             beat(token,1,99)
             with sqlite3.connect(dbpath) as db:
                 db.execute("UPDATE relay_heartbeat SET received_at=unixepoch()+60 WHERE node_id=?",(a,))
@@ -192,4 +208,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==4 and all(report.values())
+assert len(report)==5 and all(report.values())
