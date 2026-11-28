@@ -393,9 +393,24 @@ with sqlite3.connect(sys.argv[1]) as db:
   const devs=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/devices',{headers:{Authorization:adminBearer}})
   const dev=(await devs.json()).find(d=>d.name==='Browser fixture')
   assert.ok(dev)
-  const allocationResponse=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/allocations',{method:'POST',
-    headers:{Authorization:adminBearer,'Content-Type':'application/json'},
-    body:JSON.stringify({request_key:randomBytes(16).toString('hex'),device_id:dev.id,node_id:localNode,protocol:'tcp',local_port:8080,bind_port:29999})})
+  const allocationSpec={request_key:randomBytes(16).toString('hex'),device_id:dev.id,node_id:localNode,protocol:'tcp',local_port:8080,bind_port:29999}
+  const createAllocation=()=>fetch('http://127.0.0.1:'+apiPort+'/api/v1/allocations',{method:'POST',
+    headers:{Authorization:adminBearer,'Content-Type':'application/json'},body:JSON.stringify(allocationSpec)})
+  // Previous commercial phase intentionally left the owner expired.
+  // Exercise the real admission denial, then renew the same plan with
+  // its current revision before testing a successful reservation.
+  const expired=await entitlement()
+  assert.equal(expired.effective_state,'expired')
+  assert.equal((await createAllocation()).status,409)
+  assign('active',null,expired.revision)
+  const renewed=await entitlement()
+  assert.equal(renewed.effective_state,'active')
+  assert.equal(renewed.revision,expired.revision+1)
+  const refreshedHeartbeat=await fetch('http://127.0.0.1:'+apiPort+'/api/v1/relay/heartbeat',{method:'POST',
+    headers:{Authorization:'Bearer '+nodeCredential.stdout.trim(),'Content-Type':'application/json'},
+    body:JSON.stringify({protocol_version:1,generation:1,capacity:9})})
+  assert.equal(refreshedHeartbeat.status,204)
+  const allocationResponse=await createAllocation()
   assert.equal(allocationResponse.status,201)
   const allocation=await allocationResponse.json()
   await menu('分配与切换').click()
