@@ -50,17 +50,31 @@ async fn ready(State(pool): State<SqlitePool>) -> impl IntoResponse {
 }
 
 #[cfg(target_os = "linux")]
-fn secure_sqlite_file(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+fn secure_sqlite_file(path: &Path, sidecar: bool) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     // The parent is private and trusted. Open without following links, then
     // inspect and tighten the exact descriptor rather than chmod a pathname.
-    let file = std::fs::OpenOptions::new().read(true)
+    let file = match std::fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
+        .open(path) {
+        Ok(file) => file,
+        // SQLite may commit and unlink a transient journal between the
+        // pathname inspection and open. A missing main DB is not this case.
+        Err(e) if sidecar && e.kind()==io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    secure_sqlite_descriptor(&file, sidecar)
+}
+#[cfg(target_os = "linux")]
+fn secure_sqlite_descriptor(file: &std::fs::File, sidecar: bool) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let m = file.metadata()?;
-    if !m.is_file() || m.nlink() != 1 || m.uid() != unsafe { libc::geteuid() } {
+    if !m.is_file() || m.uid() != unsafe { libc::geteuid() } || m.nlink()>1 || (!sidecar && m.nlink()==0) {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unsafe SQLite ownership or link count"));
     }
+    // A valid owned sidecar can also be unlinked after open. Nothing at
+    // the old inode remains reachable by pathname; do not chmod it.
+    if m.nlink()==0 {return Ok(())}
     if m.permissions().mode() & 0o7777 != 0o600 {
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
@@ -96,7 +110,7 @@ fn data_path(dir: &Path) -> io::Result<PathBuf> {
             }
             Ok(_) => {
                 #[cfg(target_os = "linux")]
-                secure_sqlite_file(&dir.join(name))?;
+                secure_sqlite_file(&dir.join(name), name!="control.sqlite3")?;
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
@@ -165,7 +179,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
         return Err("usage: localtunnel-server <data-dir> <port> | --init-admin <data-dir> | --commercial-create-account <data-dir> | --commercial-create-plan <data-dir> | --commercial-assign <data-dir> (each reads bounded JSON stdin) | --scan-relay-failures <data-dir> | --watch-relay-failures <data-dir> | --retire-relay-budget <data-dir> <allocation-id> <grant-id> <offline_ports_and_engine_verified_stopped> | --recover-relay-budget <data-dir> <allocation-id> <grant-id> <offline_engine_and_guard_verified_stopped> | --commercial-list-bandwidth <data-dir> | --commercial-recover-bandwidth <data-dir> (reads exact reservation JSON and offline confirmation) | --relay-issue <data-dir> <node-id> | --relay-rotate / --relay-revoke <data-dir> <node-id> <expected-generation> | --node-health <data-dir> <node-id> | --set-node-policy <data-dir> <node-id> <expected-revision> <approved-capacity> <region> <active|draining|maintenance> | --add-node <data-dir> <name> | --set-node-enabled <data-dir> <id> <true|false> | --export-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> | --preview-gateway <data-dir> <mapping-id|clear> <revision> <prefix-name> <listen-port> <init|apply|apply-checked> [private-expected-body-filename] | --supervise-udp-preview <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> | --runtime-tcp-worker <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <bytes-per-second> | --runtime-udp-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bundle-name> <bytes-per-second> <burst-bytes> | --runtime-udp-device-worker <data-dir> <mapping-id> <revision> <relay-port> <internal-udp-port> <bytes-per-second> <burst-bytes> | --runtime-udp-resident (same arguments as --runtime-udp-worker; bundle base <=30 characters) | --supervise-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> | --preview-tls-gateway <data-dir> <mapping-id|clear> <revision> <prefix> <listen-port> <probe-port> <cert-dir> <init|apply|apply-checked> [expected-body-filename] | --supervise-tls-preview <data-dir> <mapping-id> <revision> <relay-port> <bundle-name> <prefix-name> <listen-port> <expected-body-filename> <probe-port> <cert-dir> | --runtime-worker / --runtime-tls-worker / --runtime-resident / --runtime-tls-resident (same arguments as corresponding supervise command; resident bundle base <=30 characters) | --recover-runtime <data-dir> <prefix> <request-id> | --prune-history <data-dir> | --prune-gateway-logs <data-dir> <prefix>".into());
     }
     let operator = scan_relay_failures || watch_relay_failures || relay_budget_retire || relay_budget_recover || node_health || set_policy || relay_action.is_some() || bandwidth_list || bandwidth_recover || commercial_action.is_some() || init || add_node || set_node || export || gateway || supervise || udp_supervise || tcp_worker || udp_worker || udp_device_worker || udp_resident || tls_gateway || supervise_tls || worker || tls_worker || resident || tls_resident || recover || prune_history || prune_logs;
-    let database = data_path(Path::new(if operator { &args[1] } else { &args[0] }))?;
+    let database = data_path(Path::new(if operator { &args[1] } else { &args[0] })).map_err(|e|{
+        if tcp_worker{eprintln!("TCP worker database path admission failed");}
+        e
+    })?;
     let port: u16 = if operator { 0 } else { args[1].to_str().ok_or("invalid port")?.parse()? };
     let root=database.parent().ok_or("invalid data directory")?.to_path_buf();
     if prune_logs{
@@ -194,7 +211,10 @@ async fn run() -> Result<(), Box<dyn Error>> {
     let _bandwidth_guard=if bandwidth_recover{
         Some(preview::bandwidth_guard(&root,true)?)
     }else if supervise || supervise_tls || worker || tls_worker || resident || tls_resident || udp_supervise || udp_worker || udp_device_worker || udp_resident || tcp_worker || recover{
-        Some(preview::bandwidth_guard(&root,false)?)
+        Some(preview::bandwidth_guard(&root,false).map_err(|e|{
+            if tcp_worker{eprintln!("TCP worker shared bandwidth guard admission failed");}
+            e
+        })?)
     }else{None};
     if scan_relay_failures{
         let result=reconciliation::scan_failures(&pool).await?;
@@ -409,5 +429,42 @@ async fn entry() {
         // Do not print SQL, filesystem paths, or future credentials.
         eprintln!("LocalTunnel management server failed to initialize or serve");
         std::process::exit(1);
+    }
+}
+
+#[cfg(all(test,target_os="linux"))]
+mod sqlite_admission_tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt,PermissionsExt,symlink};
+    struct Temp(PathBuf);
+    impl Drop for Temp{fn drop(&mut self){let _=std::fs::remove_dir_all(&self.0);}}
+    #[test]
+    fn transient_sidecar_removal_is_not_a_worker_start_failure(){
+        let root=Temp(std::env::temp_dir().join(format!("lt-sidecar-{}",hex::encode(auth::random::<16>().unwrap()))));
+        std::fs::DirBuilder::new().mode(0o700).create(&root.0).unwrap();
+        let path=root.0.join("control.sqlite3-journal");
+        std::fs::write(&path,b"fixture").unwrap();
+        let file=std::fs::File::open(&path).unwrap();
+        // Deterministically reproduce both disappearing-name and
+        // disappearing-link races without modifying a live SQLite journal.
+        std::fs::remove_file(&path).unwrap();
+        assert!(secure_sqlite_file(&path,true).is_ok());
+        assert!(secure_sqlite_file(&path,false).is_err());
+        assert!(secure_sqlite_descriptor(&file,true).is_ok());
+        assert!(secure_sqlite_descriptor(&file,false).is_err());
+        let target=root.0.join("target");
+        std::fs::write(&target,b"fixture").unwrap();
+        symlink(&target,&path).unwrap();
+        assert!(secure_sqlite_file(&path,true).is_err());
+        assert!(data_path(&root.0).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&target,&path).unwrap();
+        assert!(secure_sqlite_file(&path,true).is_err());
+        assert!(data_path(&root.0).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path,b"fixture").unwrap();
+        std::fs::set_permissions(&path,std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(secure_sqlite_file(&path,true).is_ok());
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);
     }
 }
