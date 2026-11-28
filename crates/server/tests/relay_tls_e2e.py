@@ -1067,6 +1067,10 @@ try:
                     return subprocess.run([str(exe),"--recover-relay-budget",str(center),a2["id"],grant_id,confirm],
                         text=True,capture_output=True,timeout=15)
                 assert reclaim_cmd().returncode!=0
+                def retire_cmd(grant_id=g2["id"],confirm="offline_ports_and_engine_verified_stopped"):
+                    return subprocess.run([str(exe),"--retire-relay-budget",str(center),a2["id"],grant_id,confirm],
+                        text=True,capture_output=True,timeout=15)
+                assert retire_cmd().returncode!=0
                 wait(lambda:time.time()>=g2["expires_at"]+2,20)
                 fence=admin(route+"/fence",dict(expected_generation=2,grant_id=g2["id"]),finite_owner,201)
                 assert fence["fence"]["new_generation"]==3
@@ -1132,6 +1136,28 @@ try:
                 with urllib.request.urlopen(req,timeout=4) as response:
                     row=json.load(response)
                     assert row["ports_released"] is False and row["monthly_refunded"] is False and row["reclaim"]==json.loads(recovered.stdout)
+                assert retire_cmd(confirm="unverified").returncode!=0
+                assert retire_cmd(grant_id=secrets.token_hex(16)).returncode!=0
+                retired=retire_cmd()
+                assert retired.returncode==0
+                again=retire_cmd()
+                assert again.returncode==0 and json.loads(again.stdout)==json.loads(retired.stdout)
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT generation,state,live_mapping_id FROM relay_allocations WHERE id=?",(a2["id"],)).fetchone()==(4,"cancelled",None)
+                    assert db.execute("SELECT count(*) FROM mappings WHERE id=?",(a2["mapping_id"],)).fetchone()==(0,)
+                    assert db.execute("SELECT count(*) FROM relay_budget_intents WHERE grant_id=?",(g2["id"],)).fetchone()==(0,)
+                    assert db.execute("SELECT relay_port,bind_port,new_generation FROM relay_budget_retirements WHERE allocation_id=?",(a2["id"],)).fetchone()==(br,bf,4)
+                    assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.budget_retired'").fetchone()==(1,)
+                    assert db.execute("SELECT monthly_bytes FROM relay_budget_previews WHERE allocation_id=?",(a2["id"],)).fetchone()==(4096,)
+                    for sql in ("DELETE FROM relay_budget_retirements","UPDATE relay_budget_retirements SET relay_port=31000","UPDATE relay_allocations SET generation=3 WHERE id IN (SELECT allocation_id FROM relay_budget_retirements)"):
+                        try:db.execute(sql);raise AssertionError("mutable retirement")
+                        except sqlite3.IntegrityError:db.rollback()
+                    assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
+                fails(start_finite())
+                req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/"+route+"/budget-retirement",headers={"Authorization":"Bearer "+finite_owner})
+                with urllib.request.urlopen(req,timeout=4) as response:
+                    row=json.load(response)
+                    assert row["ports_released"] is True and row["monthly_refunded"] is False and row["retirement"]==json.loads(retired.stdout)
             finally:
                 target.shutdown();target.server_close();worker.join(timeout=3)
         # D: two independently supervised real Noise tunnels from one finite
@@ -1143,8 +1169,9 @@ try:
             control(tokens[i],dict(protocol_version=1,node_id=nodes[i],generation=1,capacity=cap,nonce=secrets.token_hex(16)),200)
         # The reclaimed rate/slot capacity can be reserved again on another
         # node, but the previous monthly slice must remain fully charged.
-        new_a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":finite_device,"node_id":nodes[2],
-            "protocol":"tcp","local_port":8080,"bind_port":offline_port(20001,29999)},finite_owner,201)
+        new_a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":finite_device,"node_id":nodes[0],
+            "protocol":"tcp","local_port":8080,"bind_port":bf},finite_owner,201)
+        assert new_a["mapping_id"]!=a2["mapping_id"] and new_a["id"]!=a2["id"]
         try:
             admin("allocations/"+new_a["id"]+"/budget-preview",dict(spec,rate_bytes_per_second=65536,monthly_bytes=45905,connection_slots=2),finite_owner,201)
             raise AssertionError("reclaimed monthly slice refunded")
@@ -1156,6 +1183,12 @@ try:
             assert db.execute("SELECT sum(monthly_bytes) FROM relay_budget_previews WHERE allocation_id IN (?,?,?)",
                 (a["id"],a2["id"],new_a["id"])).fetchone()==(100000,)
         report["real_operator_reclaims_rate_slots_without_monthly_refund"]=True
+        control(tokens[0],dict(protocol_version=1,node_id=nodes[0],generation=1,capacity=8,nonce=secrets.token_hex(16)),200)
+        new_g=admin("allocations/"+new_a["id"]+"/budget-grant",spec,finite_owner,201)["grant"]
+        assert new_g["id"]!=g2["id"]
+        new_intent=admin("allocations/"+new_a["id"]+"/budget-start-intent",dict(grant_id=new_g["id"],expected_generation=2,relay_port=br),finite_owner,201)
+        assert new_intent["intent"]["relay_port"]==br and new_intent["intent"]["bind_port"]==bf
+        report["real_terminal_finite_retirement_and_port_reuse"]=True
         cmd("--commercial-create-account",data={"username":"finite-dual","password":password,"plan_id":finite,"expires_at":None})
         dual_owner=admin("auth/login",{"username":"finite-dual","password":password})["access_token"];tokens.append(dual_owner)
         pairing=admin("devices/pairing-code",None,dual_owner)["pairing_code"]
@@ -1281,4 +1314,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==29 and all(report.values())
+assert len(report)==30 and all(report.values())

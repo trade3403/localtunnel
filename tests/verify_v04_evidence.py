@@ -402,6 +402,7 @@ REQUIRED["management-v09"] = {
          "real_dual_node_guarded_tcp_budget_isolation_and_expiry",
          "real_tls_fenced_cleanup_observation_idempotent_no_release",
          "real_operator_reclaims_rate_slots_without_monthly_refund",
+         "real_terminal_finite_retirement_and_port_reuse",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",

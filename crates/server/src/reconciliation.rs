@@ -20,6 +20,7 @@ pub fn routes(pool:SqlitePool)->Router{
                 .route("/api/v1/relay/budget-cleanup-report",post(cleanup))
         .route("/api/v1/allocations/{id}/cleanup-report",axum::routing::get(cleanup_detail))
         .route("/api/v1/allocations/{id}/budget-reclaim",axum::routing::get(reclaim_detail))
+        .route("/api/v1/allocations/{id}/budget-retirement",axum::routing::get(retirement_detail))
         .layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 const SESSION:&str="EXISTS(SELECT 1 FROM admin_sessions s JOIN users u ON u.id=s.user_id
@@ -162,4 +163,38 @@ async fn reclaim_detail(State(pool):State<SqlitePool>,Path(id):Path<String>,head
     let row=sqlx::query_as::<_,Reclaim>(&query).bind(id).bind(owner).bind(token).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
     Ok(auth::uncached(Json(serde_json::json!({"scope":"rate_and_slots_reclaimed_monthly_retained","executable":false,
       "ports_released":false,"monthly_refunded":false,"reclaim":row}))))
+}
+
+#[derive(Serialize,sqlx::FromRow)]
+struct Retirement{allocation_id:String,grant_id:String,mapping_id:String,node_id:String,node_generation:i64,mapping_revision:i64,
+    local_port:i64,relay_port:i64,bind_port:i64,intent_created_at:i64,intent_claimed_at:i64,old_generation:i64,new_generation:i64,confirmation:String,retired_at:i64}
+pub async fn retire_budget(pool:&SqlitePool,id:&str,grant:&str,confirmation:&str)->Result<String,&'static str>{
+    if !hex_id(id)||!hex_id(grant)||confirmation!="offline_ports_and_engine_verified_stopped"{return Err("invalid budget retirement confirmation")}
+    let mut tx=pool.begin().await.map_err(|_|"budget retirement unavailable")?;
+    let row=sqlx::query_as::<_,Retirement>("INSERT INTO relay_budget_retirements(allocation_id,grant_id,mapping_id,owner_id,device_id,node_id,node_generation,
+      mapping_revision,local_port,relay_port,bind_port,intent_created_at,intent_claimed_at,old_generation,new_generation,confirmation,retired_at)
+      SELECT a.id,r.grant_id,m.id,a.owner_id,m.device_id,a.node_id,a.node_generation,m.revision,m.local_port,i.relay_port,m.bind_port,
+      i.created_at,i.claimed_at,3,4,?,unixepoch()
+      FROM relay_budget_reclaims r JOIN relay_allocations a ON a.id=r.allocation_id
+      JOIN mappings m ON m.id=a.live_mapping_id JOIN relay_budget_intents i ON i.grant_id=r.grant_id
+      WHERE a.id=? AND r.grant_id=? AND a.generation=3 AND a.state='reserved'
+      AND unixepoch()>=r.reclaimed_at AND NOT EXISTS(SELECT 1 FROM relay_budget_retirements x WHERE x.allocation_id=a.id)
+      RETURNING *")
+      .bind(confirmation).bind(id).bind(grant).fetch_optional(&mut *tx).await.map_err(|_|"budget retirement refused")?;
+    let row=if let Some(row)=row{row}else{
+        sqlx::query_as::<_,Retirement>("SELECT * FROM relay_budget_retirements WHERE allocation_id=? AND grant_id=? AND confirmation=?")
+          .bind(id).bind(grant).bind(confirmation).fetch_optional(&mut *tx).await.map_err(|_|"budget retirement refused")?.ok_or("budget retirement refused")?
+    };
+    tx.commit().await.map_err(|_|"budget retirement outcome unknown")?;
+    serde_json::to_string(&row).map_err(|_|"budget retirement outcome unknown")
+}
+async fn retirement_detail(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    if !hex_id(&id){return Err(MISSING)}
+    let query=format!("SELECT x.* FROM relay_budget_retirements x JOIN relay_allocations a ON a.id=x.allocation_id
+      WHERE a.id=? AND a.owner_id=? AND {SESSION}");
+    let row=sqlx::query_as::<_,Retirement>(&query).bind(id).bind(owner).bind(token).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
+    Ok(auth::uncached(Json(serde_json::json!({"scope":"terminal_finite_allocation_retired","executable":false,
+      "ports_released":true,"monthly_refunded":false,"retirement":row}))))
 }
