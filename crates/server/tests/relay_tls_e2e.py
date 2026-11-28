@@ -1627,6 +1627,16 @@ try:
                             with socket.socket() as probe:
                                 probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",port))!=0
                         report["real_automatic_successor_discovery_and_replacement_noise_traffic"]=True
+                        # The relay deliberately ends its monotonic lease
+                        # early (one-second margin plus request latency).
+                        # Center expiry uses its own UTC database clock.
+                        # Wait for that exact grant to expire, not for a
+                        # possibly incorrect status from the overview API.
+                        def successor_center_expired():
+                            with sqlite3.connect(center/"control.sqlite3") as db:
+                                return db.execute("SELECT expires_at<=unixepoch() FROM relay_budget_grants WHERE id=? AND allocation_id=?",
+                                    (sg["id"],successor)).fetchone()==(1,)
+                        wait(successor_center_expired,6)
                         req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/allocations",headers={"Authorization":"Bearer "+dual_owner})
                         with urllib.request.urlopen(req,timeout=4) as response:
                             listing=json.load(response)
