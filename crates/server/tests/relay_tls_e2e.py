@@ -1549,6 +1549,87 @@ try:
                         assert db.execute("SELECT count(*) FROM relay_failover_links WHERE source_id=?",(fid,)).fetchone()==(0,)
                         assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
                     report["real_opted_in_automatic_failover_after_verified_retirement"]=True
+                    # Continue the exact automatically reserved successor, not
+                    # a separate manually reserved fixture. Prepare keys before
+                    # spending the short lease; owner still explicitly activates.
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        successor_mapping,destination,destination_generation=db.execute(
+                            "SELECT mapping_id,node_id,node_generation FROM relay_allocations WHERE id=?",(successor,)).fetchone()
+                    ni=nodes.index(destination)
+                    cap=8 if ni==0 else 6
+                    rp=offline_port(30000,59999)
+                    key_output=subprocess.check_output([str(engine),"--genkey"],text=True,timeout=15)
+                    private=re.search(r"Private Key:\s*([A-Za-z0-9+/=]+)",key_output).group(1)
+                    public=re.search(r"Public Key:\s*([A-Za-z0-9+/=]+)",key_output).group(1)
+                    secret=secrets.token_hex(32);tokens.extend([private,secret])
+                    nd=directory("automatic-successor",tokens[ni])
+                    for name,value in (("noise.private",private),("budget-tcp.token",secret)):
+                        path=nd/name;path.write_text(value+"\n");path.chmod(0o600)
+                    nc=root/"automatic-successor.toml"
+                    subprocess.run([str(core_test.CLI),"client-config",str(nc),f"127.0.0.1:{rp}",
+                        "m_"+successor_mapping,f"127.0.0.1:{target.server_address[1]}"],
+                        env=dict(os.environ,LOCALTUNNEL_TOKEN=secret,LOCALTUNNEL_SERVER_PUBLIC_KEY=public),
+                        check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    def discover(index,credential=None,generation=1):
+                        nonce=secrets.token_hex(16)
+                        req=urllib.request.Request(f"https://localhost:{tp}/api/v1/relay/failover-pending",method="POST",
+                            headers={"Authorization":"Bearer "+(tokens[index] if credential is None else credential),"Content-Type":"application/json"},
+                            data=json.dumps(dict(protocol_version=1,node_id=nodes[index],node_generation=generation,nonce=nonce)).encode())
+                        try:
+                            with opener.open(req,timeout=4) as response:
+                                row=json.load(response)
+                                assert row["nonce"]==nonce and row["node_id"]==nodes[index] and row["node_generation"]==generation
+                                assert row["scope"]=="failover_pending_discovery_only" and row["executable"] is False
+                                return response.status,row["pending"]
+                        except urllib.error.HTTPError as ex:return ex.code,None
+                    control(tokens[ni],dict(protocol_version=1,node_id=destination,generation=destination_generation,capacity=cap,nonce=secrets.token_hex(16)),200)
+                    assert discover(ni)==(200,[])
+                    assert discover(ni,tokens[2])[0]==401
+                    assert discover(ni,generation=destination_generation+1)[0]==401
+                    assert discover(ni,dual_owner)[0]==401
+                    activation=admin("allocations/"+successor+"/failover-start",
+                        dict(source_id=sid,source_grant_id=second["grant"]["id"],lineage_epoch=2,expected_generation=1,
+                            expected_mapping_revision=1,expected_entitlement_revision=2,relay_port=rp),dual_owner,201)
+                    sg=activation["grant"]
+                    status,pending=discover(ni)
+                    assert status==200 and len(pending)==1
+                    job=pending[0]
+                    assert job["grant_id"]==sg["id"] and job["allocation_id"]==successor and job["mapping_id"]==successor_mapping
+                    assert job["source_id"]==sid and job["lineage_epoch"]==2 and job["relay_port"]==rp and job["bind_port"]==second["bp"]
+                    assert job["rate_bytes_per_second"]==65536 and job["monthly_bytes"]==95904 and job["connection_slots"]==3
+                    assert discover(2)==(200,[])
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        assert db.execute("SELECT claimed_at FROM relay_budget_intents WHERE grant_id=?",(sg["id"],)).fetchone()==(None,)
+                    args=[str(relay),"--budget-tcp-preview",str(nd),"localhost",str(tp),job["node_id"],str(job["node_generation"]),str(cap),
+                        job["allocation_id"],job["mapping_id"],str(job["mapping_revision"]),str(job["generation"]),job["grant_id"],
+                        str(job["bind_port"]),str(job["rate_bytes_per_second"]),str(job["monthly_bytes"]),str(job["connection_slots"]),str(job["relay_port"]),str(engine)]
+                    replacement=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);children.append(replacement)
+                    agent2=None
+                    try:
+                        with selectors.DefaultSelector() as sel:
+                            sel.register(replacement.stdout,selectors.EVENT_READ);assert sel.select(5)
+                        assert replacement.stdout.readline().strip()=="relay finite TCP engine started"
+                        assert discover(ni)==(200,[])
+                        agent2=subprocess.Popen([str(engine),str(nc)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,RUST_LOG="warn"));children.append(agent2)
+                        def echo_replacement():
+                            try:
+                                with socket.create_connection(("127.0.0.1",job["bind_port"]),timeout=.5) as conn:
+                                    echo(conn,b"automatic-reservation-replacement");return True
+                            except (OSError,AssertionError):return False
+                        wait(echo_replacement,6)
+                        assert replacement.poll() is None
+                        fails(launch(second))
+                        out,err=replacement.communicate(timeout=20)
+                        assert replacement.returncode==0 and out.strip().startswith("relay finite TCP stopped reason=expired bytes=")
+                        assert discover(ni)==(200,[])
+                        assert (nd/("budget-consumed-"+sg["id"])).is_file()
+                        for port in (rp,job["bind_port"]):
+                            with socket.socket() as probe:
+                                probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",port))!=0
+                        report["real_automatic_successor_discovery_and_replacement_noise_traffic"]=True
+                    finally:
+                        if agent2 is not None:stop(agent2)
+                        stop(replacement)
                 finally:
                     for item in items:
                         if item.get("conn") is not None:item["conn"].close()
@@ -1568,4 +1649,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==34 and all(report.values())
+assert len(report)==35 and all(report.values())

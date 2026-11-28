@@ -48,6 +48,7 @@ pub fn routes(pool:SqlitePool)->Router{
         .route("/api/v1/allocations/{id}/budget-run-intent",post(run_intent))
         .route("/api/v1/relay/budget-run-claim",post(run_claim))
         .route("/api/v1/allocations/{id}/budget-start-intent",post(start_intent))
+        .route("/api/v1/relay/failover-pending",post(failover_pending))
         .route("/api/v1/relay/budget-start-claim",post(start_claim)).layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 async fn issue(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<Issue>)->Result<Response,Failure>{
@@ -219,4 +220,41 @@ async fn failover_start(State(pool):State<SqlitePool>,Path(id):Path<String>,head
     tx.commit().await.map_err(|_|INTERNAL)?;
     Ok(auth::uncached((StatusCode::CREATED,Json(serde_json::json!({"scope":"failover_guarded_start_intent",
       "executable":false,"lineage_epoch":c.lineage_epoch,"grant":grant,"intent":row})))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingRequest{protocol_version:i64,node_id:String,node_generation:i64,nonce:String}
+#[derive(Serialize,sqlx::FromRow)]
+struct Pending{grant_id:String,allocation_id:String,mapping_id:String,mapping_revision:i64,node_id:String,node_generation:i64,
+    generation:i64,rate_bytes_per_second:i64,monthly_bytes:i64,connection_slots:i64,relay_port:i64,bind_port:i64,
+    source_id:String,lineage_epoch:i64,expires_at:i64,server_time:i64}
+/// Read-only discovery: no claim, no lease renewal, no keys. Identity and
+/// candidate checks use the same snapshot. A subsequent claim revalidates.
+async fn failover_pending(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<PendingRequest>)->Result<Response,Failure>{
+    let credential=relay::digest(&headers)?;
+    if c.protocol_version!=1||!hex_id(&c.node_id)||!hex_id(&c.nonce)||c.node_generation<1{return Err(BAD)}
+    let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
+    let valid=sqlx::query_scalar::<_,i64>("SELECT count(*) FROM relay_identities r JOIN nodes n ON n.id=r.node_id
+      WHERE r.node_id=? AND r.generation=? AND r.token_digest=? AND n.enabled=1")
+      .bind(&c.node_id).bind(c.node_generation).bind(&credential).fetch_one(&mut *tx).await.map_err(|_|INTERNAL)?;
+    if valid!=1{return Err(DENIED)}
+    let query=format!("SELECT g.id AS grant_id,a.id AS allocation_id,m.id AS mapping_id,b.mapping_revision,b.node_id,b.node_generation,
+      a.generation,b.rate_bytes_per_second,b.monthly_bytes,b.connection_slots,i.relay_port,a.bind_port,l.source_id,l.lineage_epoch,
+      g.expires_at,unixepoch() AS server_time {CURRENT}
+      JOIN relay_budget_grants g ON g.allocation_id=a.id
+      JOIN relay_budget_intents i ON i.grant_id=g.id AND i.node_id=a.node_id AND i.bind_port=a.bind_port
+      JOIN relay_failover_links l ON l.successor_id=a.id AND l.entitlement_revision=b.entitlement_revision
+      JOIN relay_allocations old ON old.id=l.source_id AND old.owner_id=a.owner_id
+      JOIN relay_budget_retirements retirement ON retirement.allocation_id=old.id AND retirement.grant_id=l.source_grant_id
+      WHERE {ELIGIBLE} AND {CLAIM_ELIGIBLE} AND b.node_id=? AND b.node_generation=? AND r.token_digest=?
+      AND i.intent_mode='guarded_tcp' AND i.execution_opt_in=1 AND i.claimed_at IS NULL
+      AND old.state='cancelled' AND old.generation=4 AND old.node_id<>a.node_id
+      ORDER BY g.expires_at,g.id LIMIT 17");
+    let mut rows=sqlx::query_as::<_,Pending>(&query).bind(&c.node_id).bind(c.node_generation).bind(&credential)
+      .fetch_all(&mut *tx).await.map_err(|_|INTERNAL)?;
+    let more=rows.len()>16;rows.truncate(16);
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"node_id":c.node_id,"node_generation":c.node_generation,
+      "scope":"failover_pending_discovery_only","executable":false,"more":more,"pending":rows}))))
 }
