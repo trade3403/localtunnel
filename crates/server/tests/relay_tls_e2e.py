@@ -136,9 +136,9 @@ try:
             (d/"center-ca.pem").write_bytes(anchor.read_bytes())
             (d/"center-ca.pem").chmod(0o600)
             return d
-        def start(d,i,host="localhost",target=tp):
+        def start(d,i,host="localhost",target=tp,capacity=None):
             env=dict(os.environ,https_proxy="http://127.0.0.1:1",HTTPS_PROXY="http://127.0.0.1:1",ALL_PROXY="http://127.0.0.1:1",NO_PROXY="")
-            p=subprocess.Popen([str(relay),"--tls",str(d),host,str(target),nodes[i],"1",str(i+5)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            p=subprocess.Popen([str(relay),"--tls",str(d),host,str(target),nodes[i],"1",str(i+5 if capacity is None else capacity)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             children.append(p);return p
         dirs=[directory("relay-"+str(i),t) for i,t in enumerate(tokens)]
         live=[start(d,i) for i,d in enumerate(dirs)]
@@ -1055,6 +1055,126 @@ try:
                 report["real_tls_guarded_noise_tcp_budget_exhaustion_and_replay_rejection"]=True
             finally:
                 target.shutdown();target.server_close();worker.join(timeout=3)
+        # D: two independently supervised real Noise tunnels from one finite
+        # tenant, with disjoint slices saturating every commercial cap.
+        # Refresh node 0's advertised capacity for the additional fixture.
+        stop(live[0]);live[0]=start(dirs[0],0,capacity=8)
+        cmd("--set-node-policy",nodes[2],2,9,"east","active")
+        for i,cap in ((0,8),(2,7)):
+            control(tokens[i],dict(protocol_version=1,node_id=nodes[i],generation=1,capacity=cap,nonce=secrets.token_hex(16)),200)
+        cmd("--commercial-create-account",data={"username":"finite-dual","password":password,"plan_id":finite,"expires_at":None})
+        dual_owner=admin("auth/login",{"username":"finite-dual","password":password})["access_token"];tokens.append(dual_owner)
+        pairing=admin("devices/pairing-code",None,dual_owner)["pairing_code"]
+        dual_device=admin("devices/enroll",{"pairing_code":pairing,"name":"dual budget fixture"},status=201)["id"]
+        with socketserver.ThreadingTCPServer(("127.0.0.1",0),Stream) as target:
+            target.daemon_threads=True
+            worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
+            try:
+                items=[]
+                for i,cap,monthly,slots in ((0,8,4096,1),(2,7,95904,3)):
+                    rp,bp=offline_port(30000,59999),offline_port(20001,29999)
+                    a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":dual_device,"node_id":nodes[i],
+                        "protocol":"tcp","local_port":target.server_address[1],"bind_port":bp},dual_owner,201)
+                    admin("allocations/"+a["id"]+"/budget-preview",dict(spec,rate_bytes_per_second=65536,
+                        monthly_bytes=monthly,connection_slots=slots),dual_owner,201)
+                    keys=subprocess.check_output([str(engine),"--genkey"],text=True,timeout=15)
+                    private=re.search(r"Private Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
+                    public=re.search(r"Public Key:\s*([A-Za-z0-9+/=]+)",keys).group(1)
+                    secret=secrets.token_hex(32);tokens.extend([private,secret])
+                    # Distinct node credentials and state directories.
+                    d=directory("dual-finite-"+str(i),tokens[i])
+                    for name,value in (("noise.private",private),("budget-tcp.token",secret)):
+                        path=d/name;path.write_text(value+"\n");path.chmod(0o600)
+                    config=root/("dual-finite-"+str(i)+".toml")
+                    subprocess.run([str(core_test.CLI),"client-config",str(config),f"127.0.0.1:{rp}","m_"+a["mapping_id"],
+                        f"127.0.0.1:{target.server_address[1]}"],env=dict(os.environ,LOCALTUNNEL_TOKEN=secret,LOCALTUNNEL_SERVER_PUBLIC_KEY=public),
+                        check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                    items.append(dict(i=i,cap=cap,a=a,rp=rp,bp=bp,monthly=monthly,slots=slots,d=d,config=config))
+                for item in items:
+                    i=item["i"];a=item["a"]
+                    control(tokens[i],dict(protocol_version=1,node_id=nodes[i],generation=1,capacity=item["cap"],nonce=secrets.token_hex(16)),200)
+                    g=admin("allocations/"+a["id"]+"/budget-grant",spec,dual_owner,201)["grant"]
+                    admin("allocations/"+a["id"]+"/budget-start-intent",dict(grant_id=g["id"],expected_generation=2,relay_port=item["rp"]),dual_owner,201)
+                    item["grant"]=g
+                    item["args"]=[str(relay),"--budget-tcp-preview",str(item["d"]),"localhost",str(tp),nodes[i],"1",str(item["cap"]),
+                        a["id"],a["mapping_id"],"1","2",g["id"],str(item["bp"]),"65536",str(item["monthly"]),str(item["slots"]),str(item["rp"]),str(engine)]
+                def launch(item):
+                    proc=subprocess.Popen(item["args"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);children.append(proc);return proc
+                for item in items:item["proc"]=launch(item)
+                for item in items:
+                    proc=item["proc"]
+                    with selectors.DefaultSelector() as sel:
+                        sel.register(proc.stdout,selectors.EVENT_READ);assert sel.select(5)
+                    assert proc.stdout.readline().strip()=="relay finite TCP engine started"
+                    client=subprocess.Popen([str(engine),str(item["config"])],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,RUST_LOG="warn"))
+                    children.append(client);item["client"]=client
+                def echo(conn,body):
+                    conn.sendall(body)
+                    received=bytearray()
+                    while len(received)<len(body):
+                        chunk=conn.recv(len(body)-len(received))
+                        if not chunk:raise OSError("finite echo closed")
+                        received.extend(chunk)
+                    assert received==body
+                def connect_item(item):
+                    if item.get("conn") is not None:return True
+                    try:
+                        c=socket.create_connection(("127.0.0.1",item["bp"]),timeout=.5)
+                        try:echo(c,b"dual-finite-echo")
+                        except (OSError,AssertionError):c.close();return False
+                        item["conn"]=c;return True
+                    except OSError:return False
+                try:
+                    wait(lambda:all(connect_item(item) for item in items),6)
+                    first,second=items
+                    assert all(item["proc"].poll() is None for item in items)
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        assert db.execute("SELECT sum(rate_bytes_per_second),sum(monthly_bytes),sum(connection_slots) FROM relay_budget_previews WHERE allocation_id IN (?,?)",
+                            tuple(item["a"]["id"] for item in items)).fetchone()==(131072,100000,4)
+                        assert db.execute("SELECT count(DISTINCT node_id),count(*) FROM relay_budget_intents WHERE grant_id IN (?,?) AND claimed_at IS NOT NULL AND execution_opt_in=1",
+                            tuple(item["grant"]["id"] for item in items)).fetchone()==(2,2)
+                    # Exhaust only the first node's slice. The second must
+                    # still carry a real established encrypted stream.
+                    c=first["conn"];c.settimeout(3);c.sendall(b"x"*8192)
+                    try:
+                        while c.recv(4096):pass
+                    except (ConnectionResetError,BrokenPipeError):pass
+                    out,err=first["proc"].communicate(timeout=5)
+                    assert first["proc"].returncode==0 and out.strip()=="relay finite TCP stopped reason=exhausted bytes=4096"
+                    assert second["proc"].poll() is None
+                    echo(second["conn"],b"survives-other-node")
+                    for n in (first["rp"],first["bp"]):
+                        with socket.socket() as probe:
+                            probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",n))!=0
+                    fails(launch(first))
+                    # The surviving stream must close at its own lease,
+                    # not consume the other node's unused allocation.
+                    out,err=second["proc"].communicate(timeout=20)
+                    assert second["proc"].returncode==0
+                    match=re.fullmatch(r"relay finite TCP stopped reason=expired bytes=(\d+)",out.strip())
+                    assert match and 2*(len(b"dual-finite-echo")+len(b"survives-other-node"))<=int(match.group(1))<second["monthly"]
+                    second["conn"].settimeout(2)
+                    try:assert second["conn"].recv(1)==b""
+                    except ConnectionResetError:pass
+                    fails(launch(second))
+                    for item in items:
+                        stop(item["client"])
+                        assert (item["d"]/("budget-consumed-"+item["grant"]["id"])).is_file()
+                        for n in (item["rp"],item["bp"]):
+                            with socket.socket() as probe:
+                                probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",n))!=0
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        assert db.execute("SELECT sum(monthly_bytes),sum(connection_slots) FROM relay_budget_previews WHERE allocation_id IN (?,?)",
+                            tuple(item["a"]["id"] for item in items)).fetchone()==(100000,4)
+                        assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
+                    report["real_dual_node_guarded_tcp_budget_isolation_and_expiry"]=True
+                finally:
+                    for item in items:
+                        if item.get("conn") is not None:item["conn"].close()
+                        for key in ("proc","client"):
+                            if item.get(key) is not None:stop(item[key])
+            finally:
+                target.shutdown();target.server_close();worker.join(timeout=3)
         dns.shutdown();dns_thread.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
         fails(live[1])
@@ -1067,4 +1187,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==26 and all(report.values())
+assert len(report)==27 and all(report.values())
