@@ -1189,6 +1189,58 @@ try:
         new_intent=admin("allocations/"+new_a["id"]+"/budget-start-intent",dict(grant_id=new_g["id"],expected_generation=2,relay_port=br),finite_owner,201)
         assert new_intent["intent"]["relay_port"]==br and new_intent["intent"]["bind_port"]==bf
         report["real_terminal_finite_retirement_and_port_reuse"]=True
+        # C1: automatic destination selection after terminal retirement.
+        # First prove a fully allocated tenant cannot acquire a successor.
+        from concurrent.futures import ThreadPoolExecutor
+        fail_route="allocations/"+a2["id"]+"/failover"
+        fail_data=dict(expected_generation=4,source_grant_id=g2["id"],expected_entitlement_revision=1)
+        def request_failover(data,token=finite_owner):
+            req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/"+fail_route,method="POST",
+                headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"},data=json.dumps(data).encode())
+            try:
+                with urllib.request.urlopen(req,timeout=5) as response:return response.status,json.load(response)
+            except urllib.error.HTTPError as e:return e.code,None
+        with sqlite3.connect(center/"control.sqlite3") as db:
+            before=db.execute("SELECT count(*) FROM mappings").fetchone()
+            tenant_id=db.execute("SELECT tenant_id FROM relay_budget_previews WHERE allocation_id=?",(a2["id"],)).fetchone()[0]
+        assert request_failover(fail_data)[0]==409
+        assert request_failover(fail_data,owner)[0]==404
+        with sqlite3.connect(center/"control.sqlite3") as db:
+            assert db.execute("SELECT count(*) FROM mappings").fetchone()==before
+            assert db.execute("SELECT count(*) FROM relay_failover_links").fetchone()==(0,)
+        larger=cmd("--commercial-create-plan",data={"code":"finite-relay","version":2,"name":"Finite relay expanded",
+            "max_active_devices":4,"max_retained_devices":8,"max_mappings":8,"max_bandwidth_bps":1572864,
+            "max_monthly_bytes":104096,"max_concurrent_connections":5})
+        cmd("--commercial-assign",data={"tenant_id":tenant_id,"plan_id":larger,"expected_revision":1,"state":"active","expires_at":None})
+        fail_data["expected_entitlement_revision"]=2
+        assert request_failover(dict(fail_data,expected_entitlement_revision=1))[0]==409
+        assert request_failover(dict(fail_data,source_grant_id=secrets.token_hex(16)))[0]==409
+        for i,cap in ((1,6),(2,7)):
+            control(tokens[i],dict(protocol_version=1,node_id=nodes[i],generation=1,capacity=cap,nonce=secrets.token_hex(16)),200)
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            outcomes=list(workers.map(lambda _:request_failover(fail_data),range(2)))
+        assert sorted(code for code,_ in outcomes)==[200,201]
+        row=outcomes[0][1]
+        assert outcomes[1][1]==row and row["executable"] is False and row["monthly_refunded"] is False
+        link=row["link"]
+        assert link["source_id"]==a2["id"] and link["source_grant_id"]==g2["id"] and link["lineage_epoch"]==2
+        assert link["node_id"] in nodes[1:] and link["bind_port"]==bf and link["mapping_id"]!=a2["mapping_id"]
+        assert request_failover(dict(fail_data,expected_entitlement_revision=1))[0]==409
+        req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/"+fail_route,headers={"Authorization":"Bearer "+finite_owner})
+        with urllib.request.urlopen(req,timeout=4) as response:assert json.load(response)==row
+        with sqlite3.connect(center/"control.sqlite3") as db:
+            assert db.execute("SELECT count(*) FROM relay_failover_links").fetchone()==(1,)
+            assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.failover_reserved'").fetchone()==(1,)
+            assert db.execute("SELECT generation,state FROM relay_allocations WHERE id=?",(link["successor_id"],)).fetchone()==(1,"reserved")
+            assert db.execute("SELECT local_port,device_id,enabled FROM mappings WHERE id=?",(link["mapping_id"],)).fetchone()==(json.loads(retired.stdout)["local_port"],finite_device,0)
+            assert db.execute("SELECT count(*) FROM relay_budget_grants WHERE allocation_id=?",(link["successor_id"],)).fetchone()==(0,)
+            assert db.execute("SELECT sum(monthly_bytes) FROM relay_budget_previews WHERE tenant_id=?",(tenant_id,)).fetchone()==(104096,)
+            assert db.execute("SELECT sum(rate_bytes_per_second),sum(connection_slots) FROM relay_budget_active WHERE tenant_id=?",(tenant_id,)).fetchone()==(196608,5)
+            for sql in ("DELETE FROM relay_failover_links","UPDATE relay_failover_links SET lineage_epoch=3"):
+                try:db.execute(sql);raise AssertionError("mutable failover link")
+                except sqlite3.IntegrityError:db.rollback()
+            assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
+        report["real_retired_failover_atomic_successor_and_budget_isolation"]=True
         cmd("--commercial-create-account",data={"username":"finite-dual","password":password,"plan_id":finite,"expires_at":None})
         dual_owner=admin("auth/login",{"username":"finite-dual","password":password})["access_token"];tokens.append(dual_owner)
         pairing=admin("devices/pairing-code",None,dual_owner)["pairing_code"]
@@ -1314,4 +1366,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==30 and all(report.values())
+assert len(report)==31 and all(report.values())

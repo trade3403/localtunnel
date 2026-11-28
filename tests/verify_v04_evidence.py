@@ -403,6 +403,7 @@ REQUIRED["management-v09"] = {
          "real_tls_fenced_cleanup_observation_idempotent_no_release",
          "real_operator_reclaims_rate_slots_without_monthly_refund",
          "real_terminal_finite_retirement_and_port_reuse",
+         "real_retired_failover_atomic_successor_and_budget_isolation",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",
