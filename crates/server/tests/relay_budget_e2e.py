@@ -190,8 +190,27 @@ try:
                 assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
             report["real_finite_budget_grant_exact_node_slice_and_legacy_isolation"]=True
             report["real_guarded_intent_explicit_opt_in_and_claim_mode_isolation"]=True
+            # No finite slice is refunded or port released by expiry fencing.
+            deadline=time.monotonic()+20
+            while time.time()<g["expires_at"]+2:
+                assert time.monotonic()<deadline
+                time.sleep(.1)
+            route="allocations/"+g["allocation_id"]
+            data=dict(expected_generation=2,grant_id=g["id"])
+            call(base,route+"/fence",404,owner,"POST",data)
+            row=call(base,route+"/fence",201,other,"POST",data)[1]
+            assert row["fence"]["grant_kind"]=="finite" and row["fence"]["new_generation"]==3
+            assert row["resources_released"] is False and row["executable"] is False
+            assert call(base,route+"/fence",200,other,"POST",data)[1]==row
+            call(base,route+"/cancel",409,other,"POST",dict(expected_generation=3))
+            observe(g,401);claim(g,401)
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT count(*) FROM relay_budget_previews").fetchone()==(3,)
+                assert db.execute("SELECT count(*) FROM relay_budget_intents").fetchone()==(2,)
+                assert db.execute("SELECT generation,state FROM relay_allocations WHERE id=?",(g["allocation_id"],)).fetchone()==(3,"reserved")
+            report["real_finite_expiry_fence_retains_budget_and_ports"]=True
         finally:stop(p)
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==5 and all(report.values())
+assert len(report)==6 and all(report.values())

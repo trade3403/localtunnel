@@ -95,6 +95,12 @@ try:
             assert call(base,route+"/grant",200,owner)[1]==grant
             call(base,route+"/grant",404,other)
             cancel(gen=1);cancel()
+            fence_spec={"expected_generation":2,"grant_id":grant["id"]}
+            def fence(status=201,token=owner,data=fence_spec):
+                return call(base,route+"/fence",status,token,"POST",data)
+            fence(409);fence(404,other);fence(401,tokens[0])
+            call(base,route+"/fence",404,owner)
+            fence(400,data=dict(fence_spec,expected_generation=3))
             payload={k:grant[k] for k in ("allocation_id","mapping_id","mapping_revision","node_id","node_generation","generation")}
             payload.update(protocol_version=1,nonce=secrets.token_hex(16))
             def fetch(status=200,token=tokens[0],data=payload):
@@ -124,6 +130,24 @@ try:
                 assert db.execute("SELECT unixepoch()>=expires_at FROM relay_grants WHERE id=?",(grant["id"],)).fetchone()==(1,)
             cancel()
             issue(409)
+            while time.time()<grant["expires_at"]+2:time.sleep(.1)
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                results=list(workers.map(lambda _:fence((200,201)),range(2)))
+            assert sorted(code for code,_ in results)==[200,201]
+            row=results[0][1]
+            assert results[1][1]==row and row["resources_released"] is False and row["executable"] is False
+            assert row["fence"]["old_generation"]==2 and row["fence"]["new_generation"]==3
+            assert call(base,route,200,owner)[1]["generation"]==3
+            assert call(base,route+"/fence",200,owner)[1]==row
+            fence(409,data=dict(fence_spec,grant_id=secrets.token_hex(16)))
+            call(base,route+"/fence",404,other)
+            cancel(gen=3)
+            with sqlite3.connect(root/"control.sqlite3") as db:
+                assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.expiry_fenced'").fetchone()==(1,)
+                for sql in ("DELETE FROM relay_allocation_fences","UPDATE relay_allocation_fences SET fenced_at=fenced_at+1","UPDATE relay_allocations SET generation=2 WHERE id IN (SELECT allocation_id FROM relay_allocation_fences)"):
+                    try:db.execute(sql);raise AssertionError("mutable fence")
+                    except sqlite3.IntegrityError:db.rollback()
+            report["real_expired_allocation_fence_atomic_idempotent_and_retained"]=True
             beat(0)
             c=reserve(20002)
             current=issue(allocation=c)[1]
@@ -153,7 +177,9 @@ try:
             fresh=login(base,"owner")
             restored_grant=call(base,route+"/grant",200,fresh)[1]
             assert restored_grant["id"]==grant["id"] and restored_grant["revoked_at"] is not None
-            call(base,route+"/cancel",409,fresh,"POST",{"expected_generation":2})
+            call(base,route+"/cancel",409,fresh,"POST",{"expected_generation":3})
+            assert call(base,route+"/fence",200,fresh)[1]==row
+            assert call(base,route,200,fresh)[1]["generation"]==3
             call(base,"relay/grant",401,rotated,"POST",current_payload)
             with sqlite3.connect(restored/"control.sqlite3") as db:
                 assert db.execute("SELECT count(*) FROM relay_grants WHERE revoked_at IS NOT NULL").fetchone()==(2,)
@@ -164,4 +190,4 @@ try:
 finally:
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==3 and all(report.values())
+assert len(report)==4 and all(report.values())

@@ -343,6 +343,7 @@ REQUIRED["management-v09"] = {
         "real_finite_budget_grant_exact_node_slice_and_legacy_isolation",
          "real_finite_budget_one_shot_claim_and_replay_rejection",
          "real_guarded_intent_explicit_opt_in_and_claim_mode_isolation",
+        "real_finite_expiry_fence_retains_budget_and_ports",
     ],
     "relay-http-claim.json": [
         "real_http_dns_proof_exact_claim_and_protocol_isolation",
@@ -357,6 +358,7 @@ REQUIRED["management-v09"] = {
         "real_grant_exact_binding_atomic_generation_and_owner_isolation",
         "real_grant_policy_generation_expiry_and_no_release",
         "real_grant_restore_revoked_and_retained",
+        "real_expired_allocation_fence_atomic_idempotent_and_retained",
     ],
     "scheduling.json": [
         "real_atomic_capacity_and_idempotent_reservation",
