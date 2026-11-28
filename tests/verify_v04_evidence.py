@@ -404,6 +404,7 @@ REQUIRED["management-v09"] = {
          "real_operator_reclaims_rate_slots_without_monthly_refund",
          "real_terminal_finite_retirement_and_port_reuse",
          "real_retired_failover_atomic_successor_and_budget_isolation",
+         "real_failover_successor_atomic_activation_and_noise_traffic",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",

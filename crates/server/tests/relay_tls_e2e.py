@@ -629,6 +629,8 @@ try:
                     except OSError:continue
                 used.add(n);return n
             raise AssertionError("offline fixture port unavailable")
+        class ReusableStreamServer(socketserver.ThreadingTCPServer):
+            allow_reuse_address=True
         class Stream(socketserver.BaseRequestHandler):
             def handle(self):
                 self.request.settimeout(25)
@@ -638,7 +640,7 @@ try:
                         if not data:return
                         self.request.sendall(data)
                 except OSError:return
-        with socketserver.ThreadingTCPServer(("127.0.0.1",0),Stream) as target:
+        with ReusableStreamServer(("127.0.0.1",0),Stream) as target:
             target.daemon_threads=True
             worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
             try:
@@ -1000,7 +1002,7 @@ try:
         report["real_tls_finite_budget_node_verification_and_expiry_without_listener"]=True
         # Fresh explicit opt-in: existing observation or guarded previews
         # cannot be promoted. Use the remaining reserved plan slice.
-        with socketserver.ThreadingTCPServer(("127.0.0.1",0),Stream) as target:
+        with ReusableStreamServer(("127.0.0.1",0),Stream) as target:
             target.daemon_threads=True
             worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
             try:
@@ -1241,11 +1243,108 @@ try:
                 except sqlite3.IntegrityError:db.rollback()
             assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
         report["real_retired_failover_atomic_successor_and_budget_isolation"]=True
+        # C2: re-open the exact archived local target and start a real
+        # replacement on the selected different node with fresh credentials.
+        with ReusableStreamServer(("127.0.0.1",json.loads(retired.stdout)["local_port"]),Stream) as target:
+            target.daemon_threads=True
+            worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
+            successor=None;client=None
+            try:
+                i=nodes.index(link["node_id"]);cap=i+5
+                rp=offline_port(30000,59999)
+                key_output=subprocess.check_output([str(engine),"--genkey"],text=True,timeout=15)
+                private=re.search(r"Private Key:\s*([A-Za-z0-9+/=]+)",key_output).group(1)
+                public=re.search(r"Public Key:\s*([A-Za-z0-9+/=]+)",key_output).group(1)
+                secret=secrets.token_hex(32);tokens.extend([private,secret])
+                d=directory("failover-successor",tokens[i])
+                for name,value in (("noise.private",private),("budget-tcp.token",secret)):
+                    path=d/name;path.write_text(value+"\n");path.chmod(0o600)
+                config=root/"failover-successor.toml"
+                subprocess.run([str(core_test.CLI),"client-config",str(config),f"127.0.0.1:{rp}",
+                    "m_"+link["mapping_id"],f"127.0.0.1:{target.server_address[1]}"],
+                    env=dict(os.environ,LOCALTUNNEL_TOKEN=secret,LOCALTUNNEL_SERVER_PUBLIC_KEY=public),
+                    check=True,timeout=15,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                start_route="allocations/"+link["successor_id"]+"/failover-start"
+                start_data=dict(source_id=a2["id"],source_grant_id=g2["id"],lineage_epoch=2,
+                    expected_generation=1,expected_mapping_revision=1,expected_entitlement_revision=2,relay_port=rp)
+                def start_request(data,token=finite_owner):
+                    req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/"+start_route,method="POST",
+                        headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"},data=json.dumps(data).encode())
+                    try:
+                        with urllib.request.urlopen(req,timeout=5) as response:return response.status,json.load(response)
+                    except urllib.error.HTTPError as e:return e.code,None
+                control(tokens[i],dict(protocol_version=1,node_id=nodes[i],generation=1,capacity=cap,nonce=secrets.token_hex(16)),200)
+                try:
+                    admin("allocations/"+link["successor_id"]+"/budget-grant",dict(spec,expected_entitlement_revision=2),finite_owner,201)
+                    raise AssertionError("successor bypassed lineage activation")
+                except urllib.error.HTTPError as ex:assert ex.code==409
+                assert start_request(start_data,owner)[0]==409
+                assert start_request(dict(start_data,lineage_epoch=3))[0]==409
+                assert start_request(dict(start_data,expected_entitlement_revision=1))[0]==409
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT generation FROM relay_allocations WHERE id=?",(link["successor_id"],)).fetchone()==(1,)
+                    assert db.execute("SELECT count(*) FROM relay_budget_grants WHERE allocation_id=?",(link["successor_id"],)).fetchone()==(0,)
+                with ThreadPoolExecutor(max_workers=2) as workers:
+                    outcomes=list(workers.map(lambda _:start_request(start_data),range(2)))
+                assert sorted(code for code,_ in outcomes)==[201,409]
+                activation=next(row for code,row in outcomes if code==201)
+                assert activation["scope"]=="failover_guarded_start_intent" and activation["executable"] is False and activation["lineage_epoch"]==2
+                sg=activation["grant"];si=activation["intent"]
+                assert sg["id"]!=g2["id"] and sg["node_id"]==nodes[i] and sg["generation"]==2 and si["claimed_at"] is None
+                assert sg["rate_bytes_per_second"]==65536 and sg["monthly_bytes"]==4096 and sg["connection_slots"]==1
+                claim_payload=dict(protocol_version=1,grant_id=sg["id"],allocation_id=link["successor_id"],mapping_id=link["mapping_id"],
+                    mapping_revision=1,node_id=nodes[i],node_generation=1,generation=2,relay_port=rp,nonce=secrets.token_hex(16))
+                req=urllib.request.Request(f"https://localhost:{tp}/api/v1/relay/budget-start-claim",method="POST",
+                    headers={"Authorization":"Bearer "+tokens[0],"Content-Type":"application/json"},data=json.dumps(claim_payload).encode())
+                try:
+                    with opener.open(req,timeout=4):raise AssertionError("old node claimed successor")
+                except urllib.error.HTTPError as ex:assert ex.code==401
+                args=[str(relay),"--budget-tcp-preview",str(d),"localhost",str(tp),nodes[i],"1",str(cap),
+                    link["successor_id"],link["mapping_id"],"1","2",sg["id"],str(bf),"65536","4096","1",str(rp),str(engine)]
+                def launch_successor():
+                    p=subprocess.Popen(args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True);children.append(p);return p
+                successor=launch_successor()
+                with selectors.DefaultSelector() as sel:
+                    sel.register(successor.stdout,selectors.EVENT_READ);assert sel.select(5)
+                assert successor.stdout.readline().strip()=="relay finite TCP engine started"
+                client=subprocess.Popen([str(engine),str(config)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True,env=dict(os.environ,RUST_LOG="warn"))
+                children.append(client)
+                def exchange():
+                    try:
+                        with socket.create_connection(("127.0.0.1",bf),timeout=.5) as c:
+                            body=b"failover-successor-echo";c.sendall(body)
+                            received=bytearray()
+                            while len(received)<len(body):
+                                chunk=c.recv(len(body)-len(received))
+                                if not chunk:return False
+                                received.extend(chunk)
+                            return received==body
+                    except OSError:return False
+                wait(exchange,6)
+                assert successor.poll() is None
+                fails(start_finite())
+                assert exchange()
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT generation,state FROM relay_allocations WHERE id=?",(a2["id"],)).fetchone()==(4,"cancelled")
+                    assert db.execute("SELECT count(*) FROM relay_budget_intents WHERE grant_id=?",(g2["id"],)).fetchone()==(0,)
+                    assert db.execute("SELECT execution_opt_in,claimed_at IS NOT NULL FROM relay_budget_intents WHERE grant_id=?",(sg["id"],)).fetchone()==(1,1)
+                    assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.failover_start_intent'").fetchone()==(1,)
+                out,err=successor.communicate(timeout=20)
+                assert successor.returncode==0 and out.strip().startswith("relay finite TCP stopped reason=expired bytes=")
+                fails(launch_successor())
+                for port in (rp,bf):
+                    with socket.socket() as probe:
+                        probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",port))!=0
+                report["real_failover_successor_atomic_activation_and_noise_traffic"]=True
+            finally:
+                if client is not None:stop(client)
+                if successor is not None:stop(successor)
+                target.shutdown();target.server_close();worker.join(timeout=3)
         cmd("--commercial-create-account",data={"username":"finite-dual","password":password,"plan_id":finite,"expires_at":None})
         dual_owner=admin("auth/login",{"username":"finite-dual","password":password})["access_token"];tokens.append(dual_owner)
         pairing=admin("devices/pairing-code",None,dual_owner)["pairing_code"]
         dual_device=admin("devices/enroll",{"pairing_code":pairing,"name":"dual budget fixture"},status=201)["id"]
-        with socketserver.ThreadingTCPServer(("127.0.0.1",0),Stream) as target:
+        with ReusableStreamServer(("127.0.0.1",0),Stream) as target:
             target.daemon_threads=True
             worker=threading.Thread(target=target.serve_forever,daemon=True);worker.start()
             try:
@@ -1366,4 +1465,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==31 and all(report.values())
+assert len(report)==32 and all(report.values())

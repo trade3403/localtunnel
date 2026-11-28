@@ -41,6 +41,7 @@ const ELIGIBLE:&str="m.protocol='tcp' AND m.domain_id IS NULL AND m.enabled=0 AN
 const FIELDS:&str="g.id,a.id AS allocation_id,m.id AS mapping_id,b.mapping_revision,b.node_id,b.node_generation,a.generation,b.policy_revision,b.entitlement_revision,g.device_revision,a.bind_port,b.rate_bytes_per_second,b.monthly_bytes,b.connection_slots,b.month_utc,g.issued_at,g.expires_at,unixepoch() AS server_time";
 pub fn routes(pool:SqlitePool)->Router{
     Router::new().route("/api/v1/allocations/{id}/budget-grant",post(issue))
+        .route("/api/v1/allocations/{id}/failover-start",post(failover_start))
         .route("/api/v1/relay/budget-grant",post(fetch))
         .route("/api/v1/allocations/{id}/budget-intent",post(intent))
         .route("/api/v1/relay/budget-claim",post(claim))
@@ -61,7 +62,8 @@ async fn issue(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Heade
         AND (e.expires_at IS NULL OR e.expires_at>=unixepoch()+15)
         AND b.month_utc=strftime('%Y-%m',unixepoch()+15,'unixepoch')
         AND EXISTS(SELECT 1 FROM admin_sessions s WHERE s.user_id=a.owner_id AND s.token_digest=? AND s.expires_at>unixepoch())
-        AND NOT EXISTS(SELECT 1 FROM relay_budget_grants g WHERE g.allocation_id=a.id)");
+        AND NOT EXISTS(SELECT 1 FROM relay_budget_grants g WHERE g.allocation_id=a.id)
+        AND NOT EXISTS(SELECT 1 FROM relay_failover_links l WHERE l.successor_id=a.id)");
     let changed=sqlx::query(&query).bind(&gid).bind(&id).bind(&owner).bind(c.expected_generation).bind(c.expected_mapping_revision).bind(c.expected_entitlement_revision).bind(token)
         .execute(&mut *tx).await.map_err(|_|INTERNAL)?;
     if changed.rows_affected()!=1{return Err(CONFLICT)}
@@ -163,4 +165,58 @@ async fn claim_for(pool:SqlitePool,headers:HeaderMap,c:Claim,guarded:bool,execut
         .bind(if execution{"budget.start_claim"}else if guarded{"budget.run_claim_preview"}else{"budget.claimed"}).bind(&c.grant_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
     tx.commit().await.map_err(|_|INTERNAL)?;
     Ok(auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":c.nonce,"scope":if execution{"budget_guarded_tcp_start"}else if guarded{"budget_guarded_claim_preview_only"}else{"budget_claim_preview_only"},"executable":execution,"grant":grant,"intent":row}))))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailoverStart{source_id:String,source_grant_id:String,lineage_epoch:i64,expected_generation:i64,
+    expected_mapping_revision:i64,expected_entitlement_revision:i64,relay_port:i64}
+/// Separate explicit activation of an already reserved successor. Both the
+/// grant and guarded intent commit together or neither does. Existing node
+/// claim semantics and local durable consumption remain unchanged.
+async fn failover_start(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap,Json(c):Json<FailoverStart>)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    if !hex_id(&id)||!hex_id(&c.source_id)||!hex_id(&c.source_grant_id)||c.lineage_epoch<2||
+        c.expected_generation!=1||c.expected_mapping_revision<1||c.expected_entitlement_revision<1||
+        !(30000..=59999).contains(&c.relay_port){return Err(BAD)}
+    let gid=hex::encode(auth::random::<16>()?);
+    let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
+    let query=format!("INSERT INTO relay_budget_grants(id,allocation_id,device_revision,issued_at,expires_at)
+        SELECT ?,a.id,d.revision,unixepoch(),unixepoch()+15 {CURRENT}
+        JOIN relay_failover_links l ON l.successor_id=a.id
+        JOIN relay_allocations old ON old.id=l.source_id AND old.owner_id=a.owner_id
+        JOIN relay_budget_retirements retirement ON retirement.allocation_id=old.id AND retirement.grant_id=l.source_grant_id
+        WHERE {ELIGIBLE} AND a.id=? AND a.owner_id=? AND a.generation=? AND b.mapping_revision=? AND b.entitlement_revision=?
+        AND l.source_id=? AND l.source_grant_id=? AND l.lineage_epoch=? AND l.entitlement_revision=b.entitlement_revision
+        AND old.state='cancelled' AND old.generation=4 AND old.node_id<>a.node_id
+        AND (e.expires_at IS NULL OR e.expires_at>=unixepoch()+15)
+        AND b.month_utc=strftime('%Y-%m',unixepoch()+15,'unixepoch')
+        AND EXISTS(SELECT 1 FROM admin_sessions s WHERE s.user_id=a.owner_id AND s.token_digest=? AND s.expires_at>unixepoch())
+        AND NOT EXISTS(SELECT 1 FROM relay_budget_grants g WHERE g.allocation_id=a.id)
+        AND NOT EXISTS(SELECT 1 FROM relay_tcp_intents x WHERE x.node_id=a.node_id AND x.relay_port=?)
+        AND NOT EXISTS(SELECT 1 FROM relay_udp_intents x WHERE x.node_id=a.node_id AND x.relay_port=?)
+        AND NOT EXISTS(SELECT 1 FROM relay_http_intents x WHERE x.node_id=a.node_id AND x.relay_port=?)
+        AND NOT EXISTS(SELECT 1 FROM relay_https_intents x WHERE x.node_id=a.node_id AND x.relay_port=?)
+        AND NOT EXISTS(SELECT 1 FROM relay_budget_intents x WHERE x.node_id=a.node_id AND x.relay_port=?)");
+    let changed=sqlx::query(&query).bind(&gid).bind(&id).bind(&owner).bind(c.expected_generation)
+        .bind(c.expected_mapping_revision).bind(c.expected_entitlement_revision)
+        .bind(&c.source_id).bind(&c.source_grant_id).bind(c.lineage_epoch).bind(&token)
+        .bind(c.relay_port).bind(c.relay_port).bind(c.relay_port).bind(c.relay_port).bind(c.relay_port)
+        .execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    if changed.rows_affected()!=1{return Err(CONFLICT)}
+    let changed=sqlx::query("UPDATE relay_allocations SET generation=2 WHERE id=? AND generation=1")
+        .bind(&id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    if changed.rows_affected()!=1{return Err(CONFLICT)}
+    let query=format!("SELECT {FIELDS} {CURRENT} JOIN relay_budget_grants g ON g.allocation_id=a.id WHERE g.id=?");
+    let grant=sqlx::query_as::<_,Grant>(&query).bind(&gid).fetch_one(&mut *tx).await.map_err(|_|INTERNAL)?;
+    let row=sqlx::query_as::<_,IntentRecord>("INSERT INTO relay_budget_intents(grant_id,node_id,relay_port,bind_port,created_at,intent_mode,execution_opt_in)
+        VALUES(?,?,?,?,unixepoch(),'guarded_tcp',1) RETURNING grant_id,node_id,relay_port,bind_port,created_at,claimed_at")
+        .bind(&gid).bind(&grant.node_id).bind(c.relay_port).bind(grant.bind_port).fetch_one(&mut *tx).await.map_err(|_|INTERNAL)?;
+    sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
+        VALUES (?,'allocation.failover_start_intent',?,?,?,'pending')")
+        .bind(&owner).bind(&grant.mapping_id).bind(c.lineage_epoch).bind(&gid).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    Ok(auth::uncached((StatusCode::CREATED,Json(serde_json::json!({"scope":"failover_guarded_start_intent",
+      "executable":false,"lineage_epoch":c.lineage_epoch,"grant":grant,"intent":row})))))
 }
