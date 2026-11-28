@@ -1,6 +1,9 @@
 //! Independent relay control-plane client: loopback preview or verified HTTPS.
 //! No database access; bounded one-shot loopback data-plane previews.
 #[cfg(target_os="linux")]
+#[path="../relay_budget_guard.rs"]
+mod relay_budget_guard;
+#[cfg(target_os="linux")]
 mod linux {
     use serde::Deserialize;
     use rand_core::{OsRng,RngCore};
