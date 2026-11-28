@@ -1062,6 +1062,11 @@ try:
                     proc=subprocess.Popen(cleanup_args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
                     children.append(proc);return proc
                 fails(report_cleanup())
+                confirmation="offline_engine_and_guard_verified_stopped"
+                def reclaim_cmd(grant_id=g2["id"],confirm=confirmation):
+                    return subprocess.run([str(exe),"--recover-relay-budget",str(center),a2["id"],grant_id,confirm],
+                        text=True,capture_output=True,timeout=15)
+                assert reclaim_cmd().returncode!=0
                 wait(lambda:time.time()>=g2["expires_at"]+2,20)
                 fence=admin(route+"/fence",dict(expected_generation=2,grant_id=g2["id"]),finite_owner,201)
                 assert fence["fence"]["new_generation"]==3
@@ -1105,6 +1110,28 @@ try:
                     assert row["report"]["grant_id"]==g2["id"] and row["resources_released"] is False and row["executable"] is False
                 assert submit_report(tokens[0],payload,200)["report"]==row["report"]
                 report["real_tls_fenced_cleanup_observation_idempotent_no_release"]=True
+                assert reclaim_cmd(confirm="unverified").returncode!=0
+                assert reclaim_cmd(grant_id=secrets.token_hex(16)).returncode!=0
+                # Node report is not an automatic refund.
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT count(*) FROM relay_budget_reclaims").fetchone()==(0,)
+                recovered=reclaim_cmd()
+                assert recovered.returncode==0
+                again=reclaim_cmd()
+                assert again.returncode==0 and json.loads(again.stdout)==json.loads(recovered.stdout)
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT count(*) FROM relay_budget_reclaims").fetchone()==(1,)
+                    assert db.execute("SELECT count(*) FROM management_audit WHERE event='budget.capacity_reclaimed'").fetchone()==(1,)
+                    assert db.execute("SELECT count(*) FROM relay_budget_active WHERE allocation_id=?",(a2["id"],)).fetchone()==(0,)
+                    assert db.execute("SELECT monthly_bytes FROM relay_budget_previews WHERE allocation_id=?",(a2["id"],)).fetchone()==(4096,)
+                    assert db.execute("SELECT generation,state FROM relay_allocations WHERE id=?",(a2["id"],)).fetchone()==(3,"reserved")
+                    for sql in ("DELETE FROM relay_budget_reclaims","UPDATE relay_budget_reclaims SET reclaimed_at=reclaimed_at+1"):
+                        try:db.execute(sql);raise AssertionError("mutable reclaim")
+                        except sqlite3.IntegrityError:db.rollback()
+                req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/"+route+"/budget-reclaim",headers={"Authorization":"Bearer "+finite_owner})
+                with urllib.request.urlopen(req,timeout=4) as response:
+                    row=json.load(response)
+                    assert row["ports_released"] is False and row["monthly_refunded"] is False and row["reclaim"]==json.loads(recovered.stdout)
             finally:
                 target.shutdown();target.server_close();worker.join(timeout=3)
         # D: two independently supervised real Noise tunnels from one finite
@@ -1114,6 +1141,21 @@ try:
         cmd("--set-node-policy",nodes[2],2,9,"east","active")
         for i,cap in ((0,8),(2,7)):
             control(tokens[i],dict(protocol_version=1,node_id=nodes[i],generation=1,capacity=cap,nonce=secrets.token_hex(16)),200)
+        # The reclaimed rate/slot capacity can be reserved again on another
+        # node, but the previous monthly slice must remain fully charged.
+        new_a=admin("allocations",{"request_key":secrets.token_hex(16),"device_id":finite_device,"node_id":nodes[2],
+            "protocol":"tcp","local_port":8080,"bind_port":offline_port(20001,29999)},finite_owner,201)
+        try:
+            admin("allocations/"+new_a["id"]+"/budget-preview",dict(spec,rate_bytes_per_second=65536,monthly_bytes=45905,connection_slots=2),finite_owner,201)
+            raise AssertionError("reclaimed monthly slice refunded")
+        except urllib.error.HTTPError as ex:assert ex.code==409
+        admin("allocations/"+new_a["id"]+"/budget-preview",dict(spec,rate_bytes_per_second=65536,monthly_bytes=45904,connection_slots=2),finite_owner,201)
+        with sqlite3.connect(center/"control.sqlite3") as db:
+            assert db.execute("SELECT sum(rate_bytes_per_second),sum(connection_slots) FROM relay_budget_active WHERE allocation_id IN (?,?,?)",
+                (a["id"],a2["id"],new_a["id"])).fetchone()==(131072,4)
+            assert db.execute("SELECT sum(monthly_bytes) FROM relay_budget_previews WHERE allocation_id IN (?,?,?)",
+                (a["id"],a2["id"],new_a["id"])).fetchone()==(100000,)
+        report["real_operator_reclaims_rate_slots_without_monthly_refund"]=True
         cmd("--commercial-create-account",data={"username":"finite-dual","password":password,"plan_id":finite,"expires_at":None})
         dual_owner=admin("auth/login",{"username":"finite-dual","password":password})["access_token"];tokens.append(dual_owner)
         pairing=admin("devices/pairing-code",None,dual_owner)["pairing_code"]
@@ -1239,4 +1281,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==28 and all(report.values())
+assert len(report)==29 and all(report.values())

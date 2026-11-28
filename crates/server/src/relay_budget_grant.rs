@@ -35,8 +35,8 @@ const ELIGIBLE:&str="m.protocol='tcp' AND m.domain_id IS NULL AND m.enabled=0 AN
  AND NOT EXISTS(SELECT 1 FROM bandwidth_reservations x WHERE x.tenant_id=t.id)
  AND NOT EXISTS(SELECT 1 FROM relay_grants g JOIN relay_allocations z ON z.id=g.allocation_id WHERE z.owner_id=a.owner_id)
  AND p.max_bandwidth_bps IS NOT NULL AND p.max_monthly_bytes IS NOT NULL AND p.max_concurrent_connections IS NOT NULL
- AND (SELECT coalesce(sum(rate_bytes_per_second),0) FROM relay_budget_previews x WHERE x.tenant_id=t.id)<=p.max_bandwidth_bps/8
- AND (SELECT coalesce(sum(connection_slots),0) FROM relay_budget_previews x WHERE x.tenant_id=t.id)<=p.max_concurrent_connections
+ AND (SELECT coalesce(sum(rate_bytes_per_second),0) FROM relay_budget_active x WHERE x.tenant_id=t.id)<=p.max_bandwidth_bps/8
+ AND (SELECT coalesce(sum(connection_slots),0) FROM relay_budget_active x WHERE x.tenant_id=t.id)<=p.max_concurrent_connections
  AND (SELECT coalesce(sum(monthly_bytes),0) FROM relay_budget_previews x WHERE x.tenant_id=t.id AND x.month_utc=b.month_utc)<=p.max_monthly_bytes-coalesce((SELECT charged_bytes FROM tenant_monthly_usage q WHERE q.tenant_id=t.id AND q.month_utc=b.month_utc),0)";
 const FIELDS:&str="g.id,a.id AS allocation_id,m.id AS mapping_id,b.mapping_revision,b.node_id,b.node_generation,a.generation,b.policy_revision,b.entitlement_revision,g.device_revision,a.bind_port,b.rate_bytes_per_second,b.monthly_bytes,b.connection_slots,b.month_utc,g.issued_at,g.expires_at,unixepoch() AS server_time";
 pub fn routes(pool:SqlitePool)->Router{

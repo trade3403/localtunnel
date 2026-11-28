@@ -19,6 +19,7 @@ pub fn routes(pool:SqlitePool)->Router{
     Router::new().route("/api/v1/allocations/{id}/fence",post(fence).get(detail))
                 .route("/api/v1/relay/budget-cleanup-report",post(cleanup))
         .route("/api/v1/allocations/{id}/cleanup-report",axum::routing::get(cleanup_detail))
+        .route("/api/v1/allocations/{id}/budget-reclaim",axum::routing::get(reclaim_detail))
         .layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 const SESSION:&str="EXISTS(SELECT 1 FROM admin_sessions s JOIN users u ON u.id=s.user_id
@@ -123,4 +124,42 @@ async fn cleanup_detail(State(pool):State<SqlitePool>,Path(id):Path<String>,head
       WHERE a.id=? AND a.owner_id=? AND {SESSION}");
     let row=sqlx::query_as::<_,CleanupReport>(&query).bind(id).bind(owner).bind(token).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
     Ok(cleanup_reply(row,None))
+}
+
+#[derive(Serialize,sqlx::FromRow)]
+struct Reclaim{allocation_id:String,grant_id:String,fenced_generation:i64,confirmation:String,reclaimed_at:i64}
+/// Only a trusted local center operator may attest independent remote
+/// shutdown verification. The node observation alone is not sufficient.
+pub async fn reclaim_budget(pool:&SqlitePool,id:&str,grant:&str,confirmation:&str)->Result<String,&'static str>{
+    if !hex_id(id)||!hex_id(grant)||confirmation!="offline_engine_and_guard_verified_stopped"{return Err("invalid budget recovery confirmation")}
+    let mut tx=pool.begin().await.map_err(|_|"budget recovery unavailable")?;
+    let row=sqlx::query_as::<_,Reclaim>("INSERT INTO relay_budget_reclaims(allocation_id,grant_id,fenced_generation,confirmation,reclaimed_at)
+      SELECT c.allocation_id,c.grant_id,c.fenced_generation,?,unixepoch()
+      FROM relay_cleanup_reports c JOIN relay_allocation_fences f ON f.allocation_id=c.allocation_id
+      JOIN relay_allocations a ON a.id=f.allocation_id
+      WHERE c.allocation_id=? AND c.grant_id=? AND f.grant_id=c.grant_id AND a.generation=f.new_generation AND a.state='reserved'
+      AND unixepoch()>=c.reported_at AND unixepoch()>=f.expires_at+2
+      AND NOT EXISTS(SELECT 1 FROM relay_budget_reclaims x WHERE x.allocation_id=c.allocation_id) RETURNING *")
+      .bind(confirmation).bind(id).bind(grant).fetch_optional(&mut *tx).await.map_err(|_|"budget recovery refused")?;
+    let row=if let Some(row)=row{
+        sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
+          SELECT owner_id,'budget.capacity_reclaimed',id,generation,?,'monthly_retained' FROM relay_allocations WHERE id=?")
+          .bind(grant).bind(id).execute(&mut *tx).await.map_err(|_|"budget recovery refused")?;
+        row
+    }else{
+        sqlx::query_as::<_,Reclaim>("SELECT * FROM relay_budget_reclaims WHERE allocation_id=? AND grant_id=? AND confirmation=?")
+          .bind(id).bind(grant).bind(confirmation).fetch_optional(&mut *tx).await.map_err(|_|"budget recovery refused")?.ok_or("budget recovery refused")?
+    };
+    tx.commit().await.map_err(|_|"budget recovery outcome unknown")?;
+    serde_json::to_string(&row).map_err(|_|"budget recovery outcome unknown")
+}
+async fn reclaim_detail(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    if !hex_id(&id){return Err(MISSING)}
+    let query=format!("SELECT x.* FROM relay_budget_reclaims x JOIN relay_allocations a ON a.id=x.allocation_id
+      WHERE a.id=? AND a.owner_id=? AND {SESSION}");
+    let row=sqlx::query_as::<_,Reclaim>(&query).bind(id).bind(owner).bind(token).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
+    Ok(auth::uncached(Json(serde_json::json!({"scope":"rate_and_slots_reclaimed_monthly_retained","executable":false,
+      "ports_released":false,"monthly_refunded":false,"reclaim":row}))))
 }
