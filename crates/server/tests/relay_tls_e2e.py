@@ -1078,7 +1078,13 @@ try:
                 submit_report(tokens[1],payload,401)
                 submit_report(tokens[0],dict(payload,bind_port=bf+1 if bf<29999 else bf-1),401)
                 with socket.socket() as occupied:
+                    # Match the Linux Rust/Tokio listener's SO_REUSEADDR:
+                    # prior accepted connections may still be in TIME_WAIT.
+                    # Never set SO_REUSEPORT; an actual listening socket
+                    # must still prevent the node's exclusive bind probe.
+                    occupied.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
                     occupied.bind(("127.0.0.1",br));occupied.listen()
+                    assert occupied.getsockopt(socket.SOL_SOCKET,socket.SO_ACCEPTCONN)==1
                     fails(report_cleanup())
                 with sqlite3.connect(center/"control.sqlite3") as db:
                     assert db.execute("SELECT count(*) FROM relay_cleanup_reports").fetchone()==(0,)
