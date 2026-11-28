@@ -21,6 +21,7 @@ pub fn routes(pool:SqlitePool)->Router{
         .route("/api/v1/allocations/{id}/cleanup-report",axum::routing::get(cleanup_detail))
         .route("/api/v1/allocations/{id}/budget-reclaim",axum::routing::get(reclaim_detail))
         .route("/api/v1/allocations/{id}/budget-retirement",axum::routing::get(retirement_detail))
+        .route("/api/v1/allocations/{id}/failure-observation",axum::routing::get(failure_detail))
         .layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 const SESSION:&str="EXISTS(SELECT 1 FROM admin_sessions s JOIN users u ON u.id=s.user_id
@@ -197,4 +198,48 @@ async fn retirement_detail(State(pool):State<SqlitePool>,Path(id):Path<String>,h
     let row=sqlx::query_as::<_,Retirement>(&query).bind(id).bind(owner).bind(token).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
     Ok(auth::uncached(Json(serde_json::json!({"scope":"terminal_finite_allocation_retired","executable":false,
       "ports_released":true,"monthly_refunded":false,"retirement":row}))))
+}
+
+#[derive(Serialize,sqlx::FromRow)]
+struct FailureObservation{allocation_id:String,grant_id:String,node_id:String,node_generation:i64,reason:String,observed_at:i64}
+#[derive(Serialize)]
+pub struct ScanResult{pub observed:usize,pub fenced:usize}
+/// Bounded central scan. The first statement writes under the SQLite writer
+/// lock. A recovered heartbeat disqualifies a candidate at the next scan;
+/// a historical observation alone cannot fence a healthy allocation.
+pub async fn scan_failures(pool:&SqlitePool)->Result<ScanResult,&'static str>{
+    let mut tx=pool.begin().await.map_err(|_|"failure scan unavailable")?;
+    let observations=sqlx::query_as::<_,FailureObservation>("INSERT INTO relay_failure_observations(allocation_id,grant_id,node_id,node_generation,reason,observed_at)
+      SELECT f.allocation_id,f.grant_id,f.node_id,f.node_generation,f.reason,unixepoch() FROM relay_failed_finite_claims f
+      WHERE NOT EXISTS(SELECT 1 FROM relay_failure_observations o WHERE o.allocation_id=f.allocation_id)
+      ORDER BY f.allocation_id LIMIT 32 RETURNING *")
+      .fetch_all(&mut *tx).await.map_err(|_|"failure scan unavailable")?;
+    for row in &observations{
+        sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
+          SELECT owner_id,'allocation.failure_observed',id,generation,?,? FROM relay_allocations WHERE id=?")
+          .bind(&row.grant_id).bind(&row.reason).bind(&row.allocation_id).execute(&mut *tx).await.map_err(|_|"failure scan unavailable")?;
+    }
+    let fences=sqlx::query_as::<_,Fence>("INSERT INTO relay_allocation_fences(allocation_id,grant_id,grant_kind,old_generation,new_generation,node_id,node_generation,expires_at,fenced_at)
+      SELECT f.allocation_id,f.grant_id,'finite',2,3,f.node_id,f.node_generation,f.expires_at,unixepoch()
+      FROM relay_failed_finite_claims f JOIN relay_failure_observations o ON o.allocation_id=f.allocation_id AND o.grant_id=f.grant_id
+      WHERE f.expires_at+2<=unixepoch()
+      AND NOT EXISTS(SELECT 1 FROM relay_allocation_fences x WHERE x.allocation_id=f.allocation_id)
+      ORDER BY f.allocation_id LIMIT 32 RETURNING *")
+      .fetch_all(&mut *tx).await.map_err(|_|"failure scan unavailable")?;
+    for row in &fences{
+        sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
+          SELECT owner_id,'allocation.expiry_fenced',id,generation,?,'retained' FROM relay_allocations WHERE id=?")
+          .bind(&row.grant_id).bind(&row.allocation_id).execute(&mut *tx).await.map_err(|_|"failure scan unavailable")?;
+    }
+    tx.commit().await.map_err(|_|"failure scan outcome unknown")?;
+    Ok(ScanResult{observed:observations.len(),fenced:fences.len()})
+}
+async fn failure_detail(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    if !hex_id(&id){return Err(MISSING)}
+    let query=format!("SELECT o.* FROM relay_failure_observations o JOIN relay_allocations a ON a.id=o.allocation_id
+      WHERE a.id=? AND a.owner_id=? AND {SESSION}");
+    let row=sqlx::query_as::<_,FailureObservation>(&query).bind(id).bind(owner).bind(token).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
+    Ok(auth::uncached(Json(serde_json::json!({"scope":"historical_failure_observation_only","executable":false,"resources_released":false,"observation":row}))))
 }

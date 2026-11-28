@@ -1421,6 +1421,16 @@ try:
                     assert first["proc"].returncode==0 and out.strip()=="relay finite TCP stopped reason=exhausted bytes=4096"
                     assert second["proc"].poll() is None
                     echo(second["conn"],b"survives-other-node")
+                    # Stop only the second node's control process, leaving
+                    # its already authorized data-plane process independent.
+                    stop(live[2])
+                    scan=json.loads(cmd("--scan-relay-failures"))
+                    assert isinstance(scan["observed"],int) and isinstance(scan["fenced"],int)
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        assert db.execute("SELECT generation FROM relay_allocations WHERE id=?",(second["a"]["id"],)).fetchone()==(2,)
+                        assert db.execute("SELECT count(*) FROM relay_allocation_fences WHERE allocation_id=?",(second["a"]["id"],)).fetchone()==(0,)
+                    watcher=subprocess.Popen([str(exe),"--watch-relay-failures",str(center)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                    children.append(watcher)
                     for n in (first["rp"],first["bp"]):
                         with socket.socket() as probe:
                             probe.settimeout(.5);assert probe.connect_ex(("127.0.0.1",n))!=0
@@ -1446,6 +1456,40 @@ try:
                             tuple(item["a"]["id"] for item in items)).fetchone()==(100000,4)
                         assert db.execute("PRAGMA foreign_key_check").fetchall()==[]
                     report["real_dual_node_guarded_tcp_budget_isolation_and_expiry"]=True
+                    # No database timestamp mutation: wait for actual stale
+                    # heartbeat and original grant expiry. Watcher fences it.
+                    def fenced_by_watcher():
+                        assert watcher.poll() is None
+                        with sqlite3.connect(center/"control.sqlite3") as db:
+                            return db.execute("SELECT generation FROM relay_allocations WHERE id=?",(second["a"]["id"],)).fetchone()==(3,)
+                    wait(fenced_by_watcher,20)
+                    with sqlite3.connect(center/"control.sqlite3") as db:
+                        sid=second["a"]["id"];fid=first["a"]["id"]
+                        assert db.execute("SELECT reason FROM relay_failure_observations WHERE allocation_id=?",(sid,)).fetchone()==("heartbeat_stale",)
+                        assert db.execute("SELECT fenced_at>=expires_at+2 FROM relay_allocation_fences WHERE allocation_id=?",(sid,)).fetchone()==(1,)
+                        assert db.execute("SELECT generation,state FROM relay_allocations WHERE id=?",(fid,)).fetchone()==(2,"reserved")
+                        assert db.execute("SELECT count(*) FROM relay_budget_reclaims WHERE allocation_id=?",(sid,)).fetchone()==(0,)
+                        assert db.execute("SELECT count(*) FROM relay_failover_links WHERE source_id=?",(sid,)).fetchone()==(0,)
+                        assert db.execute("SELECT count(*) FROM relay_budget_active WHERE allocation_id=?",(sid,)).fetchone()==(1,)
+                        assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.failure_observed' AND resource_id=?",(sid,)).fetchone()==(1,)
+                        assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.expiry_fenced' AND resource_id=?",(sid,)).fetchone()==(1,)
+                        for sql in ("DELETE FROM relay_failure_observations","UPDATE relay_failure_observations SET observed_at=observed_at+1"):
+                            try:db.execute(sql);raise AssertionError("mutable failure observation")
+                            except sqlite3.IntegrityError:db.rollback()
+                    stop(watcher)
+                    cmd("--scan-relay-failures")
+                    req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/allocations/{sid}/failure-observation",
+                        headers={"Authorization":"Bearer "+dual_owner})
+                    with urllib.request.urlopen(req,timeout=4) as response:
+                        row=json.load(response)
+                        assert row["observation"]["reason"]=="heartbeat_stale" and row["resources_released"] is False
+                    req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/allocations/{sid}/failure-observation",
+                        headers={"Authorization":"Bearer "+finite_owner})
+                    try:
+                        with urllib.request.urlopen(req,timeout=4):raise AssertionError("cross-owner failure observation")
+                    except urllib.error.HTTPError as ex:assert ex.code==404
+                    report["real_automatic_stale_node_detection_expiry_fence_without_release"]=True
+                    live[2]=start(dirs[2],2)
                 finally:
                     for item in items:
                         if item.get("conn") is not None:item["conn"].close()
@@ -1465,4 +1509,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==32 and all(report.values())
+assert len(report)==33 and all(report.values())
