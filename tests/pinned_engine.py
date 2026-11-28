@@ -6,6 +6,8 @@ Never execute or write an engine until archive and extracted bytes both match.
 import hashlib
 import io
 import json
+import os
+import tempfile
 from pathlib import Path, PurePosixPath
 import platform
 import stat
@@ -61,7 +63,7 @@ def verified_bytes(archive,target,pin):
             raise RuntimeError("wrong native Mach-O engine architecture")
     return name,binary,archive_digest,binary_digest
 
-def acquire(directory, archive_path=None):
+def acquire(directory, archive_path=None, *, cache_dir=None):
     lock=json.loads(LOCK.read_text(encoding="utf-8"))
     if lock["version"]!=VERSION:
         raise RuntimeError("unexpected engine lock version")
@@ -73,13 +75,39 @@ def acquire(directory, archive_path=None):
         return build(directory,VERSION,lock["source_targets"][target])
     pin=lock["targets"][target]
     url=f"https://github.com/rathole-org/rathole/releases/download/{VERSION}/rathole-{target}.zip"
-    if archive_path is None:
+    # Job-local cache only; never trust cached content or use a different pin.
+    # An explicit offline archive always takes precedence.
+    cache=None
+    if archive_path is None and cache_dir is not None:
+        cache_dir=Path(cache_dir)
+        cache_dir.mkdir(mode=0o700,parents=True,exist_ok=True)
+        cache=cache_dir/f"{VERSION}-{target}-{pin['archive_sha256']}.zip"
+    source=Path(archive_path) if archive_path is not None else cache
+    reused=False
+    if source is not None:
+        try:
+            with source.open("rb") as response:
+                archive=response.read(20*1024*1024+1)
+            reused=True
+        except FileNotFoundError:
+            if archive_path is not None:
+                raise
+    if not reused:
         with urllib.request.urlopen(url,timeout=90) as response:
             archive=response.read(20*1024*1024+1)
-    else:
-        with Path(archive_path).open("rb") as response:
-            archive=response.read(20*1024*1024+1)
+    # Verify both digests, sizes and architecture on every use, including hits.
+    # A damaged cache fails closed rather than silently accepting other bytes.
     name,binary,archive_digest,binary_digest=verified_bytes(archive,target,pin)
+    if cache is not None and not reused:
+        pending=None
+        try:
+            with tempfile.NamedTemporaryFile(dir=cache_dir,prefix=".archive-",delete=False) as stream:
+                pending=Path(stream.name)
+                stream.write(archive)
+            os.replace(pending,cache)
+        finally:
+            if pending is not None:
+                pending.unlink(missing_ok=True)
     path=directory/name
     with path.open("xb") as stream:
         stream.write(binary)

@@ -26,7 +26,12 @@ ENGINE_VERSION = "v0.5.0"
 
 def engine(directory):
     from pinned_engine import acquire
-    binary, report = acquire(directory)
+    # Management fixtures run in separate processes in the same hosted job.
+    # Reuse only its ephemeral archive, not a cross-run Actions cache.
+    cache_dir = None
+    if os.environ.get("GITHUB_ACTIONS") == "true" and os.environ.get("RUNNER_TEMP") and sys.platform == "linux":
+        cache_dir = Path(os.environ["RUNNER_TEMP"]) / "localtunnel-e2e-pinned-archives"
+    binary, report = acquire(directory, cache_dir=cache_dir)
     (RESULTS / "engine.json").write_text(json.dumps(report, indent=2))
     return binary
 
