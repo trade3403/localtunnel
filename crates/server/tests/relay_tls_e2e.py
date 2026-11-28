@@ -953,12 +953,41 @@ try:
             child=subprocess.Popen([str(relay),"--verify-budget",str(dirs[0]),"localhost",str(tp),nodes[0],"1","5",
                 a["id"],a["mapping_id"],"1","2",g["id"],str(bp),rate,"50000","2"],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             children.append(child);return child
+        rp=offline_port(30000,59999)
+        admin("allocations/"+a["id"]+"/budget-intent",dict(grant_id=g["id"],expected_generation=2,relay_port=rp),finite_owner,201)
+        def claim_budget(directory=dirs[0],port=rp):
+            child=subprocess.Popen([str(relay),"--claim-budget",str(directory),"localhost",str(tp),nodes[0],"1","5",
+                a["id"],a["mapping_id"],"1","2",g["id"],str(bp),"65536","50000","2",str(port)],
+                stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            children.append(child);return child
+        marker=dirs[0]/("budget-consumed-"+g["id"])
         bad=verify_budget("65537");fails(bad)
         assert "relay budget preview verified" not in bad.stdout.read()
         good=verify_budget()
         with selectors.DefaultSelector() as sel:
             sel.register(good.stdout,selectors.EVENT_READ);assert sel.select(5)
         assert good.stdout.readline().strip()=="relay budget preview verified"
+        # A foreign or partial marker must fail closed without consuming the
+        # center claim. Only this test removes its own synthetic symlink.
+        marker.symlink_to(dirs[0]/"relay.token")
+        fails(claim_budget())
+        assert marker.is_symlink()
+        marker.unlink()
+        with sqlite3.connect(center/"control.sqlite3") as db:
+            assert db.execute("SELECT claimed_at FROM relay_budget_intents WHERE grant_id=?",(g["id"],)).fetchone()==(None,)
+        claim=claim_budget()
+        out_claim,err_claim=claim.communicate(timeout=8)
+        assert claim.returncode==0 and out_claim.strip()=="relay budget claim consumed"
+        assert marker.is_file() and not marker.is_symlink() and marker.stat().st_mode&0o777==0o600
+        assert marker.read_bytes()==b"budget claim consumed; non-executable\n"
+        fails(claim_budget())
+        with sqlite3.connect(center/"control.sqlite3") as db:
+            assert db.execute("SELECT claimed_at IS NOT NULL FROM relay_budget_intents WHERE grant_id=?",(g["id"],)).fetchone()==(1,)
+        for port in (rp,bp):
+            with socket.socket() as check:
+                check.settimeout(.5);assert check.connect_ex(("127.0.0.1",port))!=0
+        assert not any(t in out_claim+err_claim for t in tokens)
+        report["real_tls_finite_budget_one_shot_durable_node_consumption_without_listener"]=True
         with socket.socket() as check:
             check.settimeout(.5);assert check.connect_ex(("127.0.0.1",bp))!=0
         out,err=good.communicate(timeout=20)
@@ -966,6 +995,8 @@ try:
         assert not any(t in out+err for t in tokens)
         wait(lambda:time.time()>=g["expires_at"],5)
         fails(verify_budget())
+        fails(claim_budget())
+        assert marker.is_file()
         report["real_tls_finite_budget_node_verification_and_expiry_without_listener"]=True
         dns.shutdown();dns_thread.join(timeout=3)
         cmd("--relay-revoke",nodes[1],1)
@@ -979,4 +1010,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==24 and all(report.values())
+assert len(report)==25 and all(report.values())

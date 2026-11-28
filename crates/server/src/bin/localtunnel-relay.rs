@@ -467,37 +467,91 @@ mod linux {
 
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct BudgetResponse{protocol_version:i64,nonce:String,scope:String,executable:bool,grant:BudgetGrant}
+    struct BudgetResponse{protocol_version:i64,nonce:String,scope:String,executable:bool,grant:BudgetGrant,intent:Option<BudgetIntent>}
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BudgetIntent{grant_id:String,node_id:String,relay_port:u16,bind_port:u16,created_at:i64,claimed_at:Option<i64>}
+    // The trusted operator owns the 0700 directory. Never replace, unlink,
+    // or reuse an existing marker, including a symlink or partial file.
+    fn unused_budget_marker(dir:&Path,id:&str)->Result<PathBuf>{
+        if !hex_id(id){return Err(Failure::Protocol)}
+        let path=dir.join(format!("budget-consumed-{id}"));
+        match fs::symlink_metadata(&path){
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>Ok(path),
+            Ok(_)=>Err(Failure::Denied),
+            Err(_)=>Err(Failure::Protocol),
+        }
+    }
+    fn consume_budget_marker(dir:&Path,id:&str)->Result<()>{
+        let path=unused_budget_marker(dir,id)?;
+        let mut file=OpenOptions::new().write(true).create_new(true).mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open(path).map_err(|_|Failure::Denied)?;
+        let metadata=file.metadata().map_err(|_|Failure::Protocol)?;
+        if !metadata.is_file()||metadata.nlink()!=1||metadata.uid()!=unsafe{libc::geteuid()}||
+            metadata.permissions().mode()&0o777!=0o600{return Err(Failure::Protocol)}
+        file.write_all(b"budget claim consumed; non-executable\n").and_then(|_|file.sync_all()).map_err(|_|Failure::Protocol)?;
+        let directory=OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY|libc::O_NOFOLLOW|libc::O_CLOEXEC)
+            .open(dir).map_err(|_|Failure::Protocol)?;
+        directory.sync_all().map_err(|_|Failure::Protocol)?;
+        Ok(())
+    }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct BudgetGrant{id:String,allocation_id:String,mapping_id:String,mapping_revision:i64,node_id:String,node_generation:i64,
         generation:i64,policy_revision:i64,entitlement_revision:i64,device_revision:i64,bind_port:u16,
         rate_bytes_per_second:u64,monthly_bytes:u64,connection_slots:u32,month_utc:String,issued_at:i64,expires_at:i64,server_time:i64}
-    fn verify_budget(endpoint:&Endpoint,token:&str,node:&str,generation:i64,capacity:i64,expected:&Expected<'_>,bind:u16,rate:u64,monthly:u64,slots:u32)->Result<()>{
+    fn verify_budget(endpoint:&Endpoint,token:&str,node:&str,generation:i64,capacity:i64,expected:&Expected<'_>,bind:u16,rate:u64,monthly:u64,slots:u32,relay_port:Option<u16>)->Result<()>{
         if !matches!(endpoint,Endpoint::Tls{..})||!(20000..=29999).contains(&bind)||!(65536..=125000000).contains(&rate)||
             !(1..=9000000000000000).contains(&monthly)||!(1..=65536).contains(&slots){return Err(Failure::Protocol)}
+        let dir=match endpoint{Endpoint::Tls{dir,..}=>dir,_=>return Err(Failure::Protocol)};
+        if let Some(port)=relay_port{
+            if !(30000..=59999).contains(&port){return Err(Failure::Protocol)}
+            unused_budget_marker(dir,expected.id)?;
+        }
         let policy=synchronize(endpoint,token,node,generation,capacity,None)?;
         if policy.policy_mode!="active"||policy.approved_capacity<1||capacity<1{return Err(Failure::Denied)}
         let mut bytes=[0u8;16];OsRng.try_fill_bytes(&mut bytes).map_err(|_|Failure::Protocol)?;
         let nonce=hex::encode(bytes);
-        let payload=serde_json::json!({"protocol_version":1,"grant_id":expected.id,"allocation_id":expected.allocation,"mapping_id":expected.mapping,
-            "mapping_revision":expected.revision,"node_id":node,"node_generation":generation,"generation":expected.generation,"nonce":nonce}).to_string();
+        let mut payload=serde_json::json!({"protocol_version":1,"grant_id":expected.id,"allocation_id":expected.allocation,"mapping_id":expected.mapping,
+            "mapping_revision":expected.revision,"node_id":node,"node_generation":generation,"generation":expected.generation,"nonce":nonce});
+        let (path,scope)=if let Some(port)=relay_port{
+            payload["relay_port"]=serde_json::json!(port);
+            ("/api/v1/relay/budget-claim","budget_claim_preview_only")
+        }else{("/api/v1/relay/budget-grant","budget_authorization_preview_only")};
+        let payload=payload.to_string();
         let started=Instant::now();let boot=boot_now()?;
-        let (code,data)=request(endpoint,token,"/api/v1/relay/budget-grant",Some(&payload))?;
+        let (code,data)=request(endpoint,token,path,Some(&payload))?;
         if code!=200{return Err(Failure::Denied)}
         let reply:BudgetResponse=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
         let g=reply.grant;
-        if reply.protocol_version!=1||reply.nonce!=nonce||reply.scope!="budget_authorization_preview_only"||reply.executable||
+        if reply.protocol_version!=1||reply.nonce!=nonce||reply.scope!=scope||reply.executable||
             g.id!=expected.id||g.allocation_id!=expected.allocation||g.mapping_id!=expected.mapping||g.mapping_revision!=expected.revision||
             g.node_id!=node||g.node_generation!=generation||g.generation!=expected.generation||g.generation!=2||g.policy_revision!=policy.policy_revision||
             g.device_revision<1||g.entitlement_revision<1||g.bind_port!=bind||g.rate_bytes_per_second!=rate||g.monthly_bytes!=monthly||g.connection_slots!=slots||
             g.month_utc.len()!=7||g.month_utc.as_bytes()[4]!=b'-'||g.issued_at<1||g.issued_at.checked_add(15)!=Some(g.expires_at)||
             g.server_time<g.issued_at||g.server_time<policy.received_at||g.server_time>=g.expires_at{return Err(Failure::Denied)}
+        match (relay_port,reply.intent){
+            (None,None)=>{},
+            (Some(port),Some(i))=>{
+                let claimed=i.claimed_at.ok_or(Failure::Denied)?;
+                if i.grant_id!=g.id||i.node_id!=g.node_id||i.relay_port!=port||i.bind_port!=bind||
+                    i.created_at<g.issued_at||claimed<i.created_at||claimed>g.server_time||claimed>=g.expires_at{return Err(Failure::Denied)}
+            },
+            _=>return Err(Failure::Denied),
+        }
         let seconds=g.expires_at.checked_sub(g.server_time).and_then(|n|n.checked_sub(1)).filter(|n|*n>0).ok_or(Failure::Denied)?;
         let duration=Duration::from_secs(seconds as u64);
         let deadline=started.checked_add(duration).ok_or(Failure::Protocol)?;
         let boot_deadline=boot.checked_add(duration).ok_or(Failure::Protocol)?;
         if lease_left(deadline,boot_deadline)?.is_zero(){return Err(Failure::Denied)}
+        if relay_port.is_some(){
+            // The center already consumed its one-shot claim. A disk failure
+            // or expired response cannot reopen it. No listener or engine.
+            consume_budget_marker(dir,expected.id)?;
+            if lease_left(deadline,boot_deadline)?.is_zero(){return Err(Failure::Denied)}
+            println!("relay budget claim consumed");
+            return Ok(())
+        }
         println!("relay budget preview verified");
         loop{let left=lease_left(deadline,boot_deadline)?;if left.is_zero(){break}std::thread::sleep(left.min(Duration::from_millis(50)));}
         println!("relay budget preview expired");
@@ -507,7 +561,8 @@ mod linux {
         let args:Vec<_>=std::env::args_os().skip(1).collect();
         let arg=|i:usize|args.get(i).and_then(|a|a.to_str()).ok_or(Failure::Protocol);
         let verify=args.len()==12&&arg(0)?=="--verify-grant";
-        let budget=args.len()==16&&arg(0)?=="--verify-budget";
+        let budget_claim=args.len()==17&&arg(0)?=="--claim-budget";
+        let budget=(args.len()==16&&arg(0)?=="--verify-budget")||budget_claim;
         let tcp=args.len()==15&&matches!(arg(0)?,"--tcp-preview"|"--udp-preview");
         let http=args.len()==17&&matches!(arg(0)?,"--http-preview"|"--https-preview");
         let (endpoint,dir,index,port)=if (args.len()==7&&arg(0)?=="--tls")||verify||budget||tcp||http{
@@ -532,7 +587,8 @@ mod linux {
             if !hex_id(expected.id)||!hex_id(expected.allocation)||!hex_id(expected.mapping)||expected.revision<1||expected.generation<2{return Err(Failure::Protocol)}
             if budget{
                 return verify_budget(&endpoint,&token,node,generation,capacity,&expected,arg(12)?.parse().map_err(|_|Failure::Protocol)?,
-                    arg(13)?.parse().map_err(|_|Failure::Protocol)?,arg(14)?.parse().map_err(|_|Failure::Protocol)?,arg(15)?.parse().map_err(|_|Failure::Protocol)?)
+                    arg(13)?.parse().map_err(|_|Failure::Protocol)?,arg(14)?.parse().map_err(|_|Failure::Protocol)?,arg(15)?.parse().map_err(|_|Failure::Protocol)?,
+                    if budget_claim{Some(arg(16)?.parse().map_err(|_|Failure::Protocol)?)}else{None})
             }
             if tcp||http{
                 let web=if http{Some(Web{port:arg(15)?.parse().map_err(|_|Failure::Protocol)?,hostname:arg(16)?,tls:arg(0)?=="--https-preview"})}else{None};
@@ -563,6 +619,6 @@ fn main(){
     #[cfg(target_os="linux")]
     if linux::run().is_ok(){return}
     // Fixed diagnostics only, never paths, credentials or response bodies.
-    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --verify-budget (verify-grant arguments plus bind-port rate-bytes-per-second monthly-bytes connection-slots) OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine> OR --http-preview/--https-preview (same arguments plus gateway-port and hostname)");
+    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --verify-budget (verify-grant arguments plus bind-port rate-bytes-per-second monthly-bytes connection-slots) OR --claim-budget (verify-budget arguments plus relay-port; non-executable) OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine> OR --http-preview/--https-preview (same arguments plus gateway-port and hostname)");
     std::process::exit(1);
 }

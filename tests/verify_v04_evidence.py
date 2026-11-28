@@ -394,6 +394,7 @@ REQUIRED["management-v09"] = {
         "real_offline_udp_expiry_closes_datagram_port_and_retains_crash_reservation",
         "real_crashed_https_claim_rejected_after_center_recovery",
         "real_tls_finite_budget_node_verification_and_expiry_without_listener",
+         "real_tls_finite_budget_one_shot_durable_node_consumption_without_listener",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",
