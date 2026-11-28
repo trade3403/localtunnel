@@ -628,16 +628,52 @@ mod linux {
         println!("relay finite TCP stopped reason={} bytes={}",if outcome.end==End::Exhausted{"exhausted"}else{"expired"},outcome.written);
         Ok(())
     }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CleanupReply{protocol_version:i64,nonce:String,scope:String,executable:bool,resources_released:bool,report:CleanupRecord}
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CleanupRecord{allocation_id:String,grant_id:String,node_id:String,node_generation:i64,fenced_generation:i64,
+        relay_port:u16,bind_port:u16,reported_at:i64}
+    fn report_cleanup(endpoint:&Endpoint,token:&str,node:&str,generation:i64,expected:&Expected<'_>,relay_port:u16,bind_port:u16)->Result<()>{
+        let dir=match endpoint{Endpoint::Tls{dir,..}=>dir,_=>return Err(Failure::Protocol)};
+        if expected.generation!=3||!(30000..=59999).contains(&relay_port)||!(20000..=29999).contains(&bind_port){return Err(Failure::Protocol)}
+        let mut marker=Vec::new();
+        private_file(dir,&format!("budget-consumed-{}",expected.id))?.take(128).read_to_end(&mut marker).map_err(|_|Failure::Protocol)?;
+        if marker!=b"budget start consumed; no reuse\n"{return Err(Failure::Denied)}
+        match fs::symlink_metadata(dir.join(format!("budget-tcp-{}.toml",expected.id))){
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            _=>return Err(Failure::Denied),
+        }
+        // Hold both exclusive loopback probes until the authenticated report
+        // completes. This is a point-in-time observation, not OS isolation.
+        let _relay=std::net::TcpListener::bind((Ipv4Addr::LOCALHOST,relay_port)).map_err(|_|Failure::Denied)?;
+        let _bind=std::net::TcpListener::bind((Ipv4Addr::LOCALHOST,bind_port)).map_err(|_|Failure::Denied)?;
+        let mut bytes=[0u8;16];OsRng.try_fill_bytes(&mut bytes).map_err(|_|Failure::Protocol)?;
+        let nonce=hex::encode(bytes);
+        let payload=serde_json::json!({"protocol_version":1,"allocation_id":expected.allocation,"grant_id":expected.id,
+            "node_id":node,"node_generation":generation,"fenced_generation":expected.generation,"relay_port":relay_port,"bind_port":bind_port,"nonce":nonce}).to_string();
+        let (code,data)=request(endpoint,token,"/api/v1/relay/budget-cleanup-report",Some(&payload))?;
+        if code!=200{return Err(Failure::Denied)}
+        let reply:CleanupReply=serde_json::from_slice(&data).map_err(|_|Failure::Protocol)?;
+        let r=reply.report;
+        if reply.protocol_version!=1||reply.nonce!=nonce||reply.scope!="node_cleanup_observation_only"||reply.executable||reply.resources_released
+            ||r.allocation_id!=expected.allocation||r.grant_id!=expected.id||r.node_id!=node||r.node_generation!=generation
+            ||r.fenced_generation!=expected.generation||r.relay_port!=relay_port||r.bind_port!=bind_port||r.reported_at<1{return Err(Failure::Denied)}
+        println!("relay cleanup observation recorded; resources retained");
+        Ok(())
+    }
     pub(super) fn run()->Result<()>{
         let args:Vec<_>=std::env::args_os().skip(1).collect();
         let arg=|i:usize|args.get(i).and_then(|a|a.to_str()).ok_or(Failure::Protocol);
         let verify=args.len()==12&&arg(0)?=="--verify-grant";
+        let cleanup=args.len()==14&&arg(0)?=="--report-budget-cleanup";
         let budget_claim=args.len()==17&&arg(0)?=="--claim-budget";
         let budget_start=args.len()==18&&arg(0)?=="--budget-tcp-preview";
         let budget=(args.len()==16&&arg(0)?=="--verify-budget")||budget_claim||budget_start;
         let tcp=args.len()==15&&matches!(arg(0)?,"--tcp-preview"|"--udp-preview");
         let http=args.len()==17&&matches!(arg(0)?,"--http-preview"|"--https-preview");
-        let (endpoint,dir,index,port)=if (args.len()==7&&arg(0)?=="--tls")||verify||budget||tcp||http{
+        let (endpoint,dir,index,port)=if (args.len()==7&&arg(0)?=="--tls")||verify||budget||tcp||http||cleanup{
             let host=arg(2)?;
             if !hostname(host){return Err(Failure::Protocol)}
             let port:u16=arg(3)?.parse().map_err(|_|Failure::Protocol)?;
@@ -653,10 +689,14 @@ mod linux {
         let capacity:i64=arg(index+2)?.parse().map_err(|_|Failure::Protocol)?;
         if port==0||node.len()!=32||!node.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))||generation<1||!(0..=65536).contains(&capacity){return Err(Failure::Protocol)}
         let token=private_token(&dir)?;
-        if verify||budget||tcp||http{
+        if verify||budget||tcp||http||cleanup{
             let expected=Expected{allocation:arg(7)?,mapping:arg(8)?,revision:arg(9)?.parse().map_err(|_|Failure::Protocol)?,
                 generation:arg(10)?.parse().map_err(|_|Failure::Protocol)?,id:arg(11)?};
             if !hex_id(expected.id)||!hex_id(expected.allocation)||!hex_id(expected.mapping)||expected.revision<1||expected.generation<2{return Err(Failure::Protocol)}
+            if cleanup{
+                return report_cleanup(&endpoint,&token,node,generation,&expected,arg(12)?.parse().map_err(|_|Failure::Protocol)?,
+                    arg(13)?.parse().map_err(|_|Failure::Protocol)?)
+            }
             if budget{
                 return verify_budget(&endpoint,&token,node,generation,capacity,&expected,arg(12)?.parse().map_err(|_|Failure::Protocol)?,
                     arg(13)?.parse().map_err(|_|Failure::Protocol)?,arg(14)?.parse().map_err(|_|Failure::Protocol)?,arg(15)?.parse().map_err(|_|Failure::Protocol)?,
@@ -692,6 +732,6 @@ fn main(){
     #[cfg(target_os="linux")]
     if linux::run().is_ok(){return}
     // Fixed diagnostics only, never paths, credentials or response bodies.
-    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --verify-budget (verify-grant arguments plus bind-port rate-bytes-per-second monthly-bytes connection-slots) OR --claim-budget (verify-budget arguments plus relay-port; non-executable) OR --budget-tcp-preview (claim-budget arguments plus absolute-engine) OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine> OR --http-preview/--https-preview (same arguments plus gateway-port and hostname)");
+    eprintln!("relay control stopped; Linux usage: localtunnel-relay <private-dir> <port> <node-id> <generation> <capacity> OR localtunnel-relay --tls <private-dir> <host> <port> <node-id> <generation> <capacity> OR --verify-grant <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> OR --verify-budget (verify-grant arguments plus bind-port rate-bytes-per-second monthly-bytes connection-slots) OR --claim-budget (verify-budget arguments plus relay-port; non-executable) OR --report-budget-cleanup (verify-grant arguments with fenced generation 3 plus relay-port bind-port) OR --budget-tcp-preview (claim-budget arguments plus absolute-engine) OR --tcp-preview/--udp-preview <private-dir> <host> <port> <node-id> <node-generation> <capacity> <allocation-id> <mapping-id> <mapping-revision> <allocation-generation> <grant-id> <relay-port> <bind-port> <absolute-engine> OR --http-preview/--https-preview (same arguments plus gateway-port and hostname)");
     std::process::exit(1);
 }

@@ -1053,6 +1053,52 @@ try:
                     assert db.execute("SELECT execution_opt_in,claimed_at IS NOT NULL FROM relay_budget_intents WHERE grant_id=?",(g2["id"],)).fetchone()==(1,1)
                 assert (dirs[0]/("budget-consumed-"+g2["id"])).is_file()
                 report["real_tls_guarded_noise_tcp_budget_exhaustion_and_replay_rejection"]=True
+                # Actual stopped finite engine: a node observation must be
+                # fenced, exact-bound, authenticated and never release quota.
+                route="allocations/"+a2["id"]
+                cleanup_args=[str(relay),"--report-budget-cleanup",str(dirs[0]),"localhost",str(tp),nodes[0],"1","5",
+                    a2["id"],a2["mapping_id"],"1","3",g2["id"],str(br),str(bf)]
+                def report_cleanup():
+                    proc=subprocess.Popen(cleanup_args,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                    children.append(proc);return proc
+                fails(report_cleanup())
+                wait(lambda:time.time()>=g2["expires_at"]+2,20)
+                fence=admin(route+"/fence",dict(expected_generation=2,grant_id=g2["id"]),finite_owner,201)
+                assert fence["fence"]["new_generation"]==3
+                payload=dict(protocol_version=1,allocation_id=a2["id"],grant_id=g2["id"],node_id=nodes[0],
+                    node_generation=1,fenced_generation=3,relay_port=br,bind_port=bf,nonce=secrets.token_hex(16))
+                def submit_report(token,data,status):
+                    req=urllib.request.Request(f"https://localhost:{tp}/api/v1/relay/budget-cleanup-report",method="POST",
+                        headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"},data=json.dumps(data).encode())
+                    try:
+                        with opener.open(req,timeout=4) as r:
+                            assert r.status==status
+                            return json.load(r)
+                    except urllib.error.HTTPError as e:assert e.code==status
+                submit_report(tokens[1],payload,401)
+                submit_report(tokens[0],dict(payload,bind_port=bf+1 if bf<29999 else bf-1),401)
+                with socket.socket() as occupied:
+                    occupied.bind(("127.0.0.1",br));occupied.listen()
+                    fails(report_cleanup())
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT count(*) FROM relay_cleanup_reports").fetchone()==(0,)
+                for _ in range(2):
+                    proc=report_cleanup();out,err=proc.communicate(timeout=8)
+                    assert proc.returncode==0 and out.strip()=="relay cleanup observation recorded; resources retained"
+                with sqlite3.connect(center/"control.sqlite3") as db:
+                    assert db.execute("SELECT count(*) FROM relay_cleanup_reports").fetchone()==(1,)
+                    assert db.execute("SELECT count(*) FROM management_audit WHERE event='allocation.cleanup_observed'").fetchone()==(1,)
+                    assert db.execute("SELECT monthly_bytes FROM relay_budget_previews WHERE allocation_id=?",(a2["id"],)).fetchone()==(4096,)
+                    for sql in ("DELETE FROM relay_cleanup_reports","UPDATE relay_cleanup_reports SET reported_at=reported_at+1"):
+                        try:db.execute(sql);raise AssertionError("mutable cleanup report")
+                        except sqlite3.IntegrityError:db.rollback()
+                req=urllib.request.Request(f"http://127.0.0.1:{cp}/api/v1/"+route+"/cleanup-report",
+                    headers={"Authorization":"Bearer "+finite_owner})
+                with urllib.request.urlopen(req,timeout=4) as response:
+                    row=json.load(response)
+                    assert row["report"]["grant_id"]==g2["id"] and row["resources_released"] is False and row["executable"] is False
+                assert submit_report(tokens[0],payload,200)["report"]==row["report"]
+                report["real_tls_fenced_cleanup_observation_idempotent_no_release"]=True
             finally:
                 target.shutdown();target.server_close();worker.join(timeout=3)
         # D: two independently supervised real Noise tunnels from one finite
@@ -1187,4 +1233,4 @@ finally:
         assert not any(t in ((out or "")+(err or "")) for t in tokens),"credential leaked"
     evidence.parent.mkdir(parents=True,exist_ok=True)
     evidence.write_text(json.dumps(report,indent=2),encoding="utf-8")
-assert len(report)==27 and all(report.values())
+assert len(report)==28 and all(report.values())

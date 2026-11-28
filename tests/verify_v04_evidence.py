@@ -400,6 +400,7 @@ REQUIRED["management-v09"] = {
          "real_tls_finite_budget_one_shot_durable_node_consumption_without_listener",
          "real_tls_guarded_noise_tcp_budget_exhaustion_and_replay_rejection",
          "real_dual_node_guarded_tcp_budget_isolation_and_expiry",
+         "real_tls_fenced_cleanup_observation_idempotent_no_release",
     ],
     "relay-process.json": [
         "real_three_independent_relay_control_processes",

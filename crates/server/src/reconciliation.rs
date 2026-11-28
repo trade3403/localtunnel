@@ -1,6 +1,6 @@
 //! Explicit owner-requested expiry fencing. No replacement grant, resource
 //! release, or quota refund. A lost heartbeat or revocation is not expiry.
-use crate::auth;
+use crate::{auth,relay};
 use axum::{extract::{DefaultBodyLimit,Path,State},http::{HeaderMap,StatusCode},response::Response,routing::post,Json,Router};
 use serde::{Deserialize,Serialize};
 use sqlx::SqlitePool;
@@ -17,6 +17,8 @@ struct Fence{allocation_id:String,grant_id:String,grant_kind:String,old_generati
 fn hex_id(s:&str)->bool{s.len()==32&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
 pub fn routes(pool:SqlitePool)->Router{
     Router::new().route("/api/v1/allocations/{id}/fence",post(fence).get(detail))
+                .route("/api/v1/relay/budget-cleanup-report",post(cleanup))
+        .route("/api/v1/allocations/{id}/cleanup-report",axum::routing::get(cleanup_detail))
         .layer(DefaultBodyLimit::max(1024)).with_state(pool)
 }
 const SESSION:&str="EXISTS(SELECT 1 FROM admin_sessions s JOIN users u ON u.id=s.user_id
@@ -67,4 +69,58 @@ async fn detail(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:Head
       WHERE a.id=? AND a.owner_id=? AND {SESSION}");
     let row=sqlx::query_as::<_,Fence>(&query).bind(id).bind(owner).bind(token).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
     Ok(reply(row,false))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CleanupRequest{protocol_version:i64,allocation_id:String,grant_id:String,node_id:String,node_generation:i64,
+    fenced_generation:i64,relay_port:i64,bind_port:i64,nonce:String}
+#[derive(Serialize,sqlx::FromRow)]
+struct CleanupReport{allocation_id:String,grant_id:String,node_id:String,node_generation:i64,
+    fenced_generation:i64,relay_port:i64,bind_port:i64,reported_at:i64}
+const CLEANUP_MATCH:&str="f.allocation_id=? AND f.grant_id=? AND f.node_id=? AND f.node_generation=? AND f.new_generation=?
+ AND i.relay_port=? AND i.bind_port=? AND r.token_digest=? AND n.enabled=1 AND a.state='reserved' AND a.generation=f.new_generation
+ AND f.grant_kind='finite' AND i.execution_opt_in=1 AND i.claimed_at IS NOT NULL AND unixepoch()>=f.fenced_at";
+const CLEANUP_FROM:&str="FROM relay_allocation_fences f JOIN relay_allocations a ON a.id=f.allocation_id
+ JOIN relay_budget_intents i ON i.grant_id=f.grant_id AND i.node_id=f.node_id AND i.bind_port=a.bind_port
+ JOIN relay_identities r ON r.node_id=f.node_id AND r.generation=f.node_generation JOIN nodes n ON n.id=r.node_id";
+fn cleanup_reply(row:CleanupReport,nonce:Option<String>)->Response{
+    auth::uncached(Json(serde_json::json!({"protocol_version":1,"nonce":nonce,
+      "scope":"node_cleanup_observation_only","executable":false,"resources_released":false,"report":row})))
+}
+async fn cleanup(State(pool):State<SqlitePool>,headers:HeaderMap,Json(c):Json<CleanupRequest>)->Result<Response,Failure>{
+    let credential=relay::digest(&headers)?;
+    if c.protocol_version!=1||!hex_id(&c.allocation_id)||!hex_id(&c.grant_id)||!hex_id(&c.node_id)||!hex_id(&c.nonce)
+      ||c.node_generation<1||c.fenced_generation!=3||!(30000..=59999).contains(&c.relay_port)||!(20000..=29999).contains(&c.bind_port){return Err(BAD)}
+    let denied=(StatusCode::UNAUTHORIZED,"invalid relay credential or cleanup binding");
+    let mut tx=pool.begin().await.map_err(|_|INTERNAL)?;
+    let query=format!("INSERT INTO relay_cleanup_reports(allocation_id,grant_id,node_id,node_generation,fenced_generation,relay_port,bind_port,reported_at)
+      SELECT f.allocation_id,f.grant_id,f.node_id,f.node_generation,f.new_generation,i.relay_port,i.bind_port,unixepoch()
+      {CLEANUP_FROM} WHERE {CLEANUP_MATCH} AND NOT EXISTS(SELECT 1 FROM relay_cleanup_reports x WHERE x.allocation_id=f.allocation_id)
+      RETURNING *");
+    let row=sqlx::query_as::<_,CleanupReport>(&query).bind(&c.allocation_id).bind(&c.grant_id).bind(&c.node_id)
+      .bind(c.node_generation).bind(c.fenced_generation).bind(c.relay_port).bind(c.bind_port).bind(&credential)
+      .fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?;
+    let row=if let Some(row)=row{
+        sqlx::query("INSERT INTO management_audit(owner_id,event,resource_id,revision,request_id,state)
+          SELECT owner_id,'allocation.cleanup_observed',id,generation,?,'retained' FROM relay_allocations WHERE id=?")
+          .bind(&row.grant_id).bind(&row.allocation_id).execute(&mut *tx).await.map_err(|_|INTERNAL)?;
+        row
+    }else{
+        let query=format!("SELECT x.* {CLEANUP_FROM} JOIN relay_cleanup_reports x ON x.allocation_id=f.allocation_id WHERE {CLEANUP_MATCH}");
+        sqlx::query_as::<_,CleanupReport>(&query).bind(&c.allocation_id).bind(&c.grant_id).bind(&c.node_id)
+          .bind(c.node_generation).bind(c.fenced_generation).bind(c.relay_port).bind(c.bind_port).bind(&credential)
+          .fetch_optional(&mut *tx).await.map_err(|_|INTERNAL)?.ok_or(denied)?
+    };
+    tx.commit().await.map_err(|_|INTERNAL)?;
+    Ok(cleanup_reply(row,Some(c.nonce)))
+}
+async fn cleanup_detail(State(pool):State<SqlitePool>,Path(id):Path<String>,headers:HeaderMap)->Result<Response,Failure>{
+    let token=auth::bearer(&headers)?;
+    let owner=auth::identify(&pool,&token).await?.id;
+    if !hex_id(&id){return Err(MISSING)}
+    let query=format!("SELECT x.* FROM relay_cleanup_reports x JOIN relay_allocations a ON a.id=x.allocation_id
+      WHERE a.id=? AND a.owner_id=? AND {SESSION}");
+    let row=sqlx::query_as::<_,CleanupReport>(&query).bind(id).bind(owner).bind(token).fetch_optional(&pool).await.map_err(|_|INTERNAL)?.ok_or(MISSING)?;
+    Ok(cleanup_reply(row,None))
 }
